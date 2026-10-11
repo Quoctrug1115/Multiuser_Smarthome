@@ -1,3 +1,7 @@
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+use chrono::{DataTime, Utc};
+
 #[devive(Debug, Serialize, Deserialize, sqlx:FromRow)]
 pub struct User {
     pub id: Uuid,
