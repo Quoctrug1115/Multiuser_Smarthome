@@ -1,3 +1,16 @@
+use axum::{
+    async_trait,
+    extract::FromRequestParts,
+    http::{header, request::Parts, StatusCode},
+};
+use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
+use argon2::{
+    password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
+    Argon2,
+};
+use uuid::Uuid;
+use crate::models::user::Claims;
+
 const JWT_SECRET: &[u8] = b"SMARTHOME_RUST_AXUM_SECRET_KEY";
 
 pub fn hash_password(password: &str) -> Result<String, String> {
@@ -37,5 +50,33 @@ pub fn create_jwt (
     };
 
     encode(&Header::default(), &claims, &EncodingKey::from_secret(JWT_SECRET))
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())    
 }
+
+#[async_trait]
+impl<S> FromRequestParts<S> for Claims 
+where 
+    S: Send + Sync,
+{
+    type Rejection = (StatusCode, &'static str);
+    
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<self, Self:Rejection> {
+        let auth_header =  parts
+            .headers
+            .get(header::AUTHORIZATION)
+            .and_then(|value| vulue.to_str().ok())
+            .ok_or((StatusCode::UNAUTHORIZED, "Missing Authorization Header"));
+
+        if !auth_header.starts_with("Bearer") {
+            return Err((StatusCode::UNAUTHORIZED, "Invalid Bearer Token"));
+        }
+
+        let token = &auth_header[7..];
+        let token_data = decode::<Claims>(
+            token, &DecodingKey::from_secret(JWT_SECRET),
+            &Validation::Default()
+        ).map_err(|_| (StatusCode::UNAUTHORIZED, "Token is invalid or expired"))?;
+        OK(token_data.claims)
+    }
+}
+

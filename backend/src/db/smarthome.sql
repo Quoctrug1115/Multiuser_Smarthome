@@ -1,3 +1,4 @@
+-- Active: 1791959887858@@127.0.0.1@5432@smarthome_db
 create extension if not EXISTS "uuid-ossp";
 create extension if not EXISTS timescaledb CASCADE;
 
@@ -86,4 +87,4 @@ create table if not exists sensor_data (
 -- bien bang sensor_data thanh timescaledb hypertable
 select create_hypertable('sensor_data','time', if_not_exists => true);
 
-select* from users;
+select* from roles;
