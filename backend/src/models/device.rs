@@ -22,3 +22,11 @@ pub struct CreateDeviceDto {
     pub device_type: String,
     pub mqtt_topic: String,
 }
+
+#[derive(Debug, Deserialize)]
+pub struct GrantGuestAccessDto {
+    pub guest_id: Uuid,
+    pub device_id: Uuid,
+    pub valid_from: DateTime<Utc>,
+    pub valid_until: DateTime<Utc>,
+}

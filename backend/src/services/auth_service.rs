@@ -1,5 +1,4 @@
 use axum::{
-    async_trait,
     extract::FromRequestParts,
     http::{header, request::Parts, StatusCode},
 };
@@ -53,19 +52,18 @@ pub fn create_jwt (
         .map_err(|e| e.to_string())    
 }
 
-#[async_trait]
 impl<S> FromRequestParts<S> for Claims 
 where 
     S: Send + Sync,
 {
     type Rejection = (StatusCode, &'static str);
     
-    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<self, Self:Rejection> {
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
         let auth_header =  parts
             .headers
             .get(header::AUTHORIZATION)
-            .and_then(|value| vulue.to_str().ok())
-            .ok_or((StatusCode::UNAUTHORIZED, "Missing Authorization Header"));
+            .and_then(|value| value.to_str().ok())
+            .ok_or((StatusCode::UNAUTHORIZED, "Missing Authorization Header"))?;
 
         if !auth_header.starts_with("Bearer") {
             return Err((StatusCode::UNAUTHORIZED, "Invalid Bearer Token"));
@@ -74,9 +72,9 @@ where
         let token = &auth_header[7..];
         let token_data = decode::<Claims>(
             token, &DecodingKey::from_secret(JWT_SECRET),
-            &Validation::Default()
+            &Validation::default()
         ).map_err(|_| (StatusCode::UNAUTHORIZED, "Token is invalid or expired"))?;
-        OK(token_data.claims)
+        Ok(token_data.claims)
     }
 }
 

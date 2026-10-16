@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-use chrono::{DataTime, Utc};
+use chrono::{DateTime, Utc};
 
-#[devive(Debug, Serialize, Deserialize, sqlx:FromRow)]
+#[derive(Debug, Serialize, Deserialize, sqlx::FromRow)]
 pub struct User {
     pub id: Uuid,
     pub email: String,
@@ -11,17 +11,17 @@ pub struct User {
     pub full_name: String,
     pub role_id: Uuid,
     pub is_active: bool,
-    pub created_at: Option<Datetime<Utc>>,
+    pub created_at: Option<DateTime<Utc>>,
 }
 
-#[devive(Debug, Serialize, Deserialize, sqlx:FromRow)]
+#[derive(Debug, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Role {
     pub id: Uuid,
     pub name: String,
     pub description: Option<String>,
 }
 
-#[devive(Debug, Deserialize)]
+#[derive(Debug, Deserialize)]
 pub struct RegisterDto {
     pub email: String,
     pub password: String,
@@ -29,13 +29,13 @@ pub struct RegisterDto {
     pub role_name: String, // owner, member, guest
 }
 
-#[devive(Debug, Deserialize)]
+#[derive(Debug, Deserialize)]
 pub struct LoginDto {
     pub email: String,
     pub password: String,
 }
 
-#[devive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct AuthResponseDto {
     pub token: String,
     pub user_id: Uuid,
