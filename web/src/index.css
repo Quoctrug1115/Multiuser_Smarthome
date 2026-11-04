@@ -1,0 +1,68 @@
+@import "tailwindcss";
+
+/* 1. Theme Tối Sci-Fi (Cyber Dark) */
+.dark-theme {
+  background-color: #030a16;
+  background-image: 
+    radial-gradient(circle at 50% 0%, rgba(0, 162, 255, 0.12) 0%, transparent 60%),
+    linear-gradient(to bottom, #030a16, #051126);
+  color: #e2e8f0;
+}
+
+.dark-theme .cyber-card {
+  background: rgba(8, 24, 48, 0.75);
+  backdrop-filter: blur(12px);
+  border: 1px solid rgba(0, 195, 255, 0.35);
+  box-shadow: 0 0 15px rgba(0, 195, 255, 0.08), inset 0 0 15px rgba(0, 195, 255, 0.05);
+  border-radius: 6px;
+  position: relative;
+}
+
+.dark-theme .cyber-card::before {
+  content: '';
+  position: absolute;
+  top: -1px;
+  left: -1px;
+  width: 8px;
+  height: 8px;
+  border-top: 2px solid #00f0ff;
+  border-left: 2px solid #00f0ff;
+}
+
+.dark-theme .cyber-card::after {
+  content: '';
+  position: absolute;
+  bottom: -1px;
+  right: -1px;
+  width: 8px;
+  height: 8px;
+  border-bottom: 2px solid #00f0ff;
+  border-right: 2px solid #00f0ff;
+}
+
+/* 2. Theme Sáng (Modern Light) */
+.light-theme {
+  background-color: #f8fafc;
+  background-image: linear-gradient(to bottom, #f1f5f9, #f8fafc);
+  color: #0f172a;
+}
+
+.light-theme .cyber-card {
+  background: #ffffff;
+  border: 1px solid #cbd5e1;
+  box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05), 0 2px 4px -2px rgba(0, 0, 0, 0.05);
+  border-radius: 8px;
+}
+
+/* Thanh cuộn chung */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #0284c7;
+  border-radius: 3px;
+}
