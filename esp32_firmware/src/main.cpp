@@ -1,95 +1,106 @@
+#include <Arduino.h>
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include <DHT.h>
-#include <ArduinoJson.h>
 
-// --- Định cấu hình Chân cắm (Pin Mapping) ---
-#define DHTPIN 15
-#define DHTTYPE DHT22
-#define LDR_PIN 34       // Chân Analog đọc cảm biến ánh sáng
-#define PIR_PIN 13       // Chân Digital đọc cảm biến chuyển động
-#define RELAY_LIGHT_PIN 2 // Điều khiển Đèn phòng khách (d1)
-#define RELAY_FAN_PIN 4   // Điều khiển Quạt thông gió (d2)
-
-// --- Mạng WiFi & Broker MQTT ---
+// 1. Cấu hình WiFi mặc định của Wokwi
 const char* ssid = "Wokwi-GUEST";
 const char* password = "";
+
+// 2. Cấu hình MQTT Broker (khớp với Backend Rust)
 const char* mqtt_server = "broker.emqx.io";
 const int mqtt_port = 1883;
 
-// --- Topics MQTT ---
-String topic_telemetry     = "smarthome/sensors/dht22";
-String topic_cmd_light     = "smarthome/devices/d1/command";
-String topic_cmd_fan       = "smarthome/devices/d2/command";
-String topic_state         = "smarthome/devices/state";
+// 3. Định nghĩa chân linh kiện khớp 100% với diagram.json
+#define LED_LIGHT_PIN 2   // esp:D2 - Đèn vàng
+#define LED_FAN_PIN   4   // esp:D4 - Quạt (LED xanh dương)
+#define DHT_PIN       15  // esp:D15 - Cảm biến nhiệt độ/độ ẩm DHT22
+#define LDR_PIN       36  // esp:VP - Cảm biến ánh sáng (Photoresistor AO)
+#define PIR_PIN       13  // esp:D13 - Cảm biến chuyển động PIR
+#define DHT_TYPE      DHT22
 
 WiFiClient espClient;
 PubSubClient client(espClient);
-DHT dht(DHTPIN, DHTTYPE);
+DHT dht(DHT_PIN, DHT_TYPE);
 
-unsigned long lastMsg = 0;
+unsigned long lastSensorRead = 0;
 
 void setup_wifi() {
   delay(10);
-  Serial.println("\n[WiFi] Đang kết nối WiFi...");
-  WiFi.mode(WIFI_STA);
+  Serial.print("Đang kết nối WiFi Wokwi");
   WiFi.begin(ssid, password);
-
   while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
+    delay(300);
     Serial.print(".");
   }
-  Serial.println("\n[WiFi] Kết nối thành công! IP: " + WiFi.localIP().toString());
+  Serial.println("\n✅ Đã kết nối WiFi!");
 }
 
-// Xử lý lệnh điều khiển từ Web Dashboard (Lắng nghe cho cả Đèn d1 và Quạt d2)
+bool isTurnOnCommand(const String& msg) {
+  String upper = msg;
+  upper.toUpperCase();
+  return upper.indexOf("ON") != -1 || upper.indexOf("TRUE") != -1 || upper == "1";
+}
+
+bool isTurnOffCommand(const String& msg) {
+  String upper = msg;
+  upper.toUpperCase();
+  return upper.indexOf("OFF") != -1 || upper.indexOf("FALSE") != -1 || upper == "0";
+}
+
+// Nhận lệnh bật/tắt Đèn và Quạt từ Mobile/Backend gửi xuống
 void callback(char* topic, byte* payload, unsigned int length) {
-  String message;
+  String msg;
   for (unsigned int i = 0; i < length; i++) {
-    message += (char)payload[i];
+    msg += (char)payload[i];
   }
   String topicStr = String(topic);
-  Serial.printf("📩 [MQTT RECV] Topic [%s]: %s\n", topic, message.c_str());
+  Serial.println("📩 Nhận lệnh [" + topicStr + "]: " + msg);
 
-  StaticJsonDocument<200> doc;
-  DeserializationError error = deserializeJson(doc, message);
-  String powerState = (!error && doc.containsKey("power")) ? doc["power"].as<String>() : message;
-
-  // Xử lý điều khiển Đèn (d1)
-  if (topicStr == topic_cmd_light) {
-    if (powerState == "ON") {
-      digitalWrite(RELAY_LIGHT_PIN, HIGH);
-      Serial.println(" -> ĐÈN PHÒNG KHÁCH (GPIO 2): BẬT");
-    } else if (powerState == "OFF") {
-      digitalWrite(RELAY_LIGHT_PIN, LOW);
-      Serial.println(" -> ĐÈN PHÒNG KHÁCH (GPIO 2): TẮT");
+  // Điều khiển Đèn (GPIO 2)
+  if (topicStr.indexOf("led_phong_khach") != -1) {
+    if (isTurnOnCommand(msg)) {
+      digitalWrite(LED_LIGHT_PIN, HIGH);
+    } else if (isTurnOffCommand(msg)) {
+      digitalWrite(LED_LIGHT_PIN, LOW);
     }
   }
 
-  // Xử lý điều khiển Quạt (d2)
-  if (topicStr == topic_cmd_fan) {
-    if (powerState == "ON") {
-      digitalWrite(RELAY_FAN_PIN, HIGH);
-      Serial.println(" -> QUẠT THÔNG GIÓ (GPIO 4): BẬT");
-    } else if (powerState == "OFF") {
-      digitalWrite(RELAY_FAN_PIN, LOW);
-      Serial.println(" -> QUẠT THÔNG GIÓ (GPIO 4): TẮT");
+  // Điều khiển Quạt (GPIO 4)
+  if (topicStr.indexOf("quat_phong_khach") != -1) {
+    if (isTurnOnCommand(msg)) {
+      digitalWrite(LED_FAN_PIN, HIGH);
+    } else if (isTurnOffCommand(msg)) {
+      digitalWrite(LED_FAN_PIN, LOW);
     }
   }
 }
 
 void reconnect() {
   while (!client.connected()) {
-    Serial.print("[MQTT] Đang kết nối emqx.io...");
-    String clientId = "ESP32_SmartHome_Full_" + String(random(0xffff), HEX);
-
+    String clientId = "Wokwi_ESP32_" + String(random(0xffff), HEX);
     if (client.connect(clientId.c_str())) {
-      Serial.println(" [THÀNH CÔNG]");
-      client.subscribe(topic_cmd_light.c_str());
-      client.subscribe(topic_cmd_fan.c_str());
-      Serial.println("✅ Subscribed thành công các Topic điều khiển!");
+      Serial.println("✅ Đã kết nối MQTT Broker!");
+
+      // Lắng nghe lệnh điều khiển Đèn và Quạt
+      client.subscribe("smarthome/devices/led_phong_khach");
+      client.subscribe("smarthome/devices/led_phong_khach/control");
+      client.subscribe("smarthome/devices/quat_phong_khach");
+      client.subscribe("smarthome/devices/quat_phong_khach/control");
+
+      // Báo danh 3 thiết bị lên topic discovery để Mobile quét tự động
+      const char* lightDiscovery =
+          "{\"name\":\"Đèn Phòng Khách (Wokwi)\",\"device_type\":\"light\",\"mqtt_topic\":\"smarthome/devices/led_phong_khach\"}";
+      client.publish("smarthome/discovery", lightDiscovery, true);
+
+      const char* fanDiscovery =
+          "{\"name\":\"Quạt Phòng Khách (Wokwi)\",\"device_type\":\"fan\",\"mqtt_topic\":\"smarthome/devices/quat_phong_khach\"}";
+      client.publish("smarthome/discovery", fanDiscovery, true);
+
+      const char* sensorDiscovery =
+          "{\"name\":\"Cảm Biến Môi Trường (Wokwi)\",\"device_type\":\"sensor\",\"mqtt_topic\":\"smarthome/sensors/dht22\"}";
+      client.publish("smarthome/discovery", sensorDiscovery, true);
     } else {
-      Serial.printf(" Lỗi (rc=%d), thử lại sau 2s...\n", client.state());
       delay(2000);
     }
   }
@@ -97,16 +108,13 @@ void reconnect() {
 
 void setup() {
   Serial.begin(115200);
-  pinMode(RELAY_LIGHT_PIN, OUTPUT);
-  pinMode(RELAY_FAN_PIN, OUTPUT);
+  pinMode(LED_LIGHT_PIN, OUTPUT);
+  pinMode(LED_FAN_PIN, OUTPUT);
   pinMode(PIR_PIN, INPUT);
-
-  digitalWrite(RELAY_LIGHT_PIN, LOW);
-  digitalWrite(RELAY_FAN_PIN, LOW);
+  pinMode(LDR_PIN, INPUT);
 
   dht.begin();
   setup_wifi();
-
   client.setServer(mqtt_server, mqtt_port);
   client.setCallback(callback);
 }
@@ -117,34 +125,24 @@ void loop() {
   }
   client.loop();
 
-  // Đọc dữ liệu từ toàn bộ cảm biến mỗi 3 giây
-  unsigned long now = millis();
-  if (now - lastMsg > 3000) {
-    lastMsg = now;
+  // Đọc & gửi dữ liệu DHT22 + Ánh sáng (Lux) + Chuyển động (PIR) mỗi 5 giây
+  if (millis() - lastSensorRead > 5000) {
+    lastSensorRead = millis();
 
-    float temp = dht.readTemperature();
-    float hum = dht.readHumidity();
-
-    // Tính toán Lux giả lập từ cảm biến LDR (Chân 34)
-    int ldrRaw = analogRead(LDR_PIN);
-    int lux = map(ldrRaw, 0, 4095, 0, 1000); 
-
-    // Đọc trạng thái cảm biến PIR (Chân 13)
+    float t = dht.readTemperature();
+    float h = dht.readHumidity();
+    int rawLdr = analogRead(LDR_PIN); // Giá trị 0 -> 4095
+    int lux = map(rawLdr, 4095, 0, 0, 1000); // Quy đổi sang mức Lux (0 - 1000)
     bool motion = digitalRead(PIR_PIN) == HIGH;
 
-    if (!isnan(temp) && !isnan(hum)) {
-      StaticJsonDocument<256> doc;
-      doc["temperature"] = temp;
-      doc["humidity"] = hum;
-      doc["lux"] = lux;
-      doc["motion"] = motion;
-      doc["sensor_id"] = "esp32-main-hub";
-
-      char buffer[256];
-      serializeJson(doc, buffer);
-
-      client.publish(topic_telemetry.c_str(), buffer);
-      Serial.printf("📤 [MQTT PUB FULL] %s -> %s\n", topic_telemetry.c_str(), buffer);
+    if (!isnan(t) && !isnan(h)) {
+      String sensorJson = "{\"temperature\":" + String(t, 1) +
+                          ",\"humidity\":" + String(h, 1) +
+                          ",\"lux\":" + String(lux) +
+                          ",\"motion\":" + String(motion ? "true" : "false") +
+                          ",\"sensor_id\":\"esp32_wokwi_01\"}";
+      client.publish("smarthome/sensors/dht22", sensorJson.c_str());
+      Serial.println("📤 Gửi Telemetry: " + sensorJson);
     }
   }
 }
