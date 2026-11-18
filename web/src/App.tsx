@@ -1,134 +1,119 @@
-import { EnergyAnalyticsPanel } from './components/EnergyAnalyticsPanel';
-import React, { useState, useEffect, useCallback } from 'react';
-import type { House, Room, UserAccount, UserRole } from './types/smarthome';
-import { ExcelImportModal, type ExcelImportMode } from './components/ExcelImportModal';
-import {
-  exportAccountsToExcel,
-  exportDevicesToExcel,
-  exportHousesAndRoomsToExcel,
-} from './utils/excelService';
+import React, { useState, useEffect, useRef, useMemo } from 'react';
+import * as XLSX from 'xlsx';
+import { EnergyAnalyticsPanel, type EnergyPeriod } from './components/EnergyAnalyticsPanel';
 
-const API_BASE = 'http://localhost:3000/api/v1';
-const WS_URL = 'ws://localhost:3000/ws';
+const API_BASE = import.meta.env.VITE_API_URL || 'http://127.0.0.1:3000/api/v1';
+const WS_URL =
+  import.meta.env.VITE_WS_URL ||
+  API_BASE.replace(/^http/, 'ws').replace(/\/api\/v1\/?$/, '/ws');
 
-type TabKey = 'overview' | 'rooms' | 'automations' | 'energy' | 'ai' | 'accounts';
-
-interface DeviceItem {
+interface UserProfile {
   id: string;
   name: string;
-  room_id?: string | null;
-  room_name?: string | null;
-  device_type: string;
-  mqtt_topic: string;
-  is_on: boolean;
-  status?: string;
+  full_name?: string;
+  email: string;
+  role: string;
+  owner_id?: string | null;
 }
 
-interface DiscoveredDevice {
+interface ExcelUserPreviewItem {
+  rowNumber: number;
+  name: string;
+  email: string;
+  password: string;
+  isDefaultPassword: boolean;
+  role: 'Admin' | 'Member' | 'Guest';
+  isValid: boolean;
+  errorReason?: string;
+}
+
+interface ExcelSpacePreviewItem {
+  id: string;
+  sheetName: string;
+  rowNumber: number;
+  kind: 'house' | 'room' | 'device';
+  name: string;
+  address?: string;
+  houseName?: string;
+  roomName?: string;
+  floor?: number;
+  deviceType?: string;
+  mqttTopic?: string;
+  isValid: boolean;
+  errorReason?: string;
+}
+
+interface House {
+  id: string;
+  name: string;
+  address: string;
+  owner_id?: string | null;
+}
+
+interface Room {
+  id: string;
+  house_id: string;
+  house_name?: string;
+  name: string;
+  floor: number;
+}
+
+interface Device {
+  id: string;
   name: string;
   device_type: string;
   mqtt_topic: string;
-  chip?: string;
+  room_id?: string | null;
+  room_name?: string | null;
+  is_on: boolean;
 }
 
 interface AutomationRule {
   id: string;
   name: string;
+  condition_text: string;
+  action_text: string;
   condition_type?: string;
-  trigger_type?: string;
   operator?: string;
   threshold?: number;
-  trigger_value?: number;
   action?: string;
-  action_text?: string;
-  device_id?: string;
-  is_active?: boolean;
-  enabled?: boolean;
+  is_active: boolean;
 }
 
 interface AiAlert {
-  id?: string;
-  title?: string;
-  message?: string;
-  severity?: string;
-  created_at?: string;
-}
-
-interface CurrentUser {
   id: string;
-  name: string;
-  email: string;
-  role: string;
+  alert_type: string;
+  title?: string;
+  message: string;
+  severity?: string;
+  created_at: string;
 }
 
-function parseJwtPayload(token: string): Record<string, unknown> | null {
-  try {
-    const parts = token.split('.');
-    if (parts.length !== 3) return null;
-    const base64 = parts[1].replace(/-/g, '+').replace(/_/g, '/');
-    const padded = base64.padEnd(base64.length + ((4 - (base64.length % 4)) % 4), '=');
-    const jsonStr = decodeURIComponent(
-      atob(padded)
-        .split('')
-        .map((c) => '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2))
-        .join('')
-    );
-    return JSON.parse(jsonStr);
-  } catch {
-    return null;
-  }
+interface EnergyPoint {
+  label: string;
+  kwh: number;
+  power_watt?: number;
 }
 
-function extractRoleFromJwt(token: string): string | null {
-  const jwt = parseJwtPayload(token);
-  if (!jwt) return null;
-  const candidate =
-    jwt.role ??
-    jwt.role_name ??
-    jwt.user_role ??
-    (Array.isArray(jwt.roles) ? jwt.roles[0] : null);
-  return typeof candidate === 'string' && candidate.trim() ? candidate.trim() : null;
+interface EnergyState {
+  total_kwh: number;
+  estimated_cost: number;
+  peak_watt?: number;
+  daily: EnergyPoint[];
 }
 
-function getAuthHeaders(hasBody = false): Record<string, string> {
-  const token = localStorage.getItem('token');
-  return {
-    ...(hasBody ? { 'Content-Type': 'application/json' } : {}),
-    ...(token && token !== 'authenticated' ? { Authorization: `Bearer ${token}` } : {}),
-  };
-}
-
-async function readErrorText(res: Response, fallback: string): Promise<string> {
-  const txt = await res.text().catch(() => '');
-  if (!txt) return `${fallback} (${res.status})`;
-  try {
-    const parsed = JSON.parse(txt);
-    return String(parsed.error || parsed.message || txt);
-  } catch {
-    return txt;
-  }
-}
+type ActiveTab = 'overview' | 'devices' | 'automations' | 'energy' | 'ai' | 'accounts';
 
 export function App() {
-  // ==================== AUTH & THEME ====================
-  const [currentUser, setCurrentUser] = useState<CurrentUser | null>(() => {
+  // ==================== AUTH STATE ====================
+  const [currentUser, setCurrentUser] = useState<UserProfile | null>(() => {
     try {
       const saved = localStorage.getItem('smarthome_user');
-      if (!saved) return null;
-      const parsed: CurrentUser = JSON.parse(saved);
-      const token = localStorage.getItem('token') || '';
-      const jwtRole = extractRoleFromJwt(token);
-
-      // Không tin tưởng role Admin cũ lưu trong cache nếu JWT không xác nhận
-      const resolvedRole = jwtRole || 'Member';
-      const syncedUser = { ...parsed, role: resolvedRole };
-      localStorage.setItem('smarthome_user', JSON.stringify(syncedUser));
-      return syncedUser;
+      return saved ? JSON.parse(saved) : null;
     } catch {
       return null;
     }
   });
-
   const [authMode, setAuthMode] = useState<'login' | 'register'>('login');
   const [authName, setAuthName] = useState('');
   const [authEmail, setAuthEmail] = useState('');
@@ -136,176 +121,169 @@ export function App() {
   const [authError, setAuthError] = useState('');
   const [authLoading, setAuthLoading] = useState(false);
 
+  // ==================== UI & NAVIGATION STATE ====================
+  const [activeTab, setActiveTab] = useState<ActiveTab>('overview');
   const [isDark, setIsDark] = useState(true);
-  const [activeTab, setActiveTab] = useState<TabKey>('overview');
   const [clockText, setClockText] = useState('');
   const [wsConnected, setWsConnected] = useState(false);
-
-  // Chỉ Owner hoặc Admin mới có quyền quản trị hệ thống, tài khoản, thêm/sửa/xóa & nhập/xuất Excel
-  const normalizedRole = (currentUser?.role || 'Member').trim().toLowerCase();
-  const isOwnerOrAdmin = normalizedRole === 'owner' || normalizedRole === 'admin';
-
-  // ==================== DATABASE ENTITIES ====================
-  const [houses, setHouses] = useState<House[]>([]);
-  const [rooms, setRooms] = useState<Room[]>([]);
-  const [devices, setDevices] = useState<DeviceItem[]>([]);
-  const [automations, setAutomations] = useState<AutomationRule[]>([]);
-  const [usersList, setUsersList] = useState<UserAccount[]>([]);
-  const [aiAlerts, setAiAlerts] = useState<AiAlert[]>([]);
-  const [energyData, setEnergyData] = useState<{
-    total_kwh: number;
-    estimated_cost: number;
-    daily: { label: string; kwh: number }[];
-  }>({
-    total_kwh: 0,
-    estimated_cost: 0,
-    daily: [
-      { label: 'T2', kwh: 1.8 },
-      { label: 'T3', kwh: 2.1 },
-      { label: 'T4', kwh: 1.6 },
-      { label: 'T5', kwh: 2.4 },
-      { label: 'T6', kwh: 1.9 },
-      { label: 'T7', kwh: 2.6 },
-      { label: 'CN', kwh: 2.2 },
-    ],
-  });
-
-  const [sensorData, setSensorData] = useState({
-    temperature: 28.5,
-    humidity: 65,
-    lux: 450,
-    motion: false,
-  });
-
   const [systemLogs, setSystemLogs] = useState<string[]>([
     'SYSTEM: Khởi động giao diện quản trị SmartHome IoT.',
   ]);
 
-  const addLog = useCallback((msg: string) => {
-    const time = new Date().toLocaleTimeString('vi-VN', { hour12: false });
-    setSystemLogs((prev) => [`[${time}] ${msg}`, ...prev.slice(0, 49)]);
-  }, []);
+  // ==================== DOMAIN DATA STATE ====================
+  const [houses, setHouses] = useState<House[]>([]);
+  const [rooms, setRooms] = useState<Room[]>([]);
+  const [devices, setDevices] = useState<Device[]>([]);
+  const [automations, setAutomations] = useState<AutomationRule[]>([]);
+  const [aiAlerts, setAiAlerts] = useState<AiAlert[]>([]);
+  const [usersList, setUsersList] = useState<UserProfile[]>([]);
 
-  // ==================== FILTER STATES ====================
+  const [sensorData, setSensorData] = useState<{
+    temperature: number;
+    humidity: number;
+    lux: number;
+    motion: boolean;
+  } | null>(null);
+
+  const [energyPeriod, setEnergyPeriod] = useState<EnergyPeriod>('week');
+  const [energyData, setEnergyData] = useState<EnergyState>({
+    total_kwh: 0,
+    estimated_cost: 0,
+    peak_watt: 0,
+    daily: [],
+  });
+
+  // ==================== FILTER & FORM STATES ====================
   const [selectedHouseId, setSelectedHouseId] = useState<string | null>(null);
   const [selectedRoomId, setSelectedRoomId] = useState<string | null>(null);
-  const [deviceFilterMode, setDeviceFilterMode] = useState<'all' | 'unassigned' | 'room'>('all');
 
-  // ==================== MODAL STATES ====================
-  const [isHouseModalOpen, setIsHouseModalOpen] = useState(false);
+  // House form & edit
+  const [newHouseName, setNewHouseName] = useState('');
+  const [newHouseAddress, setNewHouseAddress] = useState('');
   const [editingHouse, setEditingHouse] = useState<House | null>(null);
-  const [houseNameInput, setHouseNameInput] = useState('');
-  const [houseAddressInput, setHouseAddressInput] = useState('');
-  const [houseError, setHouseError] = useState('');
-  const [houseSaving, setHouseSaving] = useState(false);
 
-  const [isRoomModalOpen, setIsRoomModalOpen] = useState(false);
+  // Room form & edit
+  const [newRoomHouseId, setNewRoomHouseId] = useState('');
+  const [newRoomName, setNewRoomName] = useState('');
+  const [newRoomFloor, setNewRoomFloor] = useState(1);
   const [editingRoom, setEditingRoom] = useState<Room | null>(null);
-  const [roomHouseIdInput, setRoomHouseIdInput] = useState('');
-  const [roomNameInput, setRoomNameInput] = useState('');
-  const [roomFloorInput, setRoomFloorInput] = useState<number>(1);
-  const [roomError, setRoomError] = useState('');
-  const [roomSaving, setRoomSaving] = useState(false);
 
-  const [isDeviceModalOpen, setIsDeviceModalOpen] = useState(false);
-  const [editingDevice, setEditingDevice] = useState<DeviceItem | null>(null);
-  const [devNameInput, setDevNameInput] = useState('');
-  const [devTypeInput, setDevTypeInput] = useState('light');
-  const [devRoomIdInput, setDevRoomIdInput] = useState('');
-  const [devTopicInput, setDevTopicInput] = useState('');
-  const [devError, setDevError] = useState('');
-  const [devSaving, setDevSaving] = useState(false);
+  // Device form, edit & discovery
+  const [newDeviceName, setNewDeviceName] = useState('');
+  const [newDeviceType, setNewDeviceType] = useState('light');
+  const [newDeviceTopic, setNewDeviceTopic] = useState('');
+  const [newDeviceRoomId, setNewDeviceRoomId] = useState('');
+  const [editingDevice, setEditingDevice] = useState<Device | null>(null);
+  const [discoveringDevices, setDiscoveringDevices] = useState(false);
 
-  const [isDiscoverModalOpen, setIsDiscoverModalOpen] = useState(false);
-  const [discoveredList, setDiscoveredList] = useState<DiscoveredDevice[]>([]);
-  const [isDiscovering, setIsDiscovering] = useState(false);
+  // Excel Space & Device Preview States
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const [excelPreviewSpace, setExcelPreviewSpace] = useState<ExcelSpacePreviewItem[]>([]);
+  const [spaceExcelFileName, setSpaceExcelFileName] = useState<string>('');
+  const [isImportingSpace, setIsImportingSpace] = useState<boolean>(false);
 
-  const [isAccountModalOpen, setIsAccountModalOpen] = useState(false);
-  const [accNameInput, setAccNameInput] = useState('');
-  const [accEmailInput, setAccEmailInput] = useState('');
-  const [accPasswordInput, setAccPasswordInput] = useState('123456');
-  const [accRoleInput, setAccRoleInput] = useState<UserRole>('Member' as UserRole);
-  const [accountError, setAccountError] = useState('');
-  const [accountSaving, setAccountSaving] = useState(false);
+  // Automation form
+  const [newAutoName, setNewAutoName] = useState('');
+  const [newAutoCondition, setNewAutoCondition] = useState('');
+  const [newAutoAction, setNewAutoAction] = useState('');
 
-  const [isExcelModalOpen, setIsExcelModalOpen] = useState(false);
-  const [excelImportMode, setExcelImportMode] = useState<ExcelImportMode>('houses_rooms');
+  // Sub-account form, edit & Excel Preview States
+  const [newUserName, setNewUserName] = useState('');
+  const [newUserEmail, setNewUserEmail] = useState('');
+  const [newUserPassword, setNewUserPassword] = useState('');
+  const [newUserRole, setNewUserRole] = useState('Member');
+  const [editingUser, setEditingUser] = useState<UserProfile | null>(null);
 
-  const [autoName, setAutoName] = useState('');
-  const [autoCondType, setAutoCondType] = useState('temperature');
-  const [autoOperator, setAutoOperator] = useState('>');
-  const [autoThreshold, setAutoThreshold] = useState(30);
-  const [autoDeviceId, setAutoDeviceId] = useState('');
-  const [autoAction, setAutoAction] = useState('ON');
+  const userExcelInputRef = useRef<HTMLInputElement | null>(null);
+  const [excelPreviewUsers, setExcelPreviewUsers] = useState<ExcelUserPreviewItem[]>([]);
+  const [excelFileName, setExcelFileName] = useState<string>('');
+  const [isImportingUsers, setIsImportingUsers] = useState<boolean>(false);
 
-  useEffect(() => {
-    if (!isOwnerOrAdmin && activeTab === 'accounts') {
-      setActiveTab('overview');
-    }
-  }, [isOwnerOrAdmin, activeTab]);
+  // ==================== PERMISSION CHECK ====================
+  const normalizedRole = (currentUser?.role || '').trim().toLowerCase();
+  const isOwnerOrAdmin = normalizedRole === 'owner' || normalizedRole === 'admin';
+
+  const appendLog = (msg: string) => {
+    const time = new Date().toLocaleTimeString('vi-VN', { hour12: false });
+    setSystemLogs((prev) => [`[${time}] ${msg}`, ...prev].slice(0, 40));
+  };
 
   // ==================== CLOCK ====================
   useEffect(() => {
     const updateClock = () => {
       const now = new Date();
-      const time = now.toLocaleTimeString('vi-VN', { hour12: false });
-      const date = now.toLocaleDateString('vi-VN');
-      setClockText(`${time} ${date}`);
+      const timePart = now.toLocaleTimeString('vi-VN', { hour12: false });
+      const datePart = now.toLocaleDateString('vi-VN');
+      setClockText(`${timePart}  ${datePart}`);
     };
     updateClock();
     const timer = setInterval(updateClock, 1000);
     return () => clearInterval(timer);
   }, []);
 
-  // ==================== FETCH ALL DATA FROM POSTGRESQL ====================
-  const fetchAllDatabaseData = useCallback(async () => {
-    const headers = getAuthHeaders(false);
+  // ==================== FETCH DATA ====================
+  const getAuthHeaders = (): HeadersInit => {
+    const token = localStorage.getItem('token') || '';
+    return {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${token}`,
+    };
+  };
+
+  const fetchAllDatabaseData = async (periodOverride?: EnergyPeriod) => {
+    const token = localStorage.getItem('token');
+    if (!token) return;
+
+    const headers = getAuthHeaders();
+    const activePeriod = periodOverride || energyPeriod;
 
     try {
-      const [housesRes, roomsRes, devicesRes, autoRes, usersRes, aiRes, energyRes] =
+      const [meRes, housesRes, roomsRes, devicesRes, autoRes, energyRes, aiRes] =
         await Promise.all([
+          fetch(`${API_BASE}/auth/me`, { headers }).catch(() => null),
           fetch(`${API_BASE}/houses`, { headers }).catch(() => null),
           fetch(`${API_BASE}/rooms`, { headers }).catch(() => null),
           fetch(`${API_BASE}/devices`, { headers }).catch(() => null),
           fetch(`${API_BASE}/automations`, { headers }).catch(() => null),
-          fetch(`${API_BASE}/users`, { headers }).catch(() => null),
+          fetch(`${API_BASE}/energy/analytics?period=${activePeriod}`, { headers }).catch(
+            () => null
+          ),
           fetch(`${API_BASE}/ai/alerts`, { headers }).catch(() => null),
-          fetch(`${API_BASE}/energy/analytics`, { headers }).catch(() => null),
         ]);
 
-      // Đồng bộ quyền thực tế từ Backend: nếu /users trả về 403 -> chắc chắn là Member
-      if (usersRes) {
-        if (usersRes.status === 403 || usersRes.status === 401) {
-          setUsersList([]);
-          setCurrentUser((prev) => {
-            if (!prev || prev.role === 'Member') return prev;
-            const updated = { ...prev, role: 'Member' };
-            localStorage.setItem('smarthome_user', JSON.stringify(updated));
-            return updated;
-          });
-        } else if (usersRes.ok) {
-          const data = await usersRes.json();
-          const list: UserAccount[] = Array.isArray(data) ? data : [];
-          setUsersList(list);
-          // Tìm đúng user đang đăng nhập trong danh sách để cập nhật role chuẩn xác
+      if (meRes && meRes.status === 401) {
+        handleLogout();
+        return;
+      }
+
+      let effectiveRole = currentUser?.role || 'Member';
+      if (meRes && meRes.ok) {
+        const meData = await meRes.json();
+        if (meData?.role) {
+          effectiveRole = meData.role;
           setCurrentUser((prev) => {
             if (!prev) return prev;
-            const me = list.find(
-              (u) => u.email.trim().toLowerCase() === prev.email.trim().toLowerCase()
-            );
-            if (me && me.role && me.role !== prev.role) {
-              const updated = { ...prev, id: me.id || prev.id, role: me.role };
-              localStorage.setItem('smarthome_user', JSON.stringify(updated));
-              return updated;
-            }
-            return prev;
+            const updated: UserProfile = {
+              ...prev,
+              id: meData.id || prev.id,
+              name: meData.name || prev.name,
+              email: meData.email || prev.email,
+              role: meData.role,
+              owner_id: meData.owner_id ?? prev.owner_id,
+            };
+            localStorage.setItem('smarthome_user', JSON.stringify(updated));
+            return updated;
           });
         }
       }
 
       if (housesRes && housesRes.ok) {
         const data = await housesRes.json();
-        setHouses(Array.isArray(data) ? data : []);
+        const list = Array.isArray(data) ? data : [];
+        setHouses(list);
+        if (list.length > 0 && !newRoomHouseId) {
+          setNewRoomHouseId(list[0].id);
+        }
       }
 
       if (roomsRes && roomsRes.ok) {
@@ -323,89 +301,110 @@ export function App() {
         setAutomations(Array.isArray(data) ? data : []);
       }
 
+      if (energyRes && energyRes.ok) {
+        const data = await energyRes.json();
+        const totalKwh = Number(data?.total_kwh ?? 0);
+        const dailyRaw = Array.isArray(data?.daily)
+          ? data.daily
+          : Array.isArray(data?.chart_data)
+          ? data.chart_data
+          : [];
+        const normalizedDaily: EnergyPoint[] = dailyRaw.map(
+          (item: Record<string, unknown>, idx: number) => ({
+            label: String(item.label ?? item.day ?? `N${idx + 1}`),
+            kwh: Number(item.kwh ?? item.value ?? 0),
+            power_watt: Number(item.power_watt ?? 0),
+          })
+        );
+
+        setEnergyData({
+          total_kwh: totalKwh,
+          estimated_cost: Number(
+            data?.estimated_cost ?? data?.total_vnd ?? Math.round(totalKwh * 2500)
+          ),
+          peak_watt: Number(data?.peak_watt ?? 0),
+          daily: normalizedDaily,
+        });
+      }
+
       if (aiRes && aiRes.ok) {
         const data = await aiRes.json();
         setAiAlerts(Array.isArray(data) ? data : []);
       }
 
-      if (energyRes && energyRes.ok) {
-        const data = await energyRes.json();
-        const totalKwh = Number(data?.total_kwh ?? data?.totalKwh ?? 16.86);
-        const dailyRaw = Array.isArray(data?.daily) ? data.daily : [];
-        const normalizedDaily =
-          dailyRaw.length > 0
-            ? dailyRaw.map((item: Record<string, unknown>, i: number) => ({
-                label: String(item.label ?? item.day ?? item.date ?? `N${i + 1}`),
-                kwh: Number(item.kwh ?? item.value ?? 0),
-              }))
-            : [
-                { label: 'T2', kwh: 1.8 },
-                { label: 'T3', kwh: 2.1 },
-                { label: 'T4', kwh: 1.6 },
-                { label: 'T5', kwh: 2.4 },
-                { label: 'T6', kwh: 1.9 },
-                { label: 'T7', kwh: 2.6 },
-                { label: 'CN', kwh: 2.2 },
-              ];
-
-        setEnergyData({
-          total_kwh: totalKwh,
-          estimated_cost: Number(data?.estimated_cost ?? Math.round(totalKwh * 2500)),
-          daily: normalizedDaily,
-        });
+      const roleLower = effectiveRole.trim().toLowerCase();
+      if (roleLower === 'owner' || roleLower === 'admin') {
+        const usersRes = await fetch(`${API_BASE}/users`, { headers }).catch(() => null);
+        if (usersRes && usersRes.ok) {
+          const uData = await usersRes.json();
+          setUsersList(Array.isArray(uData) ? uData : []);
+        }
+      } else {
+        setUsersList([]);
       }
     } catch (err) {
-      console.error('Lỗi đồng bộ dữ liệu:', err);
+      console.error('Fetch error:', err);
     }
-  }, []);
+  };
 
   useEffect(() => {
-    if (currentUser) {
-      fetchAllDatabaseData();
-    }
-  }, [currentUser?.email, fetchAllDatabaseData]);
+    if (!currentUser) return;
+    fetchAllDatabaseData();
+    const interval = setInterval(() => fetchAllDatabaseData(), 15000);
+    return () => clearInterval(interval);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentUser?.id, energyPeriod]);
 
   // ==================== WEBSOCKET REALTIME ====================
   useEffect(() => {
     if (!currentUser) return;
+
     let ws: WebSocket | null = null;
     let reconnectTimer: ReturnType<typeof setTimeout>;
 
     const connectWs = () => {
       try {
         ws = new WebSocket(WS_URL);
-        ws.onopen = () => setWsConnected(true);
-        ws.onclose = () => {
-          setWsConnected(false);
-          reconnectTimer = setTimeout(connectWs, 3000);
+        ws.onopen = () => {
+          setWsConnected(true);
         };
-        ws.onerror = () => setWsConnected(false);
         ws.onmessage = (event) => {
           try {
             const msg = JSON.parse(event.data);
             if (msg.type === 'SENSOR_UPDATE' && msg.data) {
               setSensorData((prev) => ({
-                temperature: Number(msg.data.temperature ?? prev.temperature),
-                humidity: Number(msg.data.humidity ?? prev.humidity),
-                lux: Number(msg.data.lux ?? prev.lux),
-                motion: Boolean(msg.data.motion ?? prev.motion),
+                temperature: Number(msg.data.temperature ?? prev?.temperature ?? 0),
+                humidity: Number(msg.data.humidity ?? prev?.humidity ?? 0),
+                lux: Number(msg.data.lux ?? prev?.lux ?? 0),
+                motion: Boolean(msg.data.motion ?? prev?.motion ?? false),
               }));
             } else if (msg.type === 'DEVICE_UPDATE' && msg.data) {
               setDevices((prev) =>
                 prev.map((d) =>
                   d.id === msg.data.id || d.mqtt_topic === msg.data.mqtt_topic
-                    ? {
-                        ...d,
-                        is_on: Boolean(msg.data.is_on),
-                        status: msg.data.is_on ? 'ON' : 'OFF',
-                      }
+                    ? { ...d, is_on: Boolean(msg.data.is_on) }
                     : d
                 )
               );
+            } else if (msg.type === 'AI_ALERT' && msg.data) {
+              if (
+                !msg.data.owner_id ||
+                msg.data.owner_id === (currentUser.owner_id || currentUser.id)
+              ) {
+                setAiAlerts((prev) => [msg.data, ...prev].slice(0, 30));
+                appendLog(`AI ALERT: ${msg.data.message}`);
+              }
             }
           } catch {
-            // ignore
+            // ignore non-JSON frames
           }
+        };
+        ws.onclose = () => {
+          setWsConnected(false);
+          reconnectTimer = setTimeout(connectWs, 4000);
+        };
+        ws.onerror = () => {
+          setWsConnected(false);
         };
       } catch {
         setWsConnected(false);
@@ -417,7 +416,7 @@ export function App() {
       clearTimeout(reconnectTimer);
       if (ws) ws.close();
     };
-  }, [currentUser]);
+  }, [currentUser?.id]);
 
   // ==================== AUTH HANDLERS ====================
   const handleAuthSubmit = async (e: React.FormEvent) => {
@@ -438,49 +437,24 @@ export function App() {
         body: JSON.stringify(body),
       });
 
+      const data = await res.json();
       if (!res.ok) {
-        const errMsg = await readErrorText(res, 'Đăng nhập thất bại');
-        setAuthError(errMsg);
-        setAuthLoading(false);
+        setAuthError(data?.error || 'Xác thực thất bại, vui lòng thử lại.');
         return;
       }
 
-      const data = await res.json();
-      const token = data.token || data.access_token || '';
-      const jwt = parseJwtPayload(token);
-      const jwtRole = extractRoleFromJwt(token);
-
-      const resolvedRole =
-        (typeof data.user?.role === 'string' && data.user.role.trim()) ||
-        (typeof data.role === 'string' && data.role.trim()) ||
-        jwtRole ||
-        'Member';
-
-      const userObj: CurrentUser = {
-        id:
-          data.user?.id ||
-          data.id ||
-          (typeof jwt?.sub === 'string' ? jwt.sub : '') ||
-          '',
-        name:
-          data.user?.name ||
-          data.name ||
-          (typeof jwt?.name === 'string' ? jwt.name : '') ||
-          authEmail.split('@')[0],
-        email:
-          data.user?.email ||
-          data.email ||
-          (typeof jwt?.email === 'string' ? jwt.email : '') ||
-          authEmail,
-        role: resolvedRole,
-      };
-
-      localStorage.setItem('token', token || 'authenticated');
-      localStorage.setItem('smarthome_user', JSON.stringify(userObj));
-      setCurrentUser(userObj);
-      setActiveTab('overview');
+      if (data?.token && data?.user) {
+        localStorage.setItem('token', data.token);
+        localStorage.setItem('smarthome_user', JSON.stringify(data.user));
+        setCurrentUser(data.user);
+        setActiveTab('overview');
+        setAuthName('');
+        setAuthEmail('');
+        setAuthPassword('');
+        appendLog(`Đăng nhập thành công với vai trò ${data.user.role}.`);
+      }
     } catch {
-      setAuthError('Không thể kết nối tới Backend Rust (http://localhost:3000)');
+      setAuthError('Không thể kết nối tới máy chủ Backend.');
     } finally {
       setAuthLoading(false);
     }
@@ -491,594 +465,1222 @@ export function App() {
     localStorage.removeItem('smarthome_user');
     setCurrentUser(null);
     setUsersList([]);
-  };
-
-  // ==================== HOUSE MANUAL CRUD HANDLERS ====================
-  const openCreateHouseModal = () => {
-    if (!isOwnerOrAdmin) return;
+    setHouses([]);
+    setRooms([]);
+    setDevices([]);
+    setAutomations([]);
+    setAiAlerts([]);
+    setSensorData(null);
+    setEnergyData({ total_kwh: 0, estimated_cost: 0, peak_watt: 0, daily: [] });
+    setSelectedHouseId(null);
+    setSelectedRoomId(null);
+    setExcelPreviewSpace([]);
+    setSpaceExcelFileName('');
+    setExcelPreviewUsers([]);
+    setExcelFileName('');
     setEditingHouse(null);
-    setHouseNameInput('');
-    setHouseAddressInput('');
-    setHouseError('');
-    setIsHouseModalOpen(true);
-  };
-
-  const openEditHouseModal = (house: House, e: React.MouseEvent) => {
-    e.stopPropagation();
-    if (!isOwnerOrAdmin) return;
-    setEditingHouse(house);
-    setHouseNameInput(house.name);
-    setHouseAddressInput(house.address || '');
-    setHouseError('');
-    setIsHouseModalOpen(true);
-  };
-
-  const handleSaveHouse = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!isOwnerOrAdmin) return;
-    if (!houseNameInput.trim()) {
-      setHouseError('Tên ngôi nhà không được để trống');
-      return;
-    }
-
-    setHouseSaving(true);
-    setHouseError('');
-    try {
-      const url = editingHouse
-        ? `${API_BASE}/houses/${editingHouse.id}`
-        : `${API_BASE}/houses`;
-      const method = editingHouse ? 'PUT' : 'POST';
-
-      const res = await fetch(url, {
-        method,
-        headers: getAuthHeaders(true),
-        body: JSON.stringify({
-          name: houseNameInput.trim(),
-          address: houseAddressInput.trim(),
-        }),
-      });
-
-      if (!res.ok) {
-        setHouseError(
-          await readErrorText(res, editingHouse ? 'Lỗi cập nhật nhà' : 'Lỗi tạo nhà')
-        );
-        return;
-      }
-
-      addLog(
-        editingHouse
-          ? `HOUSE UPDATED: Đã cập nhật nhà "${houseNameInput.trim()}"`
-          : `HOUSE CREATED: Đã tạo ngôi nhà "${houseNameInput.trim()}"`
-      );
-      setIsHouseModalOpen(false);
-      await fetchAllDatabaseData();
-    } catch {
-      setHouseError('Lỗi kết nối tới server Backend');
-    } finally {
-      setHouseSaving(false);
-    }
-  };
-
-  const handleDeleteHouse = async (house: House, e: React.MouseEvent) => {
-    e.stopPropagation();
-    if (!isOwnerOrAdmin) return;
-    if (!window.confirm(`Xóa ngôi nhà "${house.name}"? Các phòng bên trong cũng sẽ bị xóa.`)) {
-      return;
-    }
-
-    try {
-      const res = await fetch(`${API_BASE}/houses/${house.id}`, {
-        method: 'DELETE',
-        headers: getAuthHeaders(false),
-      });
-      if (!res.ok) {
-        alert(await readErrorText(res, 'Không thể xóa ngôi nhà'));
-        return;
-      }
-      if (selectedHouseId === house.id) {
-        setSelectedHouseId(null);
-        setSelectedRoomId(null);
-      }
-      addLog(`HOUSE DELETED: Đã xóa ngôi nhà "${house.name}"`);
-      await fetchAllDatabaseData();
-    } catch {
-      alert('Lỗi kết nối khi xóa ngôi nhà');
-    }
-  };
-
-  // ==================== ROOM MANUAL CRUD HANDLERS ====================
-  const openCreateRoomModal = () => {
-    if (!isOwnerOrAdmin) return;
-    if (houses.length === 0) {
-      alert('Bạn cần tạo ít nhất 1 Ngôi nhà trước khi thêm Phòng.');
-      return;
-    }
     setEditingRoom(null);
-    setRoomHouseIdInput(selectedHouseId || houses[0].id);
-    setRoomNameInput('');
-    setRoomFloorInput(1);
-    setRoomError('');
-    setIsRoomModalOpen(true);
-  };
-
-  const openEditRoomModal = (room: Room, e: React.MouseEvent) => {
-    e.stopPropagation();
-    if (!isOwnerOrAdmin) return;
-    setEditingRoom(room);
-    setRoomHouseIdInput(room.house_id);
-    setRoomNameInput(room.name);
-    setRoomFloorInput(room.floor ?? 1);
-    setRoomError('');
-    setIsRoomModalOpen(true);
-  };
-
-  const handleSaveRoom = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!isOwnerOrAdmin) return;
-    if (!roomHouseIdInput) {
-      setRoomError('Vui lòng chọn ngôi nhà trực thuộc');
-      return;
-    }
-    if (!roomNameInput.trim()) {
-      setRoomError('Tên phòng không được để trống');
-      return;
-    }
-
-    setRoomSaving(true);
-    setRoomError('');
-    try {
-      const url = editingRoom
-        ? `${API_BASE}/rooms/${editingRoom.id}`
-        : `${API_BASE}/rooms`;
-      const method = editingRoom ? 'PUT' : 'POST';
-
-      const res = await fetch(url, {
-        method,
-        headers: getAuthHeaders(true),
-        body: JSON.stringify({
-          house_id: roomHouseIdInput,
-          name: roomNameInput.trim(),
-          floor: Number(roomFloorInput) || 1,
-        }),
-      });
-
-      if (!res.ok) {
-        setRoomError(
-          await readErrorText(res, editingRoom ? 'Lỗi cập nhật phòng' : 'Lỗi tạo phòng')
-        );
-        return;
-      }
-
-      addLog(
-        editingRoom
-          ? `ROOM UPDATED: Đã cập nhật phòng "${roomNameInput.trim()}"`
-          : `ROOM CREATED: Đã tạo phòng "${roomNameInput.trim()}"`
-      );
-      setIsRoomModalOpen(false);
-      await fetchAllDatabaseData();
-    } catch {
-      setRoomError('Lỗi kết nối tới server Backend');
-    } finally {
-      setRoomSaving(false);
-    }
-  };
-
-  const handleDeleteRoom = async (room: Room, e: React.MouseEvent) => {
-    e.stopPropagation();
-    if (!isOwnerOrAdmin) return;
-    if (!window.confirm(`Bạn có chắc muốn xóa phòng "${room.name}"?`)) {
-      return;
-    }
-
-    try {
-      const res = await fetch(`${API_BASE}/rooms/${room.id}`, {
-        method: 'DELETE',
-        headers: getAuthHeaders(false),
-      });
-      if (!res.ok) {
-        alert(await readErrorText(res, 'Không thể xóa phòng'));
-        return;
-      }
-      if (selectedRoomId === room.id) {
-        setSelectedRoomId(null);
-        setDeviceFilterMode('all');
-      }
-      addLog(`ROOM DELETED: Đã xóa phòng "${room.name}"`);
-      await fetchAllDatabaseData();
-    } catch {
-      alert('Lỗi kết nối khi xóa phòng');
-    }
-  };
-
-  // ==================== DEVICE MANUAL CRUD & CONTROL ====================
-  const openCreateDeviceModal = () => {
-    if (!isOwnerOrAdmin) return;
     setEditingDevice(null);
-    setDevNameInput('');
-    setDevTypeInput('light');
-    setDevRoomIdInput(selectedRoomId || '');
-    setDevTopicInput('smarthome/devices/');
-    setDevError('');
-    setIsDeviceModalOpen(true);
+    setEditingUser(null);
+    setActiveTab('overview');
+    setSystemLogs(['SYSTEM: Đã đăng xuất khỏi phiên làm việc.']);
   };
 
-  const openEditDeviceModal = (dev: DeviceItem) => {
-    if (!isOwnerOrAdmin) return;
-    setEditingDevice(dev);
-    setDevNameInput(dev.name);
-    setDevTypeInput(dev.device_type || 'switch');
-    setDevRoomIdInput(dev.room_id || '');
-    setDevTopicInput(dev.mqtt_topic || '');
-    setDevError('');
-    setIsDeviceModalOpen(true);
-  };
-
-  const handleSaveDevice = async (e: React.FormEvent) => {
+  // ==================== HOUSE / ROOM / DEVICE HANDLERS ====================
+  const handleCreateHouse = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!isOwnerOrAdmin) return;
-    if (!devNameInput.trim() || !devTopicInput.trim()) {
-      setDevError('Tên thiết bị và MQTT Topic không được để trống');
+    if (!newHouseName.trim()) return;
+
+    const res = await fetch(`${API_BASE}/houses`, {
+      method: 'POST',
+      headers: getAuthHeaders(),
+      body: JSON.stringify({ name: newHouseName.trim(), address: newHouseAddress.trim() }),
+    });
+    if (res.ok) {
+      appendLog(`Đã thêm ngôi nhà "${newHouseName.trim()}".`);
+      setNewHouseName('');
+      setNewHouseAddress('');
+      fetchAllDatabaseData();
+    } else {
+      const err = await res.json().catch(() => ({}));
+      alert(err.error || 'Không thể tạo ngôi nhà');
+    }
+  };
+
+  const handleUpdateHouse = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!editingHouse || !editingHouse.name.trim()) return;
+
+    const res = await fetch(`${API_BASE}/houses/${editingHouse.id}`, {
+      method: 'PUT',
+      headers: getAuthHeaders(),
+      body: JSON.stringify({
+        name: editingHouse.name.trim(),
+        address: editingHouse.address.trim(),
+      }),
+    });
+    if (res.ok) {
+      appendLog(`Đã cập nhật thông tin nhà "${editingHouse.name.trim()}".`);
+      setEditingHouse(null);
+      fetchAllDatabaseData();
+    } else {
+      const err = await res.json().catch(() => ({}));
+      alert(err.error || 'Không thể cập nhật ngôi nhà');
+    }
+  };
+
+  const handleDeleteHouse = async (house: House) => {
+    if (!confirm(`Xóa ngôi nhà "${house.name}" và toàn bộ phòng bên trong?`)) return;
+    const res = await fetch(`${API_BASE}/houses/${house.id}`, {
+      method: 'DELETE',
+      headers: getAuthHeaders(),
+    });
+    if (res.ok) {
+      if (selectedHouseId === house.id) setSelectedHouseId(null);
+      appendLog(`Đã xóa ngôi nhà "${house.name}".`);
+      fetchAllDatabaseData();
+    }
+  };
+
+  const handleCreateRoom = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const targetHouse = newRoomHouseId || houses[0]?.id;
+    if (!targetHouse || !newRoomName.trim()) {
+      alert('Vui lòng tạo ít nhất 1 Ngôi nhà trước khi thêm phòng.');
       return;
     }
 
-    setDevSaving(true);
-    setDevError('');
-    try {
-      const url = editingDevice
-        ? `${API_BASE}/devices/${editingDevice.id}`
-        : `${API_BASE}/devices`;
-      const method = editingDevice ? 'PUT' : 'POST';
-
-      const res = await fetch(url, {
-        method,
-        headers: getAuthHeaders(true),
-        body: JSON.stringify({
-          name: devNameInput.trim(),
-          device_type: devTypeInput,
-          mqtt_topic: devTopicInput.trim(),
-          room_id: devRoomIdInput || null,
-        }),
-      });
-
-      if (!res.ok) {
-        setDevError(await readErrorText(res, 'Không thể lưu thiết bị'));
-        return;
-      }
-
-      addLog(
-        editingDevice
-          ? `DEVICE UPDATED: Đã cập nhật thiết bị "${devNameInput.trim()}"`
-          : `DEVICE CREATED: Đã thêm thiết bị "${devNameInput.trim()}"`
-      );
-      setIsDeviceModalOpen(false);
-      await fetchAllDatabaseData();
-    } catch {
-      setDevError('Lỗi kết nối Backend khi lưu thiết bị');
-    } finally {
-      setDevSaving(false);
+    const res = await fetch(`${API_BASE}/rooms`, {
+      method: 'POST',
+      headers: getAuthHeaders(),
+      body: JSON.stringify({
+        house_id: targetHouse,
+        name: newRoomName.trim(),
+        floor: Number(newRoomFloor) || 1,
+      }),
+    });
+    if (res.ok) {
+      appendLog(`Đã thêm phòng "${newRoomName.trim()}".`);
+      setNewRoomName('');
+      fetchAllDatabaseData();
+    } else {
+      const err = await res.json().catch(() => ({}));
+      alert(err.error || 'Không thể tạo phòng');
     }
   };
 
-  const handleToggleDevice = async (dev: DeviceItem) => {
-    const nextState = !dev.is_on;
+  const handleUpdateRoom = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!editingRoom || !editingRoom.name.trim()) return;
+
+    const res = await fetch(`${API_BASE}/rooms/${editingRoom.id}`, {
+      method: 'PUT',
+      headers: getAuthHeaders(),
+      body: JSON.stringify({
+        house_id: editingRoom.house_id,
+        name: editingRoom.name.trim(),
+        floor: Number(editingRoom.floor) || 1,
+      }),
+    });
+    if (res.ok) {
+      appendLog(`Đã cập nhật phòng "${editingRoom.name.trim()}".`);
+      setEditingRoom(null);
+      fetchAllDatabaseData();
+    } else {
+      const err = await res.json().catch(() => ({}));
+      alert(err.error || 'Không thể cập nhật phòng');
+    }
+  };
+
+  const handleDeleteRoom = async (room: Room) => {
+    if (!confirm(`Xóa phòng "${room.name}"? Các thiết bị sẽ chuyển về Chưa phân phòng.`)) return;
+    const res = await fetch(`${API_BASE}/rooms/${room.id}`, {
+      method: 'DELETE',
+      headers: getAuthHeaders(),
+    });
+    if (res.ok) {
+      if (selectedRoomId === room.id) setSelectedRoomId(null);
+      appendLog(`Đã xóa phòng "${room.name}".`);
+      fetchAllDatabaseData();
+    }
+  };
+
+  const handleCreateDevice = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!newDeviceName.trim() || !newDeviceTopic.trim()) return;
+
+    const res = await fetch(`${API_BASE}/devices`, {
+      method: 'POST',
+      headers: getAuthHeaders(),
+      body: JSON.stringify({
+        name: newDeviceName.trim(),
+        device_type: newDeviceType,
+        mqtt_topic: newDeviceTopic.trim(),
+        room_id: newDeviceRoomId || null,
+      }),
+    });
+    if (res.ok) {
+      appendLog(`Đã thêm thiết bị "${newDeviceName.trim()}".`);
+      setNewDeviceName('');
+      setNewDeviceTopic('');
+      fetchAllDatabaseData();
+    } else {
+      const err = await res.json().catch(() => ({}));
+      alert(err.error || 'Không thể thêm thiết bị');
+    }
+  };
+
+  const handleUpdateDevice = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!editingDevice || !editingDevice.name.trim() || !editingDevice.mqtt_topic.trim()) return;
+
+    const res = await fetch(`${API_BASE}/devices/${editingDevice.id}`, {
+      method: 'PUT',
+      headers: getAuthHeaders(),
+      body: JSON.stringify({
+        name: editingDevice.name.trim(),
+        device_type: editingDevice.device_type,
+        mqtt_topic: editingDevice.mqtt_topic.trim(),
+        room_id: editingDevice.room_id || null,
+      }),
+    });
+    if (res.ok) {
+      appendLog(`Đã cập nhật thiết bị "${editingDevice.name.trim()}".`);
+      setEditingDevice(null);
+      fetchAllDatabaseData();
+    } else {
+      const err = await res.json().catch(() => ({}));
+      alert(err.error || 'Không thể cập nhật thiết bị');
+    }
+  };
+
+  const handleToggleDevice = async (device: Device) => {
+    const nextState = !device.is_on;
     setDevices((prev) =>
-      prev.map((d) =>
-        d.id === dev.id ? { ...d, is_on: nextState, status: nextState ? 'ON' : 'OFF' } : d
-      )
+      prev.map((d) => (d.id === device.id ? { ...d, is_on: nextState } : d))
     );
 
-    try {
-      await fetch(`${API_BASE}/devices/${dev.id}/control`, {
-        method: 'POST',
-        headers: getAuthHeaders(true),
-        body: JSON.stringify({
-          action: nextState ? 'ON' : 'OFF',
-          is_on: nextState,
-          mqtt_topic: dev.mqtt_topic,
-        }),
-      });
-      addLog(`MQTT CONTROL: ${dev.name} -> ${nextState ? 'ON' : 'OFF'}`);
-    } catch {
-      await fetchAllDatabaseData();
+    const res = await fetch(`${API_BASE}/devices/${device.id}/control`, {
+      method: 'POST',
+      headers: getAuthHeaders(),
+      body: JSON.stringify({ is_on: nextState, action: nextState ? 'ON' : 'OFF' }),
+    });
+
+    if (res.ok) {
+      appendLog(`MQTT [${device.mqtt_topic}] -> ${device.name}: ${nextState ? 'BẬT' : 'TẮT'}`);
+    } else {
+      setDevices((prev) =>
+        prev.map((d) => (d.id === device.id ? { ...d, is_on: !nextState } : d))
+      );
     }
   };
 
-  const handleDeleteDevice = async (dev: DeviceItem) => {
-    if (!isOwnerOrAdmin) return;
-    if (!window.confirm(`Xóa thiết bị "${dev.name}" khỏi hệ thống?`)) return;
-    try {
-      const res = await fetch(`${API_BASE}/devices/${dev.id}`, {
-        method: 'DELETE',
-        headers: getAuthHeaders(false),
-      });
-      if (res.ok) {
-        addLog(`DEVICE DELETED: Đã xóa "${dev.name}"`);
-        await fetchAllDatabaseData();
-      }
-    } catch {
-      alert('Lỗi khi xóa thiết bị');
+  const handleDeleteDevice = async (device: Device) => {
+    if (!confirm(`Xóa thiết bị "${device.name}"?`)) return;
+    const res = await fetch(`${API_BASE}/devices/${device.id}`, {
+      method: 'DELETE',
+      headers: getAuthHeaders(),
+    });
+    if (res.ok) {
+      appendLog(`Đã xóa thiết bị "${device.name}".`);
+      fetchAllDatabaseData();
     }
   };
 
-  const handleDiscoverWokwi = async () => {
-    if (!isOwnerOrAdmin) return;
-    setIsDiscoverModalOpen(true);
-    setIsDiscovering(true);
+  const handleDiscoverDevices = async () => {
+    setDiscoveringDevices(true);
     try {
       const res = await fetch(`${API_BASE}/devices/discover`, {
-        headers: getAuthHeaders(false),
+        headers: getAuthHeaders(),
       });
       if (res.ok) {
         const data = await res.json();
-        setDiscoveredList(Array.isArray(data) ? data : []);
+        const foundList = Array.isArray(data)
+          ? data
+          : Array.isArray(data?.devices)
+          ? data.devices
+          : [];
+        appendLog(`Quét MQTT Discovery: phát hiện ${foundList.length} thiết bị.`);
+        if (foundList.length === 0) {
+          alert('Hiện chưa có thiết bị mới nào phát tín hiệu trên topic smarthome/discovery.');
+        } else {
+          const existingTopics = new Set(devices.map((d) => d.mqtt_topic.trim().toLowerCase()));
+          const previewDiscovered: ExcelSpacePreviewItem[] = foundList.map(
+            (item: Record<string, unknown>, idx: number) => {
+              const topic = String(item.mqtt_topic || '').trim();
+              const name = String(item.name || topic || `Thiết bị MQTT ${idx + 1}`).trim();
+              const dType = String(item.device_type || 'switch').trim().toLowerCase();
+              const isDup = existingTopics.has(topic.toLowerCase());
+              return {
+                id: `discover-${idx}-${topic}`,
+                sheetName: 'MQTT Discovery',
+                rowNumber: idx + 1,
+                kind: 'device',
+                name,
+                deviceType: ['light', 'fan', 'ac', 'switch', 'sensor'].includes(dType)
+                  ? dType
+                  : 'switch',
+                mqttTopic: topic,
+                isValid: Boolean(topic) && !isDup,
+                errorReason: !topic
+                  ? 'Thiếu MQTT Topic'
+                  : isDup
+                  ? 'Thiết bị đã được kết nối trong nhà'
+                  : undefined,
+              };
+            }
+          );
+          setSpaceExcelFileName('MQTT Discovery (ESP32)');
+          setExcelPreviewSpace(previewDiscovered);
+        }
       }
-    } catch {
-      setDiscoveredList([]);
     } finally {
-      setIsDiscovering(false);
+      setDiscoveringDevices(false);
     }
   };
 
-  const handleAddDiscoveredDevice = async (item: DiscoveredDevice) => {
-    if (!isOwnerOrAdmin) return;
-    try {
-      const res = await fetch(`${API_BASE}/devices`, {
-        method: 'POST',
-        headers: getAuthHeaders(true),
-        body: JSON.stringify({
-          name: item.name,
-          device_type: item.device_type,
-          mqtt_topic: item.mqtt_topic,
-          room_id: selectedRoomId || null,
-        }),
+  // ==================== EXCEL HELPERS ====================
+  const normalizeExcelKey = (key: string): string =>
+    key
+      .trim()
+      .toLowerCase()
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .replace(/đ/g, 'd')
+      .replace(/[^a-z0-9]/g, '');
+
+  const readExcelRows = async (file: File): Promise<Record<string, unknown>[]> => {
+    const xlsxLib = (XLSX as unknown as { default?: typeof XLSX }).default || XLSX;
+    const buffer = await file.arrayBuffer();
+    const bytes = new Uint8Array(buffer);
+    const workbook = xlsxLib.read(bytes, { type: 'array' });
+    const firstSheet = workbook.SheetNames[0];
+    if (!firstSheet) return [];
+    const sheet = workbook.Sheets[firstSheet];
+    return xlsxLib.utils.sheet_to_json<Record<string, unknown>>(sheet, { defval: '' });
+  };
+
+  const readAllExcelSheets = async (
+    file: File
+  ): Promise<{ sheetName: string; rowNumber: number; data: Record<string, unknown> }[]> => {
+    const xlsxLib = (XLSX as unknown as { default?: typeof XLSX }).default || XLSX;
+    const buffer = await file.arrayBuffer();
+    const bytes = new Uint8Array(buffer);
+    const workbook = xlsxLib.read(bytes, { type: 'array' });
+    const allRows: { sheetName: string; rowNumber: number; data: Record<string, unknown> }[] = [];
+
+    for (const sheetName of workbook.SheetNames) {
+      const sheet = workbook.Sheets[sheetName];
+      if (!sheet) continue;
+      const rows = xlsxLib.utils.sheet_to_json<Record<string, unknown>>(sheet, { defval: '' });
+      rows.forEach((data, idx) => {
+        allRows.push({ sheetName, rowNumber: idx + 2, data });
       });
-      if (res.ok) {
-        setDiscoveredList((prev) => prev.filter((d) => d.mqtt_topic !== item.mqtt_topic));
-        addLog(`WOKWI PAIRED: Đã thêm "${item.name}"`);
-        await fetchAllDatabaseData();
-      }
-    } catch {
-      alert('Không thể thêm thiết bị Wokwi');
     }
+    return allRows;
   };
 
-  // ==================== ACCOUNT MANUAL CRUD HANDLERS (CHỈ OWNER/ADMIN) ====================
-  const handleCreateAccountManual = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!isOwnerOrAdmin) return;
-    if (!accNameInput.trim() || !accEmailInput.trim()) {
-      setAccountError('Họ tên và Email không được để trống');
+  // ==================== EXCEL EXPORT & IMPORT SPACES / DEVICES ====================
+  const handleExportExcel = () => {
+    const xlsxLib = (XLSX as unknown as { default?: typeof XLSX }).default || XLSX;
+    const workbook = xlsxLib.utils.book_new();
+
+    // Sheet 1: Nhà & Phòng
+    const spaceRows: Record<string, unknown>[] = [];
+    if (rooms.length > 0) {
+      rooms.forEach((r, idx) => {
+        const houseObj = houses.find((h) => h.id === r.house_id);
+        spaceRows.push({
+          STT: idx + 1,
+          TenNha: r.house_name || houseObj?.name || 'Nhà chính',
+          DiaChi: houseObj?.address || '',
+          TenPhong: r.name,
+          Tang: r.floor || 1,
+        });
+      });
+    } else if (houses.length > 0) {
+      houses.forEach((h, idx) => {
+        spaceRows.push({
+          STT: idx + 1,
+          TenNha: h.name,
+          DiaChi: h.address || '',
+          TenPhong: '',
+          Tang: 1,
+        });
+      });
+    } else {
+      spaceRows.push({
+        STT: 1,
+        TenNha: 'Nhà Quận 7',
+        DiaChi: '123 Nguyễn Văn Linh',
+        TenPhong: 'Phòng khách',
+        Tang: 1,
+      });
+    }
+    const spaceSheet = xlsxLib.utils.json_to_sheet(spaceRows);
+    xlsxLib.utils.book_append_sheet(workbook, spaceSheet, 'Nha_Va_Phong');
+
+    // Sheet 2: Thiết bị IoT
+    const deviceRows =
+      devices.length > 0
+        ? devices.map((d, idx) => ({
+            STT: idx + 1,
+            TenThietBi: d.name,
+            LoaiThietBi: d.device_type,
+            MqttTopic: d.mqtt_topic,
+            Phong: d.room_name || '',
+            TrangThai: d.is_on ? 'BẬT' : 'TẮT',
+          }))
+        : [
+            {
+              STT: 1,
+              TenThietBi: 'Đèn trần phòng khách',
+              LoaiThietBi: 'light',
+              MqttTopic: 'smarthome/devices/led_phong_khach',
+              Phong: 'Phòng khách',
+              TrangThai: 'TẮT',
+            },
+          ];
+    const deviceSheet = xlsxLib.utils.json_to_sheet(deviceRows);
+    xlsxLib.utils.book_append_sheet(workbook, deviceSheet, 'ThietBi_SmartHome');
+
+    xlsxLib.writeFile(
+      workbook,
+      `SmartHome_Nha_Phong_ThietBi_${new Date().toISOString().slice(0, 10)}.xlsx`
+    );
+    appendLog('Đã xuất file Excel Nhà, Phòng & Thiết bị (.xlsx).');
+  };
+
+  // Bước 1: Tải file Excel Nhà / Phòng / Thiết bị -> Hiển thị danh sách kiểm tra hợp lệ
+  const handleImportExcel = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    let rawEntries: { sheetName: string; rowNumber: number; data: Record<string, unknown> }[] = [];
+    try {
+      rawEntries = await readAllExcelSheets(file);
+    } catch (err) {
+      console.error('Parse space Excel error:', err);
+      alert(`Lỗi đọc file Excel: ${(err as Error)?.message || 'File không hợp lệ'}`);
+      if (fileInputRef.current) fileInputRef.current.value = '';
       return;
     }
 
-    setAccountSaving(true);
-    setAccountError('');
-    try {
-      const res = await fetch(`${API_BASE}/users`, {
-        method: 'POST',
-        headers: getAuthHeaders(true),
-        body: JSON.stringify({
-          name: accNameInput.trim(),
-          email: accEmailInput.trim(),
-          password: accPasswordInput || '123456',
-          role: accRoleInput,
-        }),
+    if (rawEntries.length === 0) {
+      alert('File Excel trống, không có dòng dữ liệu nào.');
+      if (fileInputRef.current) fileInputRef.current.value = '';
+      return;
+    }
+
+    const existingHouseNames = new Set(houses.map((h) => h.name.trim().toLowerCase()));
+    const existingRoomKeys = new Set(
+      rooms.map(
+        (r) => `${(r.house_name || '').trim().toLowerCase()}::${r.name.trim().toLowerCase()}`
+      )
+    );
+    const existingRoomNamesOnly = new Set(rooms.map((r) => r.name.trim().toLowerCase()));
+    const existingDeviceTopics = new Set(devices.map((d) => d.mqtt_topic.trim().toLowerCase()));
+
+    const seenHousesInFile = new Set<string>();
+    const seenRoomsInFile = new Set<string>();
+    const seenTopicsInFile = new Set<string>();
+    const detectedColumns = new Set<string>();
+
+    const previewList: ExcelSpacePreviewItem[] = [];
+
+    rawEntries.forEach((entry, idx) => {
+      const norm: Record<string, string> = {};
+      Object.entries(entry.data).forEach(([k, v]) => {
+        detectedColumns.add(k);
+        norm[normalizeExcelKey(k)] = String(v ?? '').trim();
       });
 
-      if (!res.ok) {
-        setAccountError(await readErrorText(res, 'Không thể tạo tài khoản'));
+      const houseName =
+        norm['tennha'] || norm['nha'] || norm['house'] || norm['housename'] || '';
+      const address = norm['diachi'] || norm['address'] || '';
+      const roomName =
+        norm['tenphong'] || norm['phong'] || norm['room'] || norm['roomname'] || '';
+      const floorRaw = norm['tang'] || norm['floor'] || '1';
+      const floor = Number.parseInt(floorRaw, 10) || 1;
+
+      const deviceName =
+        norm['tenthietbi'] || norm['thietbi'] || norm['device'] || norm['devicename'] || '';
+      const mqttTopic = norm['mqtttopic'] || norm['topic'] || norm['mqtt'] || '';
+      const rawDeviceType = (
+        norm['loaithietbi'] ||
+        norm['loai'] ||
+        norm['devicetype'] ||
+        norm['type'] ||
+        'switch'
+      ).toLowerCase();
+
+      if (!houseName && !roomName && !deviceName && !mqttTopic) {
         return;
       }
 
-      addLog(`ACCOUNT CREATED: Đã tạo tài khoản "${accEmailInput.trim()}"`);
-      setAccNameInput('');
-      setAccEmailInput('');
-      setAccPasswordInput('123456');
-      setIsAccountModalOpen(false);
-      await fetchAllDatabaseData();
-    } catch {
-      setAccountError('Lỗi kết nối tới Backend');
-    } finally {
-      setAccountSaving(false);
-    }
-  };
+      // Nhánh 1: Dòng khai báo Thiết bị IoT
+      if (deviceName || mqttTopic) {
+        let isValid = true;
+        let errorReason = '';
 
-  const handleDeleteUser = async (user: UserAccount) => {
-    if (!isOwnerOrAdmin) return;
-    if (!window.confirm(`Xóa tài khoản "${user.email}"?`)) return;
-    try {
-      const res = await fetch(`${API_BASE}/users/${user.id}`, {
-        method: 'DELETE',
-        headers: getAuthHeaders(false),
-      });
-      if (!res.ok) {
-        alert(await readErrorText(res, 'Không thể xóa tài khoản'));
+        if (!deviceName) {
+          isValid = false;
+          errorReason = 'Thiếu tên thiết bị (TenThietBi)';
+        } else if (!mqttTopic) {
+          isValid = false;
+          errorReason = 'Thiếu MQTT Topic (MqttTopic)';
+        } else if (existingDeviceTopics.has(mqttTopic.toLowerCase())) {
+          isValid = false;
+          errorReason = 'MQTT Topic đã tồn tại trong nhà';
+        } else if (seenTopicsInFile.has(mqttTopic.toLowerCase())) {
+          isValid = false;
+          errorReason = 'Trùng MQTT Topic ngay trong file Excel';
+        }
+
+        if (mqttTopic) seenTopicsInFile.add(mqttTopic.toLowerCase());
+
+        const validTypes = ['light', 'fan', 'ac', 'switch', 'sensor'];
+        const normalizedType = validTypes.includes(rawDeviceType) ? rawDeviceType : 'switch';
+
+        previewList.push({
+          id: `${entry.sheetName}-${entry.rowNumber}-${idx}`,
+          sheetName: entry.sheetName,
+          rowNumber: entry.rowNumber,
+          kind: 'device',
+          name: deviceName,
+          houseName,
+          roomName,
+          deviceType: normalizedType,
+          mqttTopic,
+          isValid,
+          errorReason: isValid ? undefined : errorReason,
+        });
         return;
       }
-      addLog(`ACCOUNT DELETED: Đã xóa "${user.email}"`);
-      await fetchAllDatabaseData();
-    } catch {
-      alert('Không thể xóa tài khoản');
+
+      // Nhánh 2: Dòng khai báo Phòng
+      if (roomName) {
+        const hKey = houseName.toLowerCase();
+        const rKey = roomName.toLowerCase();
+        const compositeKey = `${hKey}::${rKey}`;
+
+        let isValid = true;
+        let errorReason = '';
+
+        const isDupInDb = hKey
+          ? existingRoomKeys.has(compositeKey)
+          : existingRoomNamesOnly.has(rKey);
+
+        if (isDupInDb) {
+          isValid = false;
+          errorReason = `Phòng "${roomName}" đã tồn tại`;
+        } else if (seenRoomsInFile.has(compositeKey)) {
+          isValid = false;
+          errorReason = 'Trùng tên phòng ngay trong file Excel';
+        }
+
+        seenRoomsInFile.add(compositeKey);
+
+        previewList.push({
+          id: `${entry.sheetName}-${entry.rowNumber}-${idx}`,
+          sheetName: entry.sheetName,
+          rowNumber: entry.rowNumber,
+          kind: 'room',
+          name: roomName,
+          houseName: houseName || houses[0]?.name || 'Nhà chính',
+          floor,
+          isValid,
+          errorReason: isValid ? undefined : errorReason,
+        });
+        return;
+      }
+
+      // Nhánh 3: Dòng khai báo Ngôi nhà
+      if (houseName) {
+        const hKey = houseName.toLowerCase();
+        let isValid = true;
+        let errorReason = '';
+
+        if (existingHouseNames.has(hKey)) {
+          isValid = false;
+          errorReason = `Ngôi nhà "${houseName}" đã tồn tại`;
+        } else if (seenHousesInFile.has(hKey)) {
+          isValid = false;
+          errorReason = 'Trùng tên nhà ngay trong file Excel';
+        }
+
+        seenHousesInFile.add(hKey);
+
+        previewList.push({
+          id: `${entry.sheetName}-${entry.rowNumber}-${idx}`,
+          sheetName: entry.sheetName,
+          rowNumber: entry.rowNumber,
+          kind: 'house',
+          name: houseName,
+          address,
+          isValid,
+          errorReason: isValid ? undefined : errorReason,
+        });
+      }
+    });
+
+    if (fileInputRef.current) fileInputRef.current.value = '';
+
+    if (previewList.length === 0) {
+      alert(
+        `Không nhận diện được cột dữ liệu hợp lệ trong file "${file.name}".\n` +
+          `Các cột đọc được: ${Array.from(detectedColumns).join(', ') || '(Trống)'}\n\n` +
+          `Gợi ý tên cột chuẩn:\n` +
+          `• Nhà & Phòng: TenNha, DiaChi, TenPhong, Tang\n` +
+          `• Thiết bị: TenThietBi, LoaiThietBi, MqttTopic, Phong`
+      );
+      return;
     }
+
+    const validCount = previewList.filter((i) => i.isValid).length;
+    setSpaceExcelFileName(file.name);
+    setExcelPreviewSpace(previewList);
+    appendLog(
+      `Đã đọc file "${file.name}": ${validCount}/${previewList.length} mục Nhà/Phòng/Thiết bị hợp lệ.`
+    );
   };
 
-  // ==================== AUTOMATION & AI HANDLERS ====================
-  const handleCreateAutomation = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!isOwnerOrAdmin || !autoName.trim()) return;
-    try {
-      const res = await fetch(`${API_BASE}/automations`, {
+  const handleRemovePreviewSpaceItem = (id: string) => {
+    setExcelPreviewSpace((prev) => {
+      const next = prev.filter((item) => item.id !== id);
+      if (next.length === 0) setSpaceExcelFileName('');
+      return next;
+    });
+  };
+
+  // Bước 2: Xác nhận lưu các mục Nhà / Phòng / Thiết bị hợp lệ vào PostgreSQL
+  const handleConfirmImportSpaceItems = async () => {
+    const validItems = excelPreviewSpace.filter((i) => i.isValid);
+    if (validItems.length === 0) return;
+
+    setIsImportingSpace(true);
+    let createdCount = 0;
+    const failedMap = new Map<string, string>();
+
+    const houseNameToId = new Map<string, string>();
+    houses.forEach((h) => houseNameToId.set(h.name.trim().toLowerCase(), h.id));
+
+    const roomNameToId = new Map<string, string>();
+    rooms.forEach((r) => roomNameToId.set(r.name.trim().toLowerCase(), r.id));
+
+    const ensureHouseId = async (houseTitle?: string, addr = ''): Promise<string | null> => {
+      const cleanName = (houseTitle || '').trim();
+      if (!cleanName) {
+        return houses[0]?.id || Array.from(houseNameToId.values())[0] || null;
+      }
+      const key = cleanName.toLowerCase();
+      if (houseNameToId.has(key)) return houseNameToId.get(key)!;
+
+      const res = await fetch(`${API_BASE}/houses`, {
         method: 'POST',
-        headers: getAuthHeaders(true),
-        body: JSON.stringify({
-          name: autoName.trim(),
-          condition_type: autoCondType,
-          operator: autoOperator,
-          threshold: Number(autoThreshold),
-          device_id: autoDeviceId,
-          action: autoAction,
-          is_active: true,
-        }),
+        headers: getAuthHeaders(),
+        body: JSON.stringify({ name: cleanName, address: addr }),
       });
       if (res.ok) {
-        setAutoName('');
-        addLog(`AUTOMATION CREATED: Đã tạo kịch bản "${autoName.trim()}"`);
-        await fetchAllDatabaseData();
+        const created = await res.json().catch(() => null);
+        if (created?.id) {
+          houseNameToId.set(key, created.id);
+          return created.id;
+        }
       }
-    } catch {
-      alert('Không thể tạo kịch bản');
+      return houses[0]?.id || Array.from(houseNameToId.values())[0] || null;
+    };
+
+    try {
+      // 1. Tạo các Ngôi nhà trước
+      for (const item of validItems.filter((i) => i.kind === 'house')) {
+        const res = await fetch(`${API_BASE}/houses`, {
+          method: 'POST',
+          headers: getAuthHeaders(),
+          body: JSON.stringify({ name: item.name, address: item.address || '' }),
+        });
+        if (res.ok) {
+          const created = await res.json().catch(() => null);
+          if (created?.id) {
+            houseNameToId.set(item.name.trim().toLowerCase(), created.id);
+          }
+          createdCount++;
+        } else {
+          const err = await res.json().catch(() => ({}));
+          failedMap.set(item.id, err.error || `Lỗi HTTP ${res.status}`);
+        }
+      }
+
+      // 2. Tạo các Phòng (tự tạo Nhà nếu file Excel có khai báo TenNha mới)
+      for (const item of validItems.filter((i) => i.kind === 'room')) {
+        const targetHouseId = await ensureHouseId(item.houseName);
+        if (!targetHouseId) {
+          failedMap.set(item.id, 'Chưa có Ngôi nhà để gắn phòng');
+          continue;
+        }
+
+        const res = await fetch(`${API_BASE}/rooms`, {
+          method: 'POST',
+          headers: getAuthHeaders(),
+          body: JSON.stringify({
+            house_id: targetHouseId,
+            name: item.name,
+            floor: item.floor || 1,
+          }),
+        });
+        if (res.ok) {
+          createdCount++;
+        } else {
+          const err = await res.json().catch(() => ({}));
+          const rawMsg = String(err.error || `Lỗi HTTP ${res.status}`);
+          const friendlyMsg =
+            rawMsg.includes('devices_mqtt_topic_key') ||
+            rawMsg.includes('idx_devices_owner_mqtt_topic')
+              ? 'MQTT Topic này đã tồn tại trên hệ thống'
+              : rawMsg;
+          failedMap.set(item.id, friendlyMsg);
+        }
+      }
+
+      // 3. Tạo các Thiết bị IoT (tự động gán vào Phòng vừa tạo hoặc Phòng đã có)
+      for (const item of validItems.filter((i) => i.kind === 'device')) {
+        let targetRoomId: string | null = null;
+        if (item.roomName) {
+          const rKey = item.roomName.trim().toLowerCase();
+          if (roomNameToId.has(rKey)) {
+            targetRoomId = roomNameToId.get(rKey)!;
+          } else {
+            const hId = await ensureHouseId(item.houseName);
+            if (hId) {
+              const roomRes = await fetch(`${API_BASE}/rooms`, {
+                method: 'POST',
+                headers: getAuthHeaders(),
+                body: JSON.stringify({ house_id: hId, name: item.roomName.trim(), floor: 1 }),
+              });
+              if (roomRes.ok) {
+                const createdRoom = await roomRes.json().catch(() => null);
+                if (createdRoom?.id) {
+                  roomNameToId.set(rKey, createdRoom.id);
+                  targetRoomId = createdRoom.id;
+                }
+              }
+            }
+          }
+        }
+
+        const res = await fetch(`${API_BASE}/devices`, {
+          method: 'POST',
+          headers: getAuthHeaders(),
+          body: JSON.stringify({
+            name: item.name,
+            device_type: item.deviceType || 'switch',
+            mqtt_topic: item.mqttTopic,
+            room_id: targetRoomId,
+          }),
+        });
+        if (res.ok) {
+          createdCount++;
+        } else {
+          const err = await res.json().catch(() => ({}));
+          failedMap.set(item.id, err.error || `Lỗi HTTP ${res.status}`);
+        }
+      }
+
+      appendLog(`Đã nhập thành công ${createdCount} mục Nhà/Phòng/Thiết bị từ Excel.`);
+      await fetchAllDatabaseData();
+
+      if (failedMap.size === 0) {
+        setExcelPreviewSpace([]);
+        setSpaceExcelFileName('');
+      } else {
+        setExcelPreviewSpace((prev) =>
+          prev
+            .filter((item) => !item.isValid || failedMap.has(item.id))
+            .map((item) =>
+              failedMap.has(item.id)
+                ? { ...item, isValid: false, errorReason: failedMap.get(item.id) }
+                : item
+            )
+        );
+      }
+    } finally {
+      setIsImportingSpace(false);
+    }
+  };
+
+  // ==================== AUTOMATION HANDLERS ====================
+  const handleCreateAutomation = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!newAutoName.trim() || !newAutoCondition.trim() || !newAutoAction.trim()) return;
+
+    const res = await fetch(`${API_BASE}/automations`, {
+      method: 'POST',
+      headers: getAuthHeaders(),
+      body: JSON.stringify({
+        name: newAutoName.trim(),
+        condition_text: newAutoCondition.trim(),
+        action_text: newAutoAction.trim(),
+      }),
+    });
+
+    if (res.ok) {
+      appendLog(`Đã tạo kịch bản "${newAutoName.trim()}".`);
+      setNewAutoName('');
+      setNewAutoCondition('');
+      setNewAutoAction('');
+      fetchAllDatabaseData();
     }
   };
 
   const handleToggleAutomation = async (rule: AutomationRule) => {
-    if (!isOwnerOrAdmin) return;
-    try {
-      await fetch(`${API_BASE}/automations/${rule.id}/toggle`, {
-        method: 'POST',
-        headers: getAuthHeaders(false),
-      });
-      await fetchAllDatabaseData();
-    } catch {
-      // ignore
+    const next = !rule.is_active;
+    setAutomations((prev) =>
+      prev.map((a) => (a.id === rule.id ? { ...a, is_active: next } : a))
+    );
+    await fetch(`${API_BASE}/automations/${rule.id}/toggle`, {
+      method: 'POST',
+      headers: getAuthHeaders(),
+      body: JSON.stringify({ is_active: next }),
+    });
+  };
+
+  const handleDeleteAutomation = async (rule: AutomationRule) => {
+    if (!confirm(`Xóa kịch bản "${rule.name}"?`)) return;
+    const res = await fetch(`${API_BASE}/automations/${rule.id}`, {
+      method: 'DELETE',
+      headers: getAuthHeaders(),
+    });
+    if (res.ok) {
+      appendLog(`Đã xóa kịch bản "${rule.name}".`);
+      fetchAllDatabaseData();
     }
   };
 
-  const handleDeleteAutomation = async (id: string) => {
-    if (!isOwnerOrAdmin) return;
-    try {
-      await fetch(`${API_BASE}/automations/${id}`, {
-        method: 'DELETE',
-        headers: getAuthHeaders(false),
-      });
-      await fetchAllDatabaseData();
-    } catch {
-      // ignore
-    }
-  };
-
+  // ==================== AI ANOMALY HANDLER ====================
   const handleSimulateAnomaly = async () => {
-    if (!isOwnerOrAdmin) return;
-    try {
-      await fetch(`${API_BASE}/ai/simulate-anomaly`, {
-        method: 'POST',
-        headers: getAuthHeaders(false),
-      });
-      addLog('AI ENGINE: Đã chạy mô phỏng phát hiện bất thường');
-      await fetchAllDatabaseData();
-    } catch {
-      // ignore
+    const res = await fetch(`${API_BASE}/ai/simulate-anomaly`, {
+      method: 'POST',
+      headers: getAuthHeaders(),
+      body: JSON.stringify({ temperature: 65.0, sensor_id: 'ESP32-DHT22-01' }),
+    });
+    if (res.ok) {
+      appendLog('Đã kích hoạt mô phỏng cảnh báo quá nhiệt AI.');
+      fetchAllDatabaseData();
     }
   };
 
-  // ==================== COMPUTED DATA ====================
-  const filteredRooms = selectedHouseId
-    ? rooms.filter((r) => r.house_id === selectedHouseId)
-    : rooms;
+  // ==================== ACCOUNT MANAGEMENT HANDLERS ====================
+  const handleCreateSubUser = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!newUserName.trim() || !newUserEmail.trim() || !newUserPassword.trim()) return;
 
-  const unassignedDevicesCount = devices.filter((d) => !d.room_id).length;
+    const res = await fetch(`${API_BASE}/users`, {
+      method: 'POST',
+      headers: getAuthHeaders(),
+      body: JSON.stringify({
+        name: newUserName.trim(),
+        email: newUserEmail.trim(),
+        password: newUserPassword,
+        role: newUserRole,
+      }),
+    });
 
-  const filteredDevices = devices.filter((d) => {
-    if (selectedRoomId) {
-      return d.room_id === selectedRoomId;
+    const data = await res.json().catch(() => ({}));
+    if (res.ok) {
+      appendLog(`Đã tạo tài khoản thành viên ${newUserEmail.trim()} (${newUserRole}).`);
+      setNewUserName('');
+      setNewUserEmail('');
+      setNewUserPassword('');
+      setNewUserRole('Member');
+      fetchAllDatabaseData();
+    } else {
+      alert(data.error || 'Không thể tạo tài khoản');
     }
-    if (deviceFilterMode === 'unassigned') {
-      return !d.room_id;
+  };
+
+  const handleUpdateUser = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!editingUser || !editingUser.name.trim()) return;
+
+    const res = await fetch(`${API_BASE}/users/${editingUser.id}`, {
+      method: 'PUT',
+      headers: getAuthHeaders(),
+      body: JSON.stringify({
+        name: editingUser.name.trim(),
+        role: editingUser.role,
+      }),
+    });
+    if (res.ok) {
+      appendLog(`Đã cập nhật tài khoản ${editingUser.email} (${editingUser.role}).`);
+      setEditingUser(null);
+      fetchAllDatabaseData();
+    } else {
+      const err = await res.json().catch(() => ({}));
+      alert(err.error || 'Không thể cập nhật tài khoản');
+    }
+  };
+
+  const handleDeleteUser = async (u: UserProfile) => {
+    if (!confirm(`Xóa tài khoản "${u.name}" (${u.email}) khỏi gia đình?`)) return;
+    const res = await fetch(`${API_BASE}/users/${u.id}`, {
+      method: 'DELETE',
+      headers: getAuthHeaders(),
+    });
+    if (res.ok) {
+      appendLog(`Đã xóa tài khoản ${u.email}.`);
+      fetchAllDatabaseData();
+    } else {
+      const err = await res.json().catch(() => ({}));
+      alert(err.error || 'Không thể xóa tài khoản này');
+    }
+  };
+
+  // ==================== EXCEL EXPORT & IMPORT USERS ====================
+  const handleExportUsersExcel = () => {
+    const xlsxLib = (XLSX as unknown as { default?: typeof XLSX }).default || XLSX;
+    const sourceList = usersList.length > 0 ? usersList : currentUser ? [currentUser] : [];
+    const rows = sourceList.map((u, idx) => ({
+      STT: idx + 1,
+      HoTen: u.name,
+      Email: u.email,
+      MatKhau: '',
+      VaiTro: u.role,
+    }));
+
+    const worksheet = xlsxLib.utils.json_to_sheet(
+      rows.length > 0
+        ? rows
+        : [
+            {
+              STT: 1,
+              HoTen: 'Nguyễn Văn C',
+              Email: 'member1@family.vn',
+              MatKhau: '123456',
+              VaiTro: 'Member',
+            },
+          ]
+    );
+    const workbook = xlsxLib.utils.book_new();
+    xlsxLib.utils.book_append_sheet(workbook, worksheet, 'TaiKhoan_GiaDinh');
+    xlsxLib.writeFile(workbook, `SmartHome_Accounts_${new Date().toISOString().slice(0, 10)}.xlsx`);
+    appendLog('Đã xuất danh sách tài khoản gia đình ra file Excel (.xlsx).');
+  };
+
+  // Bước 1: Tải file Excel tài khoản lên -> Kiểm tra từng dòng và hiển thị danh sách hợp lệ
+  const handleImportUsersExcel = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    let jsonRows: Record<string, unknown>[] = [];
+    try {
+      jsonRows = await readExcelRows(file);
+    } catch (err) {
+      console.error('Parse Excel error:', err);
+      alert(`Lỗi đọc file Excel: ${(err as Error)?.message || 'File không hợp lệ'}`);
+      if (userExcelInputRef.current) userExcelInputRef.current.value = '';
+      return;
+    }
+
+    if (jsonRows.length === 0) {
+      alert('File Excel trống, không có dòng dữ liệu nào.');
+      if (userExcelInputRef.current) userExcelInputRef.current.value = '';
+      return;
+    }
+
+    const existingEmails = new Set<string>(
+      [...usersList, ...(currentUser ? [currentUser] : [])].map((u) =>
+        u.email.trim().toLowerCase()
+      )
+    );
+    const seenInFile = new Set<string>();
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+    const previewItems: ExcelUserPreviewItem[] = jsonRows.map((row, idx) => {
+      const normalizedRow: Record<string, string> = {};
+      Object.entries(row).forEach(([k, v]) => {
+        normalizedRow[normalizeExcelKey(k)] = String(v ?? '').trim();
+      });
+
+      const name =
+        normalizedRow['hoten'] ||
+        normalizedRow['tenthanhvien'] ||
+        normalizedRow['hovaten'] ||
+        normalizedRow['name'] ||
+        normalizedRow['fullname'] ||
+        '';
+
+      const email = (
+        normalizedRow['email'] ||
+        normalizedRow['emaildangnhap'] ||
+        ''
+      ).toLowerCase();
+
+      const rawPassword =
+        normalizedRow['matkhau'] ||
+        normalizedRow['password'] ||
+        '';
+
+      const rawRole = (
+        normalizedRow['vaitro'] ||
+        normalizedRow['role'] ||
+        ''
+      ).toLowerCase();
+
+      let isValid = true;
+      let errorReason = '';
+
+      if (!name) {
+        isValid = false;
+        errorReason = 'Thiếu họ và tên';
+      } else if (!email || !emailRegex.test(email)) {
+        isValid = false;
+        errorReason = 'Email không hợp lệ';
+      } else if (existingEmails.has(email)) {
+        isValid = false;
+        errorReason = 'Email đã tồn tại trong gia đình';
+      } else if (seenInFile.has(email)) {
+        isValid = false;
+        errorReason = 'Trùng email ngay trong file Excel';
+      } else if (rawRole && !['admin', 'member', 'guest'].includes(rawRole)) {
+        isValid = false;
+        errorReason = `Vai trò "${rawRole}" không hợp lệ (chỉ nhận Admin/Member/Guest)`;
+      }
+
+      if (email) {
+        seenInFile.add(email);
+      }
+
+      const normalizedRole: 'Admin' | 'Member' | 'Guest' =
+        rawRole === 'admin' ? 'Admin' : rawRole === 'guest' ? 'Guest' : 'Member';
+
+      return {
+        rowNumber: idx + 2,
+        name,
+        email,
+        password: rawPassword || '123456',
+        isDefaultPassword: !rawPassword,
+        role: normalizedRole,
+        isValid,
+        errorReason: isValid ? undefined : errorReason,
+      };
+    });
+
+    const validCount = previewItems.filter((i) => i.isValid).length;
+    setExcelFileName(file.name);
+    setExcelPreviewUsers(previewItems);
+    appendLog(
+      `Đã đọc file "${file.name}": ${validCount}/${previewItems.length} tài khoản hợp lệ.`
+    );
+
+    if (userExcelInputRef.current) userExcelInputRef.current.value = '';
+  };
+
+  const handleRemovePreviewUser = (rowNumber: number) => {
+    setExcelPreviewUsers((prev) => {
+      const next = prev.filter((item) => item.rowNumber !== rowNumber);
+      if (next.length === 0) setExcelFileName('');
+      return next;
+    });
+  };
+
+  // Bước 2: Xác nhận tạo chỉ các tài khoản hợp lệ
+  const handleConfirmImportValidUsers = async () => {
+    const validItems = excelPreviewUsers.filter((item) => item.isValid);
+    if (validItems.length === 0) return;
+
+    setIsImportingUsers(true);
+    let createdCount = 0;
+    const failedMap = new Map<number, string>();
+
+    try {
+      for (const item of validItems) {
+        const res = await fetch(`${API_BASE}/users`, {
+          method: 'POST',
+          headers: getAuthHeaders(),
+          body: JSON.stringify({
+            name: item.name,
+            email: item.email,
+            password: item.password,
+            role: item.role,
+          }),
+        });
+
+        if (res.ok) {
+          createdCount++;
+        } else {
+          const errData = await res.json().catch(() => ({}));
+          const rawMsg = String(errData.error || `Lỗi HTTP ${res.status}`);
+          const friendlyMsg = rawMsg.includes('users_email_key')
+            ? 'Email đã được đăng ký ở tài khoản khác trên hệ thống'
+            : rawMsg;
+          failedMap.set(item.rowNumber, friendlyMsg);
+        }
+      }
+
+      appendLog(`Đã tạo thành công ${createdCount} tài khoản hợp lệ từ file Excel.`);
+      await fetchAllDatabaseData();
+
+      if (failedMap.size === 0) {
+        setExcelPreviewUsers([]);
+        setExcelFileName('');
+      } else {
+        setExcelPreviewUsers((prev) =>
+          prev
+            .filter((item) => !item.isValid || failedMap.has(item.rowNumber))
+            .map((item) =>
+              failedMap.has(item.rowNumber)
+                ? {
+                    ...item,
+                    isValid: false,
+                    errorReason: failedMap.get(item.rowNumber),
+                  }
+                : item
+            )
+        );
+      }
+    } finally {
+      setIsImportingUsers(false);
+    }
+  };
+
+  // ==================== COMPUTED METRICS ====================
+  const activeDevices = useMemo(() => devices.filter((d) => d.is_on), [devices]);
+
+  const estimatedLiveWatt = useMemo(() => {
+    return activeDevices.reduce((sum, d) => {
+      const t = (d.device_type || '').toLowerCase();
+      if (t.includes('ac') || t.includes('air') || t.includes('heater')) return sum + 1200;
+      if (t.includes('fan')) return sum + 45;
+      if (t.includes('light')) return sum + 15;
+      if (t.includes('sensor')) return sum + 2;
+      return sum + 25;
+    }, 0);
+  }, [activeDevices]);
+
+  const filteredRooms = useMemo(() => {
+    if (!selectedHouseId) return rooms;
+    return rooms.filter((r) => r.house_id === selectedHouseId);
+  }, [rooms, selectedHouseId]);
+
+  const filteredDevices = useMemo(() => {
+    if (selectedRoomId) {
+      return devices.filter((d) => d.room_id === selectedRoomId);
     }
     if (selectedHouseId) {
-      const houseRoomIds = new Set(
+      const roomIdsInHouse = new Set(
         rooms.filter((r) => r.house_id === selectedHouseId).map((r) => r.id)
       );
-      return d.room_id ? houseRoomIds.has(d.room_id) : false;
+      return devices.filter((d) => d.room_id && roomIdsInHouse.has(d.room_id));
     }
-    return true;
-  });
+    return devices;
+  }, [devices, rooms, selectedHouseId, selectedRoomId]);
 
-  const activeDevices = devices.filter((d) => d.is_on);
-  const estimatedLiveWatt = activeDevices.reduce((sum, d) => {
-    if (d.device_type === 'fan') return sum + 45;
-    if (d.device_type === 'light') return sum + 15;
-    if (d.device_type === 'sensor') return sum + 2;
-    return sum + 25;
-  }, 0);
+  // ==================== STYLING HELPERS ====================
+  const pageBg = isDark ? 'bg-[#080d1a] text-slate-100' : 'bg-slate-100 text-slate-900';
+  const sidebarBg = isDark
+    ? 'bg-[#0b1121] border-slate-800/80'
+    : 'bg-white border-slate-200';
+  const cardBg = isDark
+    ? 'bg-[#0e1629] border-slate-800/80'
+    : 'bg-white border-slate-200 shadow-sm';
+  const inputBg = isDark
+    ? 'bg-[#131c31] border-slate-700 text-slate-100 placeholder-slate-500'
+    : 'bg-slate-50 border-slate-300 text-slate-900 placeholder-slate-400';
 
-  const maxDailyKwh = Math.max(
-    ...energyData.daily.map((d) => (Number.isFinite(d.kwh) ? d.kwh : 0)),
-    0.1
-  );
-  const avgDailyKwh =
-    energyData.daily.length > 0
-      ? energyData.daily.reduce((s, d) => s + d.kwh, 0) / energyData.daily.length
-      : 0;
-  const peakDay = energyData.daily.reduce(
-    (best, cur) => (cur.kwh > best.kwh ? cur : best),
-    energyData.daily[0] || { label: '--', kwh: 0 }
-  );
-
-  // ==================== LOGIN VIEW ====================
+  // ==================== AUTH SCREEN ====================
   if (!currentUser) {
     return (
-      <div className="min-h-screen bg-[#070b14] text-slate-100 flex items-center justify-center p-4">
-        <div className="w-full max-w-md rounded-2xl bg-[#0d131f] border border-slate-800 p-8 shadow-2xl">
+      <div className="min-h-screen bg-[#080d1a] text-slate-100 flex items-center justify-center p-4">
+        <div className="w-full max-w-md rounded-2xl bg-[#0e1629] border border-slate-800 p-7 shadow-2xl">
           <div className="flex items-center gap-3 mb-6">
-            <div className="w-11 h-11 rounded-xl bg-cyan-500/15 border border-cyan-500/30 flex items-center justify-center text-2xl">
+            <div className="w-11 h-11 rounded-xl bg-cyan-500/15 border border-cyan-500/30 flex items-center justify-center text-xl">
               🏠
             </div>
             <div>
               <h1 className="text-lg font-bold text-cyan-400">SmartHome IoT</h1>
-              <p className="text-xs text-slate-400">Hệ thống Quản trị Nhà Thông Minh</p>
+              <p className="text-xs text-slate-400">
+                Hệ thống điều khiển nhà thông minh đa hộ gia đình
+              </p>
             </div>
           </div>
 
-          {authError && (
-            <div className="mb-4 p-3 rounded-lg bg-red-500/15 border border-red-500/40 text-red-400 text-xs">
-              {authError}
-            </div>
-          )}
+          <div className="grid grid-cols-2 gap-1 p-1 rounded-xl bg-[#131c31] mb-5">
+            <button
+              type="button"
+              onClick={() => {
+                setAuthMode('login');
+                setAuthError('');
+              }}
+              className={`py-2 rounded-lg text-xs font-semibold transition ${
+                authMode === 'login'
+                  ? 'bg-cyan-500 text-slate-950'
+                  : 'text-slate-400 hover:text-slate-200'
+              }`}
+            >
+              Đăng nhập
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setAuthMode('register');
+                setAuthError('');
+              }}
+              className={`py-2 rounded-lg text-xs font-semibold transition ${
+                authMode === 'register'
+                  ? 'bg-cyan-500 text-slate-950'
+                  : 'text-slate-400 hover:text-slate-200'
+              }`}
+            >
+              Đăng ký Chủ nhà
+            </button>
+          </div>
 
           <form onSubmit={handleAuthSubmit} className="space-y-4">
             {authMode === 'register' && (
               <div>
                 <label className="block text-xs font-semibold text-slate-300 mb-1.5">
-                  Họ và tên *
+                  Họ và tên Chủ nhà
                 </label>
                 <input
                   type="text"
                   required
                   value={authName}
                   onChange={(e) => setAuthName(e.target.value)}
-                  placeholder="Nguyễn Văn A"
-                  className="w-full px-3.5 py-2.5 rounded-xl bg-[#131b2e] border border-slate-700 text-sm focus:outline-none focus:border-cyan-500"
+                  placeholder="Ví dụ: Nguyễn Văn A"
+                  className="w-full px-3.5 py-2.5 rounded-xl bg-[#131c31] border border-slate-700 text-sm focus:outline-none focus:border-cyan-500"
                 />
               </div>
             )}
 
             <div>
-              <label className="block text-xs font-semibold text-slate-300 mb-1.5">
-                Email *
-              </label>
+              <label className="block text-xs font-semibold text-slate-300 mb-1.5">Email</label>
               <input
                 type="email"
                 required
                 value={authEmail}
                 onChange={(e) => setAuthEmail(e.target.value)}
-                placeholder="admin@smarthome.vn"
-                className="w-full px-3.5 py-2.5 rounded-xl bg-[#131b2e] border border-slate-700 text-sm focus:outline-none focus:border-cyan-500"
+                placeholder="owner@smarthome.vn"
+                className="w-full px-3.5 py-2.5 rounded-xl bg-[#131c31] border border-slate-700 text-sm focus:outline-none focus:border-cyan-500"
               />
             </div>
 
             <div>
-              <label className="block text-xs font-semibold text-slate-300 mb-1.5">
-                Mật khẩu *
-              </label>
+              <label className="block text-xs font-semibold text-slate-300 mb-1.5">Mật khẩu</label>
               <input
                 type="password"
                 required
                 value={authPassword}
                 onChange={(e) => setAuthPassword(e.target.value)}
-                placeholder="••••••"
-                className="w-full px-3.5 py-2.5 rounded-xl bg-[#131b2e] border border-slate-700 text-sm focus:outline-none focus:border-cyan-500"
+                placeholder="••••••••"
+                className="w-full px-3.5 py-2.5 rounded-xl bg-[#131c31] border border-slate-700 text-sm focus:outline-none focus:border-cyan-500"
               />
             </div>
+
+            {authError && (
+              <div className="p-3 rounded-xl bg-red-500/15 border border-red-500/30 text-xs text-red-400">
+                {authError}
+              </div>
+            )}
 
             <button
               type="submit"
@@ -1089,260 +1691,205 @@ export function App() {
                 ? 'Đang xử lý...'
                 : authMode === 'login'
                 ? 'Đăng nhập hệ thống'
-                : 'Đăng ký tài khoản'}
+                : 'Đăng ký tài khoản Chủ nhà'}
             </button>
-          </form>
 
-          <div className="mt-4 text-center">
-            <button
-              type="button"
-              onClick={() => {
-                setAuthMode(authMode === 'login' ? 'register' : 'login');
-                setAuthError('');
-              }}
-              className="text-xs text-cyan-400 hover:underline"
-            >
-              {authMode === 'login'
-                ? 'Chưa có tài khoản? Đăng ký ngay'
-                : 'Đã có tài khoản? Quay lại đăng nhập'}
-            </button>
-          </div>
+            {authMode === 'register' && (
+              <p className="text-[11px] text-slate-400 text-center leading-relaxed">
+                Tài khoản đăng ký mới sẽ tự động là{' '}
+                <strong className="text-cyan-400">Chủ nhà (Owner)</strong> với không gian quản lý
+                nhà, phòng, thiết bị và thành viên độc lập.
+              </p>
+            )}
+          </form>
         </div>
       </div>
     );
   }
 
-  // ==================== MAIN DASHBOARD LAYOUT ====================
-  const cardBg = isDark
-    ? 'bg-[#0d131f] border-slate-800/90'
-    : 'bg-white border-slate-200 shadow-sm';
-  const subCardBg = isDark
-    ? 'bg-[#121927] border-slate-800 hover:border-slate-700'
-    : 'bg-slate-50 border-slate-200 hover:border-slate-300';
+  // ==================== MAIN DASHBOARD ====================
+  const hasLiveSensor = sensorData !== null && devices.length > 0;
 
   return (
-    <div
-      className={`min-h-screen flex ${
-        isDark ? 'bg-[#070b14] text-slate-100' : 'bg-slate-100 text-slate-800'
-      }`}
-    >
+    <div className={`min-h-screen flex ${pageBg}`}>
       {/* ==================== SIDEBAR ==================== */}
-      <aside
-        className={`w-64 shrink-0 border-r flex flex-col justify-between ${
-          isDark ? 'bg-[#0a0f1a] border-slate-800/80' : 'bg-white border-slate-200'
-        }`}
-      >
+      <aside className={`w-64 shrink-0 border-r flex flex-col justify-between p-4 ${sidebarBg}`}>
         <div>
-          <div className="p-5 flex items-center gap-3 border-b border-slate-800/60">
-            <div className="w-10 h-10 rounded-xl bg-cyan-500/15 border border-cyan-500/30 flex items-center justify-center text-xl">
+          <div className="flex items-center gap-3 px-2 py-2 mb-6">
+            <div className="w-9 h-9 rounded-xl bg-cyan-500/15 border border-cyan-500/30 flex items-center justify-center text-lg">
               🏠
             </div>
             <div className="min-w-0">
-              <div className="text-sm font-bold text-cyan-400 truncate">SmartHome IoT</div>
+              <div className="font-bold text-sm text-cyan-400 truncate">SmartHome IoT</div>
               <div className="text-xs text-slate-400 truncate">{currentUser.name}</div>
             </div>
           </div>
 
-          <div className="p-4">
-            <div className="text-[10px] font-bold uppercase tracking-wider text-slate-500 px-3 mb-2">
-              {isOwnerOrAdmin ? 'PHÂN HỆ QUẢN TRỊ' : 'ĐIỀU KHIỂN NHÀ THÔNG MINH'}
-            </div>
-
-            <nav className="space-y-1">
-              <button
-                onClick={() => setActiveTab('overview')}
-                className={`w-full flex items-center justify-between px-3 py-2.5 rounded-xl text-xs font-semibold transition ${
-                  activeTab === 'overview'
-                    ? 'bg-cyan-500/15 text-cyan-400 border border-cyan-500/30'
-                    : 'text-slate-400 hover:bg-slate-800/40 hover:text-slate-200'
-                }`}
-              >
-                <span className="flex items-center gap-2.5">
-                  <span>📊</span>
-                  <span>Tổng quan</span>
-                </span>
-              </button>
-
-              <button
-                onClick={() => setActiveTab('rooms')}
-                className={`w-full flex items-center justify-between px-3 py-2.5 rounded-xl text-xs font-semibold transition ${
-                  activeTab === 'rooms'
-                    ? 'bg-cyan-500/15 text-cyan-400 border border-cyan-500/30'
-                    : 'text-slate-400 hover:bg-slate-800/40 hover:text-slate-200'
-                }`}
-              >
-                <span className="flex items-center gap-2.5">
-                  <span>📱</span>
-                  <span>Phòng & Thiết bị</span>
-                </span>
-                <span className="px-2 py-0.5 rounded-md bg-cyan-500/15 text-cyan-400 text-[10px] font-mono">
-                  {rooms.length}P • {devices.length}
-                </span>
-              </button>
-
-              <button
-                onClick={() => setActiveTab('automations')}
-                className={`w-full flex items-center justify-between px-3 py-2.5 rounded-xl text-xs font-semibold transition ${
-                  activeTab === 'automations'
-                    ? 'bg-cyan-500/15 text-cyan-400 border border-cyan-500/30'
-                    : 'text-slate-400 hover:bg-slate-800/40 hover:text-slate-200'
-                }`}
-              >
-                <span className="flex items-center gap-2.5">
-                  <span>⚡</span>
-                  <span>Tự động hóa (IF-THEN)</span>
-                </span>
-                <span className="px-2 py-0.5 rounded-md bg-amber-500/15 text-amber-400 text-[10px] font-mono">
-                  {automations.length}
-                </span>
-              </button>
-
-              <button
-                onClick={() => setActiveTab('energy')}
-                className={`w-full flex items-center justify-between px-3 py-2.5 rounded-xl text-xs font-semibold transition ${
-                  activeTab === 'energy'
-                    ? 'bg-cyan-500/15 text-cyan-400 border border-cyan-500/30'
-                    : 'text-slate-400 hover:bg-slate-800/40 hover:text-slate-200'
-                }`}
-              >
-                <span className="flex items-center gap-2.5">
-                  <span>📈</span>
-                  <span>Thống kê Năng lượng</span>
-                </span>
-              </button>
-
-              <button
-                onClick={() => setActiveTab('ai')}
-                className={`w-full flex items-center justify-between px-3 py-2.5 rounded-xl text-xs font-semibold transition ${
-                  activeTab === 'ai'
-                    ? 'bg-cyan-500/15 text-cyan-400 border border-cyan-500/30'
-                    : 'text-slate-400 hover:bg-slate-800/40 hover:text-slate-200'
-                }`}
-              >
-                <span className="flex items-center gap-2.5">
-                  <span>🤖</span>
-                  <span>Trí tuệ Nhân tạo (AI)</span>
-                </span>
-                <span className="px-2 py-0.5 rounded-md bg-red-500/15 text-red-400 text-[10px] font-mono">
-                  {aiAlerts.length}
-                </span>
-              </button>
-
-              {isOwnerOrAdmin && (
-                <button
-                  onClick={() => setActiveTab('accounts')}
-                  className={`w-full flex items-center justify-between px-3 py-2.5 rounded-xl text-xs font-semibold transition ${
-                    activeTab === 'accounts'
-                      ? 'bg-cyan-500/15 text-cyan-400 border border-cyan-500/30'
-                      : 'text-slate-400 hover:bg-slate-800/40 hover:text-slate-200'
-                  }`}
-                >
-                  <span className="flex items-center gap-2.5">
-                    <span>👥</span>
-                    <span>Quản lý Tài khoản</span>
-                  </span>
-                  <span className="px-2 py-0.5 rounded-md bg-sky-500/15 text-sky-400 text-[10px] font-mono">
-                    {usersList.length}
-                  </span>
-                </button>
-              )}
-            </nav>
+          <div className="text-[10px] font-bold uppercase tracking-wider text-slate-500 px-3 mb-2">
+            ĐIỀU KHIỂN NHÀ THÔNG MINH
           </div>
+
+          <nav className="space-y-1 text-xs font-medium">
+            <button
+              onClick={() => setActiveTab('overview')}
+              className={`w-full flex items-center justify-between px-3 py-2.5 rounded-xl transition ${
+                activeTab === 'overview'
+                  ? 'bg-cyan-500/15 text-cyan-400 border border-cyan-500/30 font-semibold'
+                  : 'text-slate-400 hover:bg-slate-800/50 hover:text-slate-200'
+              }`}
+            >
+              <span>📊 Tổng quan</span>
+            </button>
+
+            <button
+              onClick={() => setActiveTab('devices')}
+              className={`w-full flex items-center justify-between px-3 py-2.5 rounded-xl transition ${
+                activeTab === 'devices'
+                  ? 'bg-cyan-500/15 text-cyan-400 border border-cyan-500/30 font-semibold'
+                  : 'text-slate-400 hover:bg-slate-800/50 hover:text-slate-200'
+              }`}
+            >
+              <span>📱 Phòng & Thiết bị</span>
+              <span className="px-1.5 py-0.5 rounded bg-cyan-500/20 text-cyan-300 text-[10px] font-mono">
+                {rooms.length}P • {devices.length}
+              </span>
+            </button>
+
+            <button
+              onClick={() => setActiveTab('automations')}
+              className={`w-full flex items-center justify-between px-3 py-2.5 rounded-xl transition ${
+                activeTab === 'automations'
+                  ? 'bg-cyan-500/15 text-cyan-400 border border-cyan-500/30 font-semibold'
+                  : 'text-slate-400 hover:bg-slate-800/50 hover:text-slate-200'
+              }`}
+            >
+              <span>⚡ Tự động hóa (IF-THEN)</span>
+              <span className="px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-300 text-[10px] font-mono">
+                {automations.length}
+              </span>
+            </button>
+
+            <button
+              onClick={() => setActiveTab('energy')}
+              className={`w-full flex items-center justify-between px-3 py-2.5 rounded-xl transition ${
+                activeTab === 'energy'
+                  ? 'bg-cyan-500/15 text-cyan-400 border border-cyan-500/30 font-semibold'
+                  : 'text-slate-400 hover:bg-slate-800/50 hover:text-slate-200'
+              }`}
+            >
+              <span>📈 Thống kê Năng lượng</span>
+            </button>
+
+            <button
+              onClick={() => setActiveTab('ai')}
+              className={`w-full flex items-center justify-between px-3 py-2.5 rounded-xl transition ${
+                activeTab === 'ai'
+                  ? 'bg-cyan-500/15 text-cyan-400 border border-cyan-500/30 font-semibold'
+                  : 'text-slate-400 hover:bg-slate-800/50 hover:text-slate-200'
+              }`}
+            >
+              <span>🤖 Trí tuệ Nhân tạo (AI)</span>
+              <span className="px-1.5 py-0.5 rounded bg-rose-500/20 text-rose-300 text-[10px] font-mono">
+                {aiAlerts.length}
+              </span>
+            </button>
+
+            {isOwnerOrAdmin && (
+              <button
+                onClick={() => setActiveTab('accounts')}
+                className={`w-full flex items-center justify-between px-3 py-2.5 rounded-xl transition ${
+                  activeTab === 'accounts'
+                    ? 'bg-cyan-500/15 text-cyan-400 border border-cyan-500/30 font-semibold'
+                    : 'text-slate-400 hover:bg-slate-800/50 hover:text-slate-200'
+                }`}
+              >
+                <span>👥 Quản lý Tài khoản</span>
+                <span className="px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 text-[10px] font-mono">
+                  {usersList.length}
+                </span>
+              </button>
+            )}
+          </nav>
         </div>
 
         {/* User Footer */}
-        <div className="p-4 border-t border-slate-800/60">
-          <div
-            className={`p-3 rounded-xl border flex items-center justify-between gap-2 ${
-              isDark ? 'bg-[#0f1624] border-slate-800' : 'bg-slate-50 border-slate-200'
-            }`}
-          >
-            <div className="flex items-center gap-2.5 min-w-0">
-              <div className="w-8 h-8 rounded-full bg-cyan-500/20 text-cyan-400 flex items-center justify-center text-xs font-bold shrink-0">
-                👤
-              </div>
-              <div className="min-w-0">
-                <div className="text-xs font-semibold truncate">{currentUser.email}</div>
-                <div className="text-[11px] text-emerald-400 truncate">
-                  {currentUser.name} ({currentUser.role})
-                </div>
-              </div>
+        <div className="p-3 rounded-xl bg-slate-900/70 border border-slate-800 flex items-center justify-between gap-2">
+          <div className="min-w-0">
+            <div className="text-xs font-semibold text-slate-200 truncate">{currentUser.email}</div>
+            <div className="text-[11px] text-emerald-400 truncate">
+              {currentUser.name} ({currentUser.role})
             </div>
-            <button
-              onClick={handleLogout}
-              title="Đăng xuất"
-              className="p-1.5 rounded-lg bg-red-500/15 text-red-400 hover:bg-red-500/25 text-xs shrink-0"
-            >
-              🚪
-            </button>
           </div>
+          <button
+            onClick={handleLogout}
+            title="Đăng xuất"
+            className="p-2 rounded-lg bg-red-500/15 text-red-400 hover:bg-red-500/25 text-xs shrink-0"
+          >
+            🚪
+          </button>
         </div>
       </aside>
 
       {/* ==================== MAIN CONTENT ==================== */}
       <div className="flex-1 flex flex-col min-w-0">
-        {/* Top Status Header */}
+        {/* TOP HEADER */}
         <header
-          className={`h-14 border-b px-6 flex items-center justify-between gap-4 ${
-            isDark ? 'bg-[#0a0f1a]/90 border-slate-800/80' : 'bg-white border-slate-200'
-          }`}
+          className={`px-6 py-3 border-b flex flex-wrap items-center justify-between gap-3 ${sidebarBg}`}
         >
-          <div className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-slate-900/70 border border-slate-800 text-xs text-slate-300">
-            <span>🗄️</span>
-            <span>
-              PostgreSQL Sync: <strong>{houses.length}</strong> nhà •{' '}
-              <strong>{rooms.length}</strong> phòng • <strong>{devices.length}</strong> thiết bị
-            </span>
+          <div className="px-3 py-1.5 rounded-xl bg-slate-900/70 border border-slate-800 text-xs text-slate-300">
+            🗄️ PostgreSQL Sync:{' '}
+            <strong className="text-white">{houses.length}</strong> nhà •{' '}
+            <strong className="text-white">{rooms.length}</strong> phòng •{' '}
+            <strong className="text-white">{devices.length}</strong> thiết bị
           </div>
 
-          <div className="flex items-center gap-2.5 flex-wrap">
+          <div className="flex flex-wrap items-center gap-2 text-xs">
             <span
-              className={`px-3 py-1 rounded-full text-[11px] font-semibold border ${
+              className={`px-3 py-1 rounded-full border font-medium ${
                 wsConnected
-                  ? 'bg-emerald-500/15 text-emerald-400 border-emerald-500/30'
-                  : 'bg-red-500/15 text-red-400 border-red-500/30'
+                  ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400'
+                  : 'bg-amber-500/10 border-amber-500/30 text-amber-400'
               }`}
             >
-              ● WebSocket: {wsConnected ? 'Connected' : 'Disconnected'}
+              • WebSocket: {wsConnected ? 'Connected' : 'Reconnecting'}
             </span>
 
-            <span className="px-3 py-1 rounded-full text-[11px] font-semibold bg-sky-500/15 text-sky-400 border border-sky-500/30">
-              ● MQTT Broker: Online
+            <span className="px-3 py-1 rounded-full bg-sky-500/10 border border-sky-500/30 text-sky-400 font-medium">
+              • MQTT Broker: Online
             </span>
 
-            <span className="px-3 py-1 rounded-lg text-[11px] bg-slate-900 border border-slate-800 text-slate-300">
-              Vai trò:{' '}
-              <strong className={isOwnerOrAdmin ? 'text-cyan-400' : 'text-amber-400'}>
-                {currentUser.role || 'Member'}
-              </strong>
+            <span className="px-3 py-1 rounded-full bg-amber-500/10 border border-amber-500/30 text-slate-300">
+              Vai trò: <strong className="text-amber-400">{currentUser.role}</strong>
             </span>
 
             <button
               onClick={() => setIsDark(!isDark)}
-              className="p-1.5 rounded-lg bg-slate-800/80 border border-slate-700 text-xs"
-              title="Đổi giao diện Sáng/Tối"
+              className="w-8 h-8 rounded-full bg-slate-800/80 border border-slate-700 flex items-center justify-center text-amber-300 hover:bg-slate-700"
+              title="Đổi giao diện Sáng / Tối"
             >
               {isDark ? '🌙' : '☀️'}
             </button>
 
-            <span className="px-3 py-1 rounded-lg bg-slate-900 border border-slate-800 text-xs font-mono text-slate-300">
+            <span className="px-3 py-1 rounded-full bg-slate-900/80 border border-slate-800 font-mono text-slate-300">
               {clockText}
             </span>
           </div>
         </header>
 
-        {/* Body Content */}
-        <main className="flex-1 p-6 space-y-6 overflow-y-auto">
+        {/* WORKSPACE BODY */}
+        <main className="flex-1 p-6 overflow-y-auto space-y-6">
           {/* ==================== TAB 1: TỔNG QUAN ==================== */}
           {activeTab === 'overview' && (
-            <div className="space-y-6">
-              {/* 1. 4 thẻ KPI Môi trường & Năng lượng */}
+            <>
+              {/* 4 KPI Cards */}
               <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
                 <div className={`p-5 rounded-2xl border ${cardBg}`}>
                   <div className="flex items-center justify-between text-xs text-slate-400 mb-1">
                     <span>🌡️ Nhiệt độ phòng</span>
                     <span className="px-2 py-0.5 rounded bg-amber-500/15 text-amber-400 text-[10px] font-semibold">
-                      {sensorData.temperature > 31
+                      {!hasLiveSensor || !sensorData
+                        ? 'Chưa kết nối'
+                        : sensorData.temperature > 31
                         ? 'Nóng'
                         : sensorData.temperature < 20
                         ? 'Lạnh'
@@ -1350,10 +1897,14 @@ export function App() {
                     </span>
                   </div>
                   <div className="text-2xl font-bold text-amber-400">
-                    {sensorData.temperature.toFixed(1)}°C
+                    {hasLiveSensor && sensorData
+                      ? `${sensorData.temperature.toFixed(1)}°C`
+                      : '--°C'}
                   </div>
                   <div className="text-[11px] text-slate-500 mt-1">
-                    Cảm biến DHT22 thời gian thực
+                    {hasLiveSensor && sensorData
+                      ? 'Cảm biến DHT22 thời gian thực'
+                      : 'Chưa có dữ liệu cảm biến nhiệt độ'}
                   </div>
                 </div>
 
@@ -1361,11 +1912,17 @@ export function App() {
                   <div className="flex items-center justify-between text-xs text-slate-400 mb-1">
                     <span>💧 Độ ẩm không khí</span>
                     <span className="px-2 py-0.5 rounded bg-cyan-500/15 text-cyan-400 text-[10px] font-semibold">
-                      {sensorData.humidity > 80 ? 'Ẩm cao' : 'Thoáng'}
+                      {!hasLiveSensor || !sensorData
+                        ? 'Chưa kết nối'
+                        : sensorData.humidity > 80
+                        ? 'Ẩm cao'
+                        : 'Thoáng'}
                     </span>
                   </div>
                   <div className="text-2xl font-bold text-cyan-400">
-                    {sensorData.humidity.toFixed(0)}%
+                    {hasLiveSensor && sensorData
+                      ? `${sensorData.humidity.toFixed(0)}%`
+                      : '--%'}
                   </div>
                   <div className="text-[11px] text-slate-500 mt-1">
                     Ngưỡng khuyến nghị: 50% – 70%
@@ -1377,16 +1934,20 @@ export function App() {
                     <span>☀️ Ánh sáng / PIR</span>
                     <span
                       className={`px-2 py-0.5 rounded text-[10px] font-semibold ${
-                        sensorData.motion
+                        hasLiveSensor && sensorData?.motion
                           ? 'bg-emerald-500/20 text-emerald-400'
                           : 'bg-slate-800 text-slate-400'
                       }`}
                     >
-                      {sensorData.motion ? 'Phát hiện người' : 'Yên tĩnh'}
+                      {!hasLiveSensor || !sensorData
+                        ? 'Chưa kết nối'
+                        : sensorData.motion
+                        ? 'Phát hiện người'
+                        : 'Yên tĩnh'}
                     </span>
                   </div>
                   <div className="text-2xl font-bold text-emerald-400">
-                    {sensorData.lux} Lux
+                    {hasLiveSensor && sensorData ? `${sensorData.lux} Lux` : '-- Lux'}
                   </div>
                   <div className="text-[11px] text-slate-500 mt-1">
                     Cảm biến quang trở LDR & chuyển động
@@ -1404,24 +1965,23 @@ export function App() {
                     {activeDevices.length} / {devices.length} Bật
                   </div>
                   <div className="text-[11px] text-slate-500 mt-1">
-                    Điện năng tích lũy: {energyData.total_kwh.toFixed(2)} kWh
+                    Điện năng tích lũy: {energyData.total_kwh.toFixed(3)} kWh
                   </div>
                 </div>
               </div>
 
-              {/* 2. Điều khiển nhanh thiết bị & Tổng quan Nhà/Phòng */}
-              <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-                {/* Cột trái (2/3): Điều khiển nhanh thiết bị IoT */}
-                <div className={`lg:col-span-2 p-5 rounded-2xl border space-y-4 ${cardBg}`}>
-                  <div className="flex items-center justify-between">
+              {/* Row 2: Quick Device Control + Houses & Rooms */}
+              <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+                <div className={`lg:col-span-2 p-5 rounded-2xl border ${cardBg}`}>
+                  <div className="flex items-center justify-between mb-4">
                     <div>
-                      <h3 className="text-sm font-bold">⚡ Điều khiển nhanh Thiết bị IoT</h3>
-                      <p className="text-xs text-slate-400 mt-0.5">
-                        Bật/tắt trực tiếp các thiết bị trong nhà qua giao thức MQTT
+                      <h2 className="font-bold text-sm">⚡ Điều khiển nhanh Thiết bị IoT</h2>
+                      <p className="text-xs text-slate-400">
+                        Bật/tắt trực tiếp thiết bị và theo dõi chỉ số cảm biến thời gian thực qua MQTT
                       </p>
                     </div>
                     <button
-                      onClick={() => setActiveTab('rooms')}
+                      onClick={() => setActiveTab('devices')}
                       className="text-xs text-cyan-400 hover:underline font-semibold"
                     >
                       Xem tất cả ({devices.length}) →
@@ -1429,196 +1989,90 @@ export function App() {
                   </div>
 
                   {devices.length === 0 ? (
-                    <div className="text-xs text-slate-400 py-8 text-center border border-dashed border-slate-800 rounded-xl">
+                    <div className="p-8 rounded-xl border border-dashed border-slate-800 text-center text-xs text-slate-500">
                       Chưa có thiết bị IoT nào được kết nối.
                     </div>
                   ) : (
                     <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                      {devices.slice(0, 6).map((dev) => {
-                        const isSensor = dev.device_type === 'sensor';
-                        const roomLabel =
-                          dev.room_name ||
-                          rooms.find((r) => r.id === dev.room_id)?.name ||
-                          'Chưa phân phòng';
-                        const icon =
-                          dev.device_type === 'fan'
-                            ? '🌀'
-                            : dev.device_type === 'light'
-                            ? '💡'
-                            : isSensor
-                            ? '📡'
-                            : '🔌';
-
-                        return (
-                          <div
-                            key={dev.id}
-                            className={`p-3.5 rounded-xl border flex items-center justify-between gap-3 ${subCardBg}`}
-                          >
-                            <div className="flex items-center gap-3 min-w-0">
-                              <div className="w-9 h-9 rounded-lg bg-slate-800 flex items-center justify-center text-lg shrink-0">
-                                {icon}
-                              </div>
-                              <div className="min-w-0">
-                                <div className="text-xs font-bold truncate">{dev.name}</div>
-                                <div className="text-[11px] text-slate-400 truncate">
-                                  {roomLabel}
-                                </div>
-                              </div>
+                      {devices.slice(0, 6).map((dev) => (
+                        <div
+                          key={dev.id}
+                          className="p-3.5 rounded-xl bg-slate-900/60 border border-slate-800 flex items-center justify-between gap-3"
+                        >
+                          <div className="min-w-0">
+                            <div className="font-semibold text-xs truncate">{dev.name}</div>
+                            <div className="text-[11px] text-slate-400 truncate">
+                              {dev.room_name || 'Chưa phân phòng'} • {dev.mqtt_topic}
                             </div>
 
-                            {isSensor ? (
-                              <span className="px-2 py-0.5 rounded bg-amber-500/15 text-amber-400 text-[10px] font-bold shrink-0">
-                                ONLINE
-                              </span>
-                            ) : (
-                              <button
-                                onClick={() => handleToggleDevice(dev)}
-                                className={`w-10 h-5 rounded-full transition p-0.5 shrink-0 ${
-                                  dev.is_on ? 'bg-cyan-500' : 'bg-slate-700'
-                                }`}
-                              >
-                                <div
-                                  className={`w-4 h-4 rounded-full bg-white transition-transform ${
-                                    dev.is_on ? 'translate-x-5' : 'translate-x-0'
-                                  }`}
-                                />
-                              </button>
+                            {/* Hiển thị chỉ số trực tiếp nếu là thiết bị cảm biến */}
+                            {dev.device_type === 'sensor' && (
+                              <div className="mt-1.5 flex flex-wrap items-center gap-1.5 text-[10px] font-mono">
+                                {hasLiveSensor && sensorData ? (
+                                  <>
+                                    <span className="px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-300">
+                                      🌡️ {sensorData.temperature.toFixed(1)}°C
+                                    </span>
+                                    <span className="px-1.5 py-0.5 rounded bg-cyan-500/15 text-cyan-300">
+                                      💧 {sensorData.humidity.toFixed(0)}%
+                                    </span>
+                                    <span className="px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-300">
+                                      ☀️ {sensorData.lux} Lux
+                                    </span>
+                                  </>
+                                ) : (
+                                  <span className="px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">
+                                    ⏳ Đang chờ gói tin MQTT...
+                                  </span>
+                                )}
+                              </div>
                             )}
                           </div>
-                        );
-                      })}
+
+                          <button
+                            onClick={() => handleToggleDevice(dev)}
+                            className={`px-3 py-1.5 rounded-lg text-xs font-bold transition shrink-0 ${
+                              dev.is_on
+                                ? 'bg-emerald-500 text-slate-950'
+                                : 'bg-slate-800 text-slate-300 hover:bg-slate-700'
+                            }`}
+                          >
+                            {dev.is_on ? 'ĐANG BẬT' : 'TẮT'}
+                          </button>
+                        </div>
+                      ))}
                     </div>
                   )}
                 </div>
 
-                {/* Cột phải (1/3): Tổng quan Nhà & Phòng */}
-                <div className={`p-5 rounded-2xl border space-y-4 ${cardBg}`}>
-                  <div className="flex items-center justify-between">
-                    <h3 className="text-sm font-bold">🏡 Không gian Nhà & Phòng</h3>
+                <div className={`p-5 rounded-2xl border ${cardBg}`}>
+                  <div className="flex items-center justify-between mb-4">
+                    <h2 className="font-bold text-sm">🏠 Không gian Nhà & Phòng</h2>
                     <span className="text-xs font-mono text-slate-400">
                       {houses.length}N • {rooms.length}P
                     </span>
                   </div>
 
-                  <div className="space-y-2.5 max-h-64 overflow-y-auto pr-1">
-                    {rooms.length === 0 ? (
-                      <div className="text-xs text-slate-400 py-6 text-center">
-                        Chưa có phòng nào.
-                      </div>
-                    ) : (
-                      rooms.map((r) => {
-                        const roomDevs = devices.filter((d) => d.room_id === r.id);
-                        const onCount = roomDevs.filter((d) => d.is_on).length;
-                        const hName =
-                          r.house_name ||
-                          houses.find((h) => h.id === r.house_id)?.name ||
-                          'Nhà';
-                        return (
-                          <div
-                            key={r.id}
-                            onClick={() => {
-                              setSelectedHouseId(r.house_id);
-                              setSelectedRoomId(r.id);
-                              setDeviceFilterMode('room');
-                              setActiveTab('rooms');
-                            }}
-                            className={`p-3 rounded-xl border cursor-pointer flex items-center justify-between ${subCardBg}`}
-                          >
-                            <div className="min-w-0">
-                              <div className="text-xs font-bold truncate">🛏️ {r.name}</div>
-                              <div className="text-[11px] text-slate-400 truncate">
-                                Tầng {r.floor ?? 1} • {hName}
-                              </div>
-                            </div>
-                            <span className="px-2 py-0.5 rounded bg-cyan-500/15 text-cyan-400 text-[10px] font-mono shrink-0">
-                              {onCount}/{roomDevs.length} bật
-                            </span>
-                          </div>
-                        );
-                      })
-                    )}
-                  </div>
-                </div>
-              </div>
-
-              {/* 3. Kịch bản Tự động hóa & Cảnh báo AI */}
-              <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-                <div className={`p-5 rounded-2xl border space-y-3 ${cardBg}`}>
-                  <div className="flex items-center justify-between">
-                    <h3 className="text-sm font-bold">
-                      ⚙️ Kịch bản Tự động hóa ({automations.length})
-                    </h3>
-                    <button
-                      onClick={() => setActiveTab('automations')}
-                      className="text-xs text-cyan-400 hover:underline font-semibold"
-                    >
-                      Chi tiết →
-                    </button>
-                  </div>
-                  {automations.length === 0 ? (
-                    <div className="text-xs text-slate-400 py-4">
-                      Chưa thiết lập kịch bản tự động hóa nào.
+                  {rooms.length === 0 ? (
+                    <div className="p-8 text-center text-xs text-slate-500">
+                      Chưa có phòng nào.
                     </div>
                   ) : (
                     <div className="space-y-2">
-                      {automations.slice(0, 4).map((rule) => {
-                        const active = rule.is_active ?? rule.enabled ?? true;
-                        return (
-                          <div
-                            key={rule.id}
-                            className={`p-3 rounded-xl border flex items-center justify-between text-xs ${subCardBg}`}
-                          >
-                            <div>
-                              <div className="font-bold">{rule.name}</div>
-                              <div className="text-[11px] text-slate-400">
-                                IF {rule.condition_type || rule.trigger_type}{' '}
-                                {rule.operator || '>'} {rule.threshold ?? rule.trigger_value} →{' '}
-                                {rule.action || 'ON'}
-                              </div>
-                            </div>
-                            <span
-                              className={`px-2 py-0.5 rounded text-[10px] font-bold ${
-                                active
-                                  ? 'bg-emerald-500/20 text-emerald-400'
-                                  : 'bg-slate-800 text-slate-400'
-                              }`}
-                            >
-                              {active ? 'BẬT' : 'TẮT'}
-                            </span>
-                          </div>
-                        );
-                      })}
-                    </div>
-                  )}
-                </div>
-
-                <div className={`p-5 rounded-2xl border space-y-3 ${cardBg}`}>
-                  <div className="flex items-center justify-between">
-                    <h3 className="text-sm font-bold">
-                      🤖 Cảnh báo An ninh & AI ({aiAlerts.length})
-                    </h3>
-                    <button
-                      onClick={() => setActiveTab('ai')}
-                      className="text-xs text-cyan-400 hover:underline font-semibold"
-                    >
-                      Trung tâm AI →
-                    </button>
-                  </div>
-                  {aiAlerts.length === 0 ? (
-                    <div className="text-xs text-emerald-400/90 py-4">
-                      ✓ Hệ thống vận hành ổn định, không có bất thường.
-                    </div>
-                  ) : (
-                    <div className="space-y-2">
-                      {aiAlerts.slice(0, 3).map((a, i) => (
+                      {rooms.slice(0, 5).map((r) => (
                         <div
-                          key={a.id || i}
-                          className="p-3 rounded-xl bg-red-500/10 border border-red-500/30 text-xs"
+                          key={r.id}
+                          className="p-2.5 rounded-xl bg-slate-900/60 border border-slate-800 flex items-center justify-between text-xs"
                         >
-                          <div className="font-bold text-red-400">
-                            {a.title || 'Cảnh báo AI'}
+                          <div>
+                            <div className="font-semibold">{r.name}</div>
+                            <div className="text-[11px] text-slate-400">
+                              {r.house_name || 'Nhà chính'} • Tầng {r.floor}
+                            </div>
                           </div>
-                          <div className="text-slate-300 mt-0.5">{a.message}</div>
+                          <span className="text-[11px] font-mono text-cyan-400">
+                            {devices.filter((d) => d.room_id === r.id).length} TB
+                          </span>
                         </div>
                       ))}
                     </div>
@@ -1626,460 +2080,843 @@ export function App() {
                 </div>
               </div>
 
-              {/* 4. Nhật ký hoạt động hệ thống */}
-              <div className={`p-5 rounded-2xl border ${cardBg}`}>
-                <div className="flex items-center justify-between mb-3">
-                  <h3 className="text-sm font-bold">📜 Nhật ký hoạt động hệ thống</h3>
-                  <button
-                    onClick={() => setSystemLogs([])}
-                    className="text-[11px] text-slate-400 hover:text-slate-200"
-                  >
-                    Xóa nhật ký
-                  </button>
-                </div>
-                <div className="space-y-1.5 max-h-48 overflow-y-auto font-mono text-xs text-slate-400">
-                  {systemLogs.length === 0 ? (
-                    <div className="text-slate-500">Chưa có sự kiện mới.</div>
-                  ) : (
-                    systemLogs.map((log, i) => (
-                      <div key={i} className="py-1 border-b border-slate-800/50">
-                        {log}
-                      </div>
-                    ))
-                  )}
-                </div>
-              </div>
-            </div>
-          )}
-
-          {/* ==================== TAB 2: PHÒNG & THIẾT BỊ ==================== */}
-          {activeTab === 'rooms' && (
-            <div className="space-y-6">
-              {/* KHỐI 1: DANH SÁCH NGÔI NHÀ */}
-              <section className={`p-5 rounded-2xl border ${cardBg}`}>
-                <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
-                  <div>
-                    <h2 className="text-sm font-bold flex items-center gap-2">
-                      <span>🏡</span>
-                      <span>
-                        {isOwnerOrAdmin
-                          ? `Quản lý Ngôi nhà (${houses.length})`
-                          : `Danh sách Ngôi nhà (${houses.length})`}
-                      </span>
+              {/* Row 3: Automations + AI Alerts */}
+              <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                <div className={`p-5 rounded-2xl border ${cardBg}`}>
+                  <div className="flex items-center justify-between mb-3">
+                    <h2 className="font-bold text-sm">
+                      ⚙️ Kịch bản Tự động hóa ({automations.length})
                     </h2>
-                    <p className="text-xs text-slate-400 mt-0.5">
-                      Chọn nhà để lọc danh sách phòng và thiết bị bên dưới.
-                    </p>
+                    <button
+                      onClick={() => setActiveTab('automations')}
+                      className="text-xs text-cyan-400 hover:underline font-semibold"
+                    >
+                      Chi tiết →
+                    </button>
                   </div>
 
-                  {/* CHỈ OWNER / ADMIN MỚI CÓ NÚT XUẤT / NHẬP EXCEL & THÊM NHÀ */}
-                  {isOwnerOrAdmin && (
-                    <div className="flex flex-wrap items-center gap-2">
-                      <button
-                        onClick={() => {
-                          exportHousesAndRoomsToExcel(houses, rooms);
-                          addLog('EXCEL EXPORT: Đã xuất danh sách Nhà & Phòng ra file .xlsx');
-                        }}
-                        className={`px-3 py-1.5 rounded-lg border text-xs font-bold transition ${
-                          isDark
-                            ? 'bg-slate-900 text-emerald-400 border-emerald-500/40 hover:bg-emerald-500/15'
-                            : 'bg-emerald-50 text-emerald-700 border-emerald-300 hover:bg-emerald-100'
-                        }`}
-                      >
-                        📤 Xuất Excel
-                      </button>
-
-                      <button
-                        onClick={() => {
-                          setExcelImportMode('houses_rooms');
-                          setIsExcelModalOpen(true);
-                        }}
-                        className={`px-3 py-1.5 rounded-lg border text-xs font-bold transition ${
-                          isDark
-                            ? 'bg-slate-900 text-amber-400 border-amber-500/40 hover:bg-amber-500/15'
-                            : 'bg-amber-50 text-amber-700 border-amber-300 hover:bg-amber-100'
-                        }`}
-                      >
-                        📥 Nhập Excel
-                      </button>
-
-                      <button
-                        onClick={openCreateHouseModal}
-                        className="px-3.5 py-1.5 rounded-lg bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-bold text-xs transition"
-                      >
-                        + Thêm Nhà
-                      </button>
+                  {automations.length === 0 ? (
+                    <div className="text-xs text-slate-500 py-4">
+                      Chưa thiết lập kịch bản tự động hóa nào.
+                    </div>
+                  ) : (
+                    <div className="space-y-2">
+                      {automations.slice(0, 3).map((a) => (
+                        <div
+                          key={a.id}
+                          className="p-3 rounded-xl bg-slate-900/60 border border-slate-800 flex items-center justify-between text-xs"
+                        >
+                          <div>
+                            <div className="font-semibold">{a.name}</div>
+                            <div className="text-[11px] text-slate-400">
+                              IF {a.condition_text} → {a.action_text}
+                            </div>
+                          </div>
+                          <span
+                            className={`px-2 py-0.5 rounded text-[10px] font-bold ${
+                              a.is_active
+                                ? 'bg-emerald-500/20 text-emerald-400'
+                                : 'bg-slate-800 text-slate-400'
+                            }`}
+                          >
+                            {a.is_active ? 'BẬT' : 'TẮT'}
+                          </span>
+                        </div>
+                      ))}
                     </div>
                   )}
                 </div>
 
-                <div className="flex flex-wrap gap-3">
+                <div className={`p-5 rounded-2xl border ${cardBg}`}>
+                  <div className="flex items-center justify-between mb-3">
+                    <h2 className="font-bold text-sm">
+                      🤖 Cảnh báo An ninh & AI ({aiAlerts.length})
+                    </h2>
+                    <button
+                      onClick={() => setActiveTab('ai')}
+                      className="text-xs text-cyan-400 hover:underline font-semibold"
+                    >
+                      Trung tâm AI →
+                    </button>
+                  </div>
+
+                  {aiAlerts.length === 0 ? (
+                    <div className="text-xs text-emerald-400 py-4">
+                      ✓ Hệ thống vận hành ổn định, không có bất thường.
+                    </div>
+                  ) : (
+                    <div className="space-y-2">
+                      {aiAlerts.slice(0, 3).map((al) => (
+                        <div
+                          key={al.id}
+                          className="p-3 rounded-xl bg-rose-500/10 border border-rose-500/30 text-xs"
+                        >
+                          <div className="font-bold text-rose-400">
+                            {al.title || al.alert_type}
+                          </div>
+                          <div className="text-slate-300 mt-0.5">{al.message}</div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              {/* Row 4: System Logs */}
+              <div className={`p-5 rounded-2xl border ${cardBg}`}>
+                <div className="flex items-center justify-between mb-3">
+                  <h2 className="font-bold text-sm">📜 Nhật ký hoạt động hệ thống</h2>
+                  <button
+                    onClick={() => setSystemLogs([])}
+                    className="text-xs text-slate-400 hover:text-slate-200"
+                  >
+                    Xóa nhật ký
+                  </button>
+                </div>
+                <div className="space-y-1 font-mono text-xs text-slate-400 max-h-32 overflow-y-auto">
+                  {systemLogs.length === 0 ? (
+                    <div>Không có nhật ký.</div>
+                  ) : (
+                    systemLogs.map((log, i) => <div key={i}>{log}</div>)
+                  )}
+                </div>
+              </div>
+            </>
+          )}
+
+          {/* ==================== TAB 2: PHÒNG & THIẾT BỊ ==================== */}
+          {activeTab === 'devices' && (
+            <div className="space-y-6">
+              {/* Top Toolbar: Discover & Import / Export Excel (Owner/Admin only) */}
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div>
+                  <h1 className="text-lg font-bold">
+                    Quản lý Không gian Nhà, Phòng & Thiết bị IoT
+                  </h1>
+                  <p className="text-xs text-slate-400">
+                    Hỗ trợ nhập/xuất hàng loạt qua Excel (Sheet 1: TenNha, DiaChi, TenPhong, Tang • Sheet 2: TenThietBi, LoaiThietBi, MqttTopic, Phong)
+                  </p>
+                </div>
+
+                {isOwnerOrAdmin && (
+                  <div className="flex flex-wrap items-center gap-2">
+                    <button
+                      type="button"
+                      disabled={discoveringDevices}
+                      onClick={handleDiscoverDevices}
+                      className="px-3.5 py-2 rounded-xl bg-amber-500/15 border border-amber-500/30 text-amber-400 hover:bg-amber-500/25 text-xs font-semibold transition disabled:opacity-50"
+                    >
+                      {discoveringDevices ? '⏳ Đang quét...' : '📡 Quét thiết bị'}
+                    </button>
+                    <input
+                      ref={fileInputRef}
+                      type="file"
+                      accept=".xlsx,.xls,.csv"
+                      onChange={handleImportExcel}
+                      className="hidden"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => fileInputRef.current?.click()}
+                      className="px-3.5 py-2 rounded-xl bg-emerald-500/15 border border-emerald-500/30 text-emerald-400 hover:bg-emerald-500/25 text-xs font-semibold transition"
+                    >
+                      📥 Nhập Excel
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleExportExcel}
+                      className="px-3.5 py-2 rounded-xl bg-cyan-500/15 border border-cyan-500/30 text-cyan-400 hover:bg-cyan-500/25 text-xs font-semibold transition"
+                    >
+                      📤 Xuất Excel
+                    </button>
+                  </div>
+                )}
+              </div>
+
+              {/* BẢNG XEM TRƯỚC DANH SÁCH NHÀ / PHÒNG / THIẾT BỊ TỪ EXCEL HOẶC DISCOVERY */}
+              {excelPreviewSpace.length > 0 &&
+                (() => {
+                  const validRows = excelPreviewSpace.filter((i) => i.isValid);
+                  const invalidRows = excelPreviewSpace.filter((i) => !i.isValid);
+
+                  return (
+                    <div className={`p-5 rounded-2xl border border-cyan-500/40 space-y-4 ${cardBg}`}>
+                      <div className="flex flex-wrap items-center justify-between gap-3">
+                        <div>
+                          <h2 className="text-sm font-bold text-cyan-400">
+                            📋 Danh sách kiểm tra dữ liệu từ: {spaceExcelFileName}
+                          </h2>
+                          <div className="flex flex-wrap items-center gap-3 mt-1 text-xs">
+                            <span className="text-slate-400">
+                              Tổng cộng:{' '}
+                              <strong className="text-slate-200">{excelPreviewSpace.length}</strong>{' '}
+                              dòng
+                            </span>
+                            <span className="px-2 py-0.5 rounded bg-emerald-500/15 text-emerald-400 font-semibold">
+                              ✓ Hợp lệ: {validRows.length}
+                            </span>
+                            {invalidRows.length > 0 && (
+                              <span className="px-2 py-0.5 rounded bg-rose-500/15 text-rose-400 font-semibold">
+                                ✕ Không hợp lệ / Đã tồn tại: {invalidRows.length}
+                              </span>
+                            )}
+                          </div>
+                        </div>
+
+                        <div className="flex items-center gap-2">
+                          <button
+                            type="button"
+                            disabled={isImportingSpace}
+                            onClick={() => {
+                              setExcelPreviewSpace([]);
+                              setSpaceExcelFileName('');
+                            }}
+                            className="px-3.5 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-semibold transition disabled:opacity-50"
+                          >
+                            ✕ Hủy bỏ
+                          </button>
+                          <button
+                            type="button"
+                            disabled={validRows.length === 0 || isImportingSpace}
+                            onClick={handleConfirmImportSpaceItems}
+                            className="px-4 py-2 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 text-xs font-bold transition disabled:opacity-40"
+                          >
+                            {isImportingSpace
+                              ? 'Đang tạo dữ liệu...'
+                              : `✓ Xác nhận tạo ${validRows.length} mục hợp lệ`}
+                          </button>
+                        </div>
+                      </div>
+
+                      <div className="rounded-xl border border-slate-800 overflow-x-auto max-h-72 overflow-y-auto">
+                        <table className="w-full text-left text-xs">
+                          <thead className="bg-slate-900/90 text-slate-400 uppercase text-[11px] sticky top-0">
+                            <tr>
+                              <th className="p-2.5">Nguồn / Dòng</th>
+                              <th className="p-2.5">Phân loại</th>
+                              <th className="p-2.5">Tên mục</th>
+                              <th className="p-2.5">Chi tiết (Nhà / Phòng / Topic)</th>
+                              <th className="p-2.5">Trạng thái kiểm tra</th>
+                              <th className="p-2.5 text-right">Bỏ</th>
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-slate-800/70">
+                            {excelPreviewSpace.map((item) => (
+                              <tr
+                                key={item.id}
+                                className={
+                                  item.isValid ? 'bg-emerald-500/5' : 'bg-rose-500/5 opacity-80'
+                                }
+                              >
+                                <td className="p-2.5 font-mono text-slate-400">
+                                  {item.sheetName} #{item.rowNumber}
+                                </td>
+                                <td className="p-2.5">
+                                  {item.kind === 'house' && (
+                                    <span className="px-2 py-0.5 rounded bg-cyan-500/15 text-cyan-400 font-semibold">
+                                      🏠 Ngôi nhà
+                                    </span>
+                                  )}
+                                  {item.kind === 'room' && (
+                                    <span className="px-2 py-0.5 rounded bg-amber-500/15 text-amber-400 font-semibold">
+                                      🚪 Phòng
+                                    </span>
+                                  )}
+                                  {item.kind === 'device' && (
+                                    <span className="px-2 py-0.5 rounded bg-emerald-500/15 text-emerald-400 font-semibold">
+                                      🔌 Thiết bị
+                                    </span>
+                                  )}
+                                </td>
+                                <td className="p-2.5 font-bold">
+                                  {item.name || (
+                                    <span className="text-rose-400 italic">(Trống)</span>
+                                  )}
+                                </td>
+                                <td className="p-2.5 text-slate-300 font-mono text-[11px]">
+                                  {item.kind === 'house' && (item.address || 'Không có địa chỉ')}
+                                  {item.kind === 'room' &&
+                                    `Nhà: ${item.houseName} • Tầng ${item.floor || 1}`}
+                                  {item.kind === 'device' &&
+                                    `${item.mqttTopic || 'Thiếu topic'} • ${
+                                      item.roomName ? `Phòng: ${item.roomName}` : 'Chưa phân phòng'
+                                    } (${item.deviceType})`}
+                                </td>
+                                <td className="p-2.5">
+                                  {item.isValid ? (
+                                    <span className="text-emerald-400 font-semibold">
+                                      ✓ Hợp lệ (Sẵn sàng tạo)
+                                    </span>
+                                  ) : (
+                                    <span className="text-rose-400 font-medium">
+                                      ✕ {item.errorReason}
+                                    </span>
+                                  )}
+                                </td>
+                                <td className="p-2.5 text-right">
+                                  <button
+                                    type="button"
+                                    onClick={() => handleRemovePreviewSpaceItem(item.id)}
+                                    className="px-2 py-0.5 rounded hover:bg-slate-800 text-slate-400 hover:text-slate-200"
+                                    title="Loại khỏi danh sách nhập"
+                                  >
+                                    ✕
+                                  </button>
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+                  );
+                })()}
+
+              {/* Forms Create House / Room / Device (Owner/Admin only) */}
+              {isOwnerOrAdmin && (
+                <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+                  {/* Add House */}
+                  <form
+                    onSubmit={handleCreateHouse}
+                    className={`p-4 rounded-2xl border space-y-3 ${cardBg}`}
+                  >
+                    <h3 className="font-bold text-xs text-cyan-400 uppercase">+ Thêm Ngôi nhà</h3>
+                    <input
+                      type="text"
+                      required
+                      value={newHouseName}
+                      onChange={(e) => setNewHouseName(e.target.value)}
+                      placeholder="Tên nhà (VD: Nhà Quận 7)"
+                      className={`w-full px-3 py-2 rounded-xl border text-xs ${inputBg}`}
+                    />
+                    <input
+                      type="text"
+                      value={newHouseAddress}
+                      onChange={(e) => setNewHouseAddress(e.target.value)}
+                      placeholder="Địa chỉ (Tùy chọn)"
+                      className={`w-full px-3 py-2 rounded-xl border text-xs ${inputBg}`}
+                    />
+                    <button
+                      type="submit"
+                      className="w-full py-2 rounded-xl bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-bold text-xs"
+                    >
+                      Tạo Ngôi nhà
+                    </button>
+                  </form>
+
+                  {/* Add Room */}
+                  <form
+                    onSubmit={handleCreateRoom}
+                    className={`p-4 rounded-2xl border space-y-3 ${cardBg}`}
+                  >
+                    <h3 className="font-bold text-xs text-amber-400 uppercase">+ Thêm Phòng</h3>
+                    <select
+                      value={newRoomHouseId || houses[0]?.id || ''}
+                      onChange={(e) => setNewRoomHouseId(e.target.value)}
+                      className={`w-full px-3 py-2 rounded-xl border text-xs ${inputBg}`}
+                    >
+                      <option value="">-- Chọn ngôi nhà --</option>
+                      {houses.map((h) => (
+                        <option key={h.id} value={h.id}>
+                          {h.name}
+                        </option>
+                      ))}
+                    </select>
+                    <div className="grid grid-cols-3 gap-2">
+                      <input
+                        type="text"
+                        required
+                        value={newRoomName}
+                        onChange={(e) => setNewRoomName(e.target.value)}
+                        placeholder="Tên phòng (VD: Phòng khách)"
+                        className={`col-span-2 px-3 py-2 rounded-xl border text-xs ${inputBg}`}
+                      />
+                      <input
+                        type="number"
+                        value={newRoomFloor}
+                        onChange={(e) => setNewRoomFloor(Number(e.target.value))}
+                        placeholder="Tầng"
+                        className={`px-3 py-2 rounded-xl border text-xs ${inputBg}`}
+                      />
+                    </div>
+                    <button
+                      type="submit"
+                      className="w-full py-2 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold text-xs"
+                    >
+                      Tạo Phòng
+                    </button>
+                  </form>
+
+                  {/* Add Device */}
+                  <form
+                    onSubmit={handleCreateDevice}
+                    className={`p-4 rounded-2xl border space-y-3 ${cardBg}`}
+                  >
+                    <h3 className="font-bold text-xs text-emerald-400 uppercase">
+                      + Thêm Thiết bị IoT
+                    </h3>
+                    <div className="grid grid-cols-2 gap-2">
+                      <input
+                        type="text"
+                        required
+                        value={newDeviceName}
+                        onChange={(e) => setNewDeviceName(e.target.value)}
+                        placeholder="Tên thiết bị"
+                        className={`px-3 py-2 rounded-xl border text-xs ${inputBg}`}
+                      />
+                      <select
+                        value={newDeviceType}
+                        onChange={(e) => setNewDeviceType(e.target.value)}
+                        className={`px-3 py-2 rounded-xl border text-xs ${inputBg}`}
+                      >
+                        <option value="light">Đèn (light)</option>
+                        <option value="fan">Quạt (fan)</option>
+                        <option value="ac">Điều hòa (ac)</option>
+                        <option value="switch">Công tắc (switch)</option>
+                        <option value="sensor">Cảm biến (sensor)</option>
+                      </select>
+                    </div>
+                    <div className="grid grid-cols-2 gap-2">
+                      <input
+                        type="text"
+                        required
+                        value={newDeviceTopic}
+                        onChange={(e) => setNewDeviceTopic(e.target.value)}
+                        placeholder="MQTT Topic (home/r1/led)"
+                        className={`px-3 py-2 rounded-xl border text-xs ${inputBg}`}
+                      />
+                      <select
+                        value={newDeviceRoomId}
+                        onChange={(e) => setNewDeviceRoomId(e.target.value)}
+                        className={`px-3 py-2 rounded-xl border text-xs ${inputBg}`}
+                      >
+                        <option value="">Chưa phân phòng</option>
+                        {rooms.map((r) => (
+                          <option key={r.id} value={r.id}>
+                            {r.name} ({r.house_name || 'Nhà'})
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                    <button
+                      type="submit"
+                      className="w-full py-2 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-xs"
+                    >
+                      Kết nối Thiết bị
+                    </button>
+                  </form>
+                </div>
+              )}
+
+              {/* Inline Edit Forms if editing House / Room */}
+              {editingHouse && (
+                <form
+                  onSubmit={handleUpdateHouse}
+                  className={`p-4 rounded-2xl border border-cyan-500/40 flex flex-wrap items-center gap-3 ${cardBg}`}
+                >
+                  <span className="text-xs font-bold text-cyan-400">✏️ Sửa Ngôi nhà:</span>
+                  <input
+                    type="text"
+                    required
+                    value={editingHouse.name}
+                    onChange={(e) => setEditingHouse({ ...editingHouse, name: e.target.value })}
+                    className={`px-3 py-1.5 rounded-xl border text-xs ${inputBg}`}
+                  />
+                  <input
+                    type="text"
+                    value={editingHouse.address || ''}
+                    onChange={(e) => setEditingHouse({ ...editingHouse, address: e.target.value })}
+                    placeholder="Địa chỉ"
+                    className={`px-3 py-1.5 rounded-xl border text-xs ${inputBg}`}
+                  />
+                  <button
+                    type="submit"
+                    className="px-3 py-1.5 rounded-xl bg-cyan-500 text-slate-950 font-bold text-xs"
+                  >
+                    Lưu
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setEditingHouse(null)}
+                    className="px-3 py-1.5 rounded-xl bg-slate-800 text-slate-300 text-xs"
+                  >
+                    Hủy
+                  </button>
+                </form>
+              )}
+
+              {editingRoom && (
+                <form
+                  onSubmit={handleUpdateRoom}
+                  className={`p-4 rounded-2xl border border-amber-500/40 flex flex-wrap items-center gap-3 ${cardBg}`}
+                >
+                  <span className="text-xs font-bold text-amber-400">✏️ Sửa Phòng:</span>
+                  <select
+                    value={editingRoom.house_id}
+                    onChange={(e) => setEditingRoom({ ...editingRoom, house_id: e.target.value })}
+                    className={`px-3 py-1.5 rounded-xl border text-xs ${inputBg}`}
+                  >
+                    {houses.map((h) => (
+                      <option key={h.id} value={h.id}>
+                        {h.name}
+                      </option>
+                    ))}
+                  </select>
+                  <input
+                    type="text"
+                    required
+                    value={editingRoom.name}
+                    onChange={(e) => setEditingRoom({ ...editingRoom, name: e.target.value })}
+                    className={`px-3 py-1.5 rounded-xl border text-xs ${inputBg}`}
+                  />
+                  <input
+                    type="number"
+                    value={editingRoom.floor}
+                    onChange={(e) =>
+                      setEditingRoom({ ...editingRoom, floor: Number(e.target.value) })
+                    }
+                    className={`w-20 px-3 py-1.5 rounded-xl border text-xs ${inputBg}`}
+                  />
+                  <button
+                    type="submit"
+                    className="px-3 py-1.5 rounded-xl bg-amber-500 text-slate-950 font-bold text-xs"
+                  >
+                    Lưu
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setEditingRoom(null)}
+                    className="px-3 py-1.5 rounded-xl bg-slate-800 text-slate-300 text-xs"
+                  >
+                    Hủy
+                  </button>
+                </form>
+              )}
+
+              {/* Houses Filter Bar */}
+              <div className={`p-4 rounded-2xl border ${cardBg}`}>
+                <div className="text-xs font-bold text-slate-400 mb-2">DANH SÁCH NGÔI NHÀ</div>
+                <div className="flex flex-wrap gap-2">
                   <button
                     onClick={() => {
                       setSelectedHouseId(null);
                       setSelectedRoomId(null);
                     }}
-                    className={`px-4 py-3 rounded-xl border text-xs font-bold transition ${
+                    className={`px-3 py-1.5 rounded-xl text-xs font-semibold border ${
                       selectedHouseId === null
-                        ? 'bg-cyan-500/15 text-cyan-400 border-cyan-500'
-                        : `${subCardBg} text-slate-300`
+                        ? 'bg-cyan-500/20 border-cyan-500/40 text-cyan-300'
+                        : 'border-slate-700 text-slate-400'
                     }`}
                   >
-                    Tất cả Nhà ({houses.length})
+                    Tất cả nhà ({houses.length})
                   </button>
-
-                  {houses.map((house) => {
-                    const roomCount = rooms.filter((r) => r.house_id === house.id).length;
-                    const isSelected = selectedHouseId === house.id;
-                    return (
-                      <div
-                        key={house.id}
+                  {houses.map((h) => (
+                    <div
+                      key={h.id}
+                      className={`inline-flex items-center gap-2 px-3 py-1.5 rounded-xl text-xs border ${
+                        selectedHouseId === h.id
+                          ? 'bg-cyan-500/20 border-cyan-500/40 text-cyan-300'
+                          : 'border-slate-700 text-slate-300'
+                      }`}
+                    >
+                      <button
                         onClick={() => {
-                          setSelectedHouseId(isSelected ? null : house.id);
+                          setSelectedHouseId(h.id);
                           setSelectedRoomId(null);
                         }}
-                        className={`px-4 py-3 rounded-xl border cursor-pointer transition flex items-center gap-4 ${
-                          isSelected
-                            ? 'bg-cyan-500/15 border-cyan-500 text-cyan-300'
-                            : subCardBg
-                        }`}
+                        className="font-semibold"
                       >
-                        <div>
-                          <div className="text-xs font-bold">
-                            {house.name}{' '}
-                            <span className="font-normal text-slate-400">
-                              ({roomCount} phòng)
-                            </span>
-                          </div>
-                          <div className="text-[11px] text-slate-400 mt-0.5">
-                            {house.address || 'Chưa cập nhật địa chỉ'}
-                          </div>
-                        </div>
-
-                        {isOwnerOrAdmin && (
-                          <div className="flex items-center gap-1.5">
-                            <button
-                              onClick={(e) => openEditHouseModal(house, e)}
-                              title="Sửa ngôi nhà"
-                              className="p-1.5 rounded-lg hover:bg-slate-800 text-amber-400 text-xs"
-                            >
-                              ✏️
-                            </button>
-                            <button
-                              onClick={(e) => handleDeleteHouse(house, e)}
-                              title="Xóa ngôi nhà"
-                              className="p-1.5 rounded-lg hover:bg-slate-800 text-red-400 text-xs"
-                            >
-                              🗑️
-                            </button>
-                          </div>
-                        )}
-                      </div>
-                    );
-                  })}
+                        🏠 {h.name}
+                      </button>
+                      {isOwnerOrAdmin && (
+                        <>
+                          <button
+                            onClick={() => setEditingHouse(h)}
+                            className="text-sky-400 hover:text-sky-300 text-[11px]"
+                            title="Sửa nhà"
+                          >
+                            ✎
+                          </button>
+                          <button
+                            onClick={() => handleDeleteHouse(h)}
+                            className="text-rose-400 hover:text-rose-300 text-[11px]"
+                            title="Xóa nhà"
+                          >
+                            ✕
+                          </button>
+                        </>
+                      )}
+                    </div>
+                  ))}
                 </div>
-              </section>
+              </div>
 
-              {/* KHỐI 2: DANH SÁCH PHÒNG */}
-              <section className={`p-5 rounded-2xl border ${cardBg}`}>
-                <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
-                  <div>
-                    <h2 className="text-sm font-bold flex items-center gap-2">
-                      <span>🚪</span>
-                      <span>
-                        {isOwnerOrAdmin
-                          ? `Quản lý Phòng (${filteredRooms.length})`
-                          : `Danh sách Phòng (${filteredRooms.length})`}
-                      </span>
-                    </h2>
-                    <p className="text-xs text-slate-400 mt-0.5">
-                      Nhấn vào từng phòng để xem và điều khiển thiết bị IoT bên trong phòng đó.
-                    </p>
-                  </div>
-
-                  {isOwnerOrAdmin && (
-                    <button
-                      onClick={openCreateRoomModal}
-                      className="px-3.5 py-1.5 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-xs transition"
+              {/* Rooms Filter Bar */}
+              <div className={`p-4 rounded-2xl border ${cardBg}`}>
+                <div className="text-xs font-bold text-slate-400 mb-2">DANH SÁCH PHÒNG</div>
+                <div className="flex flex-wrap gap-2">
+                  <button
+                    onClick={() => setSelectedRoomId(null)}
+                    className={`px-3 py-1.5 rounded-xl text-xs font-semibold border ${
+                      selectedRoomId === null
+                        ? 'bg-amber-500/20 border-amber-500/40 text-amber-300'
+                        : 'border-slate-700 text-slate-400'
+                    }`}
+                  >
+                    Tất cả phòng ({filteredRooms.length})
+                  </button>
+                  {filteredRooms.map((r) => (
+                    <div
+                      key={r.id}
+                      className={`inline-flex items-center gap-2 px-3 py-1.5 rounded-xl text-xs border ${
+                        selectedRoomId === r.id
+                          ? 'bg-amber-500/20 border-amber-500/40 text-amber-300'
+                          : 'border-slate-700 text-slate-300'
+                      }`}
                     >
-                      + Thêm Phòng
-                    </button>
-                  )}
+                      <button onClick={() => setSelectedRoomId(r.id)} className="font-semibold">
+                        🚪 {r.name} (T{r.floor})
+                      </button>
+                      {isOwnerOrAdmin && (
+                        <>
+                          <button
+                            onClick={() => setEditingRoom(r)}
+                            className="text-sky-400 hover:text-sky-300 text-[11px]"
+                            title="Sửa phòng"
+                          >
+                            ✎
+                          </button>
+                          <button
+                            onClick={() => handleDeleteRoom(r)}
+                            className="text-rose-400 hover:text-rose-300 text-[11px]"
+                            title="Xóa phòng"
+                          >
+                            ✕
+                          </button>
+                        </>
+                      )}
+                    </div>
+                  ))}
                 </div>
+              </div>
 
-                {filteredRooms.length === 0 ? (
-                  <div className="text-xs text-slate-400 py-6 text-center border border-dashed border-slate-800 rounded-xl">
-                    {isOwnerOrAdmin ? (
-                      <>
-                        Chưa có phòng nào. Nhấn <strong>+ Thêm Phòng</strong> để tạo phòng mới hoặc
-                        dùng <strong>📥 Nhập Excel</strong> ở trên.
-                      </>
-                    ) : (
-                      'Chưa có phòng nào được thiết lập trong ngôi nhà này.'
-                    )}
+              {/* Devices Grid (Tích hợp chỉnh sửa trực tiếp ngay trên thẻ thiết bị) */}
+              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                {filteredDevices.length === 0 ? (
+                  <div
+                    className={`col-span-full p-10 rounded-2xl border text-center text-xs text-slate-500 ${cardBg}`}
+                  >
+                    Chưa có thiết bị nào trong khu vực này.
                   </div>
                 ) : (
-                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
-                    {filteredRooms.map((room) => {
-                      const devCount = devices.filter((d) => d.room_id === room.id).length;
-                      const houseName =
-                        room.house_name ||
-                        houses.find((h) => h.id === room.house_id)?.name ||
-                        'Nhà';
-                      const isSelected = selectedRoomId === room.id;
+                  filteredDevices.map((dev) => {
+                    const isEditingThis = editingDevice?.id === dev.id;
 
+                    if (isEditingThis && editingDevice) {
                       return (
-                        <div
-                          key={room.id}
-                          onClick={() => {
-                            if (isSelected) {
-                              setSelectedRoomId(null);
-                              setDeviceFilterMode('all');
-                            } else {
-                              setSelectedRoomId(room.id);
-                              setDeviceFilterMode('room');
-                            }
-                          }}
-                          className={`p-4 rounded-xl border cursor-pointer transition flex flex-col justify-between gap-3 ${
-                            isSelected ? 'bg-cyan-500/15 border-cyan-500' : subCardBg
-                          }`}
+                        <form
+                          key={dev.id}
+                          onSubmit={handleUpdateDevice}
+                          className={`p-4 rounded-2xl border border-cyan-500/50 flex flex-col justify-between gap-3 shadow-lg ${cardBg}`}
                         >
-                          <div className="flex items-start justify-between gap-2">
+                          <div className="flex items-center justify-between">
+                            <span className="text-xs font-bold text-cyan-400">
+                              ✏️ Chỉnh sửa thiết bị
+                            </span>
+                            <button
+                              type="button"
+                              onClick={() => setEditingDevice(null)}
+                              className="text-xs text-slate-400 hover:text-slate-200 px-1.5 py-0.5 rounded hover:bg-slate-800"
+                            >
+                              ✕
+                            </button>
+                          </div>
+
+                          <div className="space-y-2.5">
                             <div>
-                              <div className="text-sm font-bold flex items-center gap-1.5">
-                                <span>🛏️</span>
-                                <span>{room.name}</span>
+                              <label className="block text-[11px] text-slate-400 mb-1">
+                                Tên thiết bị
+                              </label>
+                              <input
+                                type="text"
+                                required
+                                value={editingDevice.name}
+                                onChange={(e) =>
+                                  setEditingDevice({ ...editingDevice, name: e.target.value })
+                                }
+                                placeholder="Tên thiết bị"
+                                className={`w-full px-3 py-1.5 rounded-xl border text-xs ${inputBg}`}
+                              />
+                            </div>
+
+                            <div className="grid grid-cols-2 gap-2">
+                              <div>
+                                <label className="block text-[11px] text-slate-400 mb-1">
+                                  Loại thiết bị
+                                </label>
+                                <select
+                                  value={editingDevice.device_type}
+                                  onChange={(e) =>
+                                    setEditingDevice({
+                                      ...editingDevice,
+                                      device_type: e.target.value,
+                                    })
+                                  }
+                                  className={`w-full px-2.5 py-1.5 rounded-xl border text-xs ${inputBg}`}
+                                >
+                                  <option value="light">Đèn (light)</option>
+                                  <option value="fan">Quạt (fan)</option>
+                                  <option value="ac">Điều hòa (ac)</option>
+                                  <option value="switch">Công tắc (switch)</option>
+                                  <option value="sensor">Cảm biến (sensor)</option>
+                                </select>
                               </div>
-                              <div className="text-[11px] text-slate-400 mt-0.5">
-                                Tầng {room.floor ?? 1} • {houseName}
+
+                              <div>
+                                <label className="block text-[11px] text-slate-400 mb-1">
+                                  Phòng
+                                </label>
+                                <select
+                                  value={editingDevice.room_id || ''}
+                                  onChange={(e) =>
+                                    setEditingDevice({
+                                      ...editingDevice,
+                                      room_id: e.target.value || null,
+                                    })
+                                  }
+                                  className={`w-full px-2.5 py-1.5 rounded-xl border text-xs ${inputBg}`}
+                                >
+                                  <option value="">Chưa phân phòng</option>
+                                  {rooms.map((r) => (
+                                    <option key={r.id} value={r.id}>
+                                      {r.name} ({r.house_name || 'Nhà'})
+                                    </option>
+                                  ))}
+                                </select>
                               </div>
                             </div>
 
-                            {isOwnerOrAdmin && (
-                              <div className="flex items-center gap-1">
-                                <button
-                                  onClick={(e) => openEditRoomModal(room, e)}
-                                  title="Sửa phòng"
-                                  className="p-1.5 rounded-lg bg-slate-800/80 hover:bg-slate-700 text-amber-400 text-xs"
-                                >
-                                  ✏️
-                                </button>
-                                <button
-                                  onClick={(e) => handleDeleteRoom(room, e)}
-                                  title="Xóa phòng"
-                                  className="p-1.5 rounded-lg bg-slate-800/80 hover:bg-slate-700 text-red-400 text-xs"
-                                >
-                                  🗑️
-                                </button>
-                              </div>
-                            )}
+                            <div>
+                              <label className="block text-[11px] text-slate-400 mb-1">
+                                MQTT Topic
+                              </label>
+                              <input
+                                type="text"
+                                required
+                                value={editingDevice.mqtt_topic}
+                                onChange={(e) =>
+                                  setEditingDevice({
+                                    ...editingDevice,
+                                    mqtt_topic: e.target.value,
+                                  })
+                                }
+                                placeholder="smarthome/devices/..."
+                                className={`w-full px-3 py-1.5 rounded-xl border text-xs font-mono ${inputBg}`}
+                              />
+                            </div>
                           </div>
 
-                          <div className="flex items-center justify-between pt-2 border-t border-slate-800/60 text-[11px]">
-                            <span className="font-bold text-cyan-400">{devCount} thiết bị</span>
-                            <span className="text-slate-400">
-                              {isSelected ? 'Đang lọc ✓' : 'Nhấn để lọc'}
-                            </span>
+                          <div className="grid grid-cols-2 gap-2 pt-1">
+                            <button
+                              type="submit"
+                              className="py-2 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-xs transition"
+                            >
+                              ✓ Lưu thay đổi
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setEditingDevice(null)}
+                              className="py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 font-semibold text-xs transition"
+                            >
+                              Hủy
+                            </button>
                           </div>
-                        </div>
+                        </form>
                       );
-                    })}
-                  </div>
-                )}
-              </section>
-
-              {/* KHỐI 3: DANH SÁCH THIẾT BỊ IOT */}
-              <section className="space-y-4">
-                <div className="flex flex-wrap items-center justify-between gap-3">
-                  <div className="flex flex-wrap items-center gap-2">
-                    <button
-                      onClick={() => {
-                        setSelectedRoomId(null);
-                        setDeviceFilterMode('all');
-                      }}
-                      className={`px-3.5 py-1.5 rounded-lg text-xs font-bold border transition ${
-                        !selectedRoomId && deviceFilterMode === 'all'
-                          ? 'bg-cyan-500/20 text-cyan-400 border-cyan-500/50'
-                          : 'bg-slate-900 text-slate-400 border-slate-800'
-                      }`}
-                    >
-                      Tất cả thiết bị
-                    </button>
-
-                    <button
-                      onClick={() => {
-                        setSelectedRoomId(null);
-                        setDeviceFilterMode('unassigned');
-                      }}
-                      className={`px-3.5 py-1.5 rounded-lg text-xs font-bold border transition ${
-                        !selectedRoomId && deviceFilterMode === 'unassigned'
-                          ? 'bg-amber-500 text-slate-950 border-amber-400'
-                          : 'bg-slate-900 text-amber-400 border-slate-800'
-                      }`}
-                    >
-                      Chưa phân phòng ({unassignedDevicesCount})
-                    </button>
-
-                    {selectedRoomId && (
-                      <span className="px-3 py-1.5 rounded-lg text-xs font-bold bg-emerald-500/15 text-emerald-400 border border-emerald-500/30 flex items-center gap-2">
-                        <span>
-                          Phòng: {rooms.find((r) => r.id === selectedRoomId)?.name}
-                        </span>
-                        <button
-                          onClick={() => {
-                            setSelectedRoomId(null);
-                            setDeviceFilterMode('all');
-                          }}
-                          className="hover:text-white"
-                        >
-                          ✕
-                        </button>
-                      </span>
-                    )}
-                  </div>
-
-                  {/* CHỈ OWNER / ADMIN ĐƯỢC XUẤT / NHẬP EXCEL THIẾT BỊ & THÊM / QUÉT THIẾT BỊ */}
-                  {isOwnerOrAdmin && (
-                    <div className="flex flex-wrap items-center gap-2">
-                      <button
-                        onClick={() => {
-                          exportDevicesToExcel(devices, rooms);
-                          addLog('EXCEL EXPORT: Đã xuất danh sách Thiết bị IoT ra file .xlsx');
-                        }}
-                        className={`px-3 py-1.5 rounded-lg border text-xs font-bold transition ${
-                          isDark
-                            ? 'bg-slate-900 text-emerald-400 border-emerald-500/40 hover:bg-emerald-500/15'
-                            : 'bg-emerald-50 text-emerald-700 border-emerald-300 hover:bg-emerald-100'
-                        }`}
-                      >
-                        📤 Xuất Thiết bị
-                      </button>
-
-                      <button
-                        onClick={() => {
-                          setExcelImportMode('devices');
-                          setIsExcelModalOpen(true);
-                        }}
-                        className={`px-3 py-1.5 rounded-lg border text-xs font-bold transition ${
-                          isDark
-                            ? 'bg-slate-900 text-amber-400 border-amber-500/40 hover:bg-amber-500/15'
-                            : 'bg-amber-50 text-amber-700 border-amber-300 hover:bg-amber-100'
-                        }`}
-                      >
-                        📥 Nhập Thiết bị
-                      </button>
-
-                      <button
-                        onClick={handleDiscoverWokwi}
-                        className="px-3.5 py-1.5 rounded-lg bg-sky-500/15 hover:bg-sky-500/25 text-sky-400 border border-sky-500/40 font-bold text-xs transition"
-                      >
-                        📡 Quét Wokwi
-                      </button>
-
-                      <button
-                        onClick={openCreateDeviceModal}
-                        className="px-3.5 py-1.5 rounded-lg bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-bold text-xs transition"
-                      >
-                        + Thêm thiết bị IoT
-                      </button>
-                    </div>
-                  )}
-                </div>
-
-                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-                  {filteredDevices.map((dev) => {
-                    const isSensor = dev.device_type === 'sensor';
-                    const roomLabel =
-                      dev.room_name ||
-                      rooms.find((r) => r.id === dev.room_id)?.name ||
-                      'Chưa phân phòng';
-
-                    const icon =
-                      dev.device_type === 'fan'
-                        ? '🌀'
-                        : dev.device_type === 'light'
-                        ? '💡'
-                        : isSensor
-                        ? '📡'
-                        : '🔌';
+                    }
 
                     return (
                       <div
                         key={dev.id}
                         className={`p-4 rounded-2xl border flex flex-col justify-between gap-4 ${cardBg}`}
                       >
-                        <div className="flex items-start justify-between gap-3">
-                          <div className="flex items-center gap-3">
-                            <div className="w-11 h-11 rounded-xl bg-slate-800/90 border border-slate-700 flex items-center justify-center text-xl">
-                              {icon}
+                        <div className="flex items-start justify-between gap-2">
+                          <div className="min-w-0">
+                            <div className="font-bold text-sm truncate">{dev.name}</div>
+                            <div className="text-xs text-slate-400 mt-0.5">
+                              {dev.room_name || 'Chưa phân phòng'} •{' '}
+                              <span className="uppercase text-cyan-400">{dev.device_type}</span>
                             </div>
-                            <div>
-                              <div className="text-xs font-bold">{dev.name}</div>
-                              <div className="text-[11px] text-slate-400 mt-0.5">
-                                {roomLabel} •{' '}
-                                <span
-                                  className={
-                                    isSensor
-                                      ? 'text-amber-400 font-semibold'
-                                      : dev.is_on
-                                      ? 'text-cyan-400 font-semibold'
-                                      : 'text-slate-500'
-                                  }
-                                >
-                                  {isSensor ? 'ONLINE' : dev.is_on ? 'ON' : 'OFF'}
-                                </span>
+                            <div className="text-[11px] font-mono text-slate-500 mt-1 truncate">
+                              {dev.mqtt_topic}
+                            </div>
+
+                            {/* Hiển thị chỉ số cảm biến thời gian thực nếu là thiết bị sensor */}
+                            {dev.device_type === 'sensor' && (
+                              <div className="mt-2 flex flex-wrap items-center gap-1.5 text-[11px] font-mono">
+                                {hasLiveSensor && sensorData ? (
+                                  <>
+                                    <span className="px-2 py-0.5 rounded bg-amber-500/15 text-amber-300">
+                                      🌡️ {sensorData.temperature.toFixed(1)}°C
+                                    </span>
+                                    <span className="px-2 py-0.5 rounded bg-cyan-500/15 text-cyan-300">
+                                      💧 {sensorData.humidity.toFixed(0)}%
+                                    </span>
+                                    <span className="px-2 py-0.5 rounded bg-emerald-500/15 text-emerald-300">
+                                      ☀️ {sensorData.lux} Lux
+                                    </span>
+                                    <span
+                                      className={`px-2 py-0.5 rounded ${
+                                        sensorData.motion
+                                          ? 'bg-rose-500/20 text-rose-300'
+                                          : 'bg-slate-800 text-slate-400'
+                                      }`}
+                                    >
+                                      {sensorData.motion ? '🏃 Có người' : '😴 Yên tĩnh'}
+                                    </span>
+                                  </>
+                                ) : (
+                                  <span className="px-2 py-0.5 rounded bg-slate-800 text-slate-400">
+                                    ⏳ Đang chờ gói tin MQTT...
+                                  </span>
+                                )}
                               </div>
-                            </div>
+                            )}
                           </div>
 
-                          {isSensor ? (
-                            <span className="px-2 py-0.5 rounded bg-amber-500/15 text-amber-400 border border-amber-500/30 text-[10px] font-bold">
-                              SENSOR
-                            </span>
-                          ) : (
-                            <button
-                              onClick={() => handleToggleDevice(dev)}
-                              className={`w-11 h-6 rounded-full transition p-0.5 ${
-                                dev.is_on ? 'bg-cyan-500' : 'bg-slate-700'
-                              }`}
-                            >
-                              <div
-                                className={`w-5 h-5 rounded-full bg-white transition-transform ${
-                                  dev.is_on ? 'translate-x-5' : 'translate-x-0'
-                                }`}
-                              />
-                            </button>
-                          )}
-                        </div>
-
-                        <div className="flex items-center justify-between pt-3 border-t border-slate-800/70 text-[11px] text-slate-400">
-                          <span className="font-mono truncate max-w-[75%]">
-                            Topic: {dev.mqtt_topic}
-                          </span>
                           {isOwnerOrAdmin && (
-                            <div className="flex items-center gap-1">
+                            <div className="flex items-center gap-1.5 shrink-0">
                               <button
-                                onClick={() => openEditDeviceModal(dev)}
-                                title="Chỉnh sửa / Gán phòng"
-                                className="p-1.5 rounded-lg bg-slate-800/80 hover:bg-slate-700 text-amber-400"
+                                onClick={() => setEditingDevice({ ...dev })}
+                                className="px-2 py-1 rounded bg-sky-500/15 text-sky-400 hover:bg-sky-500/25 text-xs"
                               >
-                                ✏️
+                                Sửa
                               </button>
                               <button
                                 onClick={() => handleDeleteDevice(dev)}
-                                title="Xóa thiết bị"
-                                className="p-1.5 rounded-lg bg-slate-800/80 hover:bg-slate-700 text-red-400"
+                                className="px-2 py-1 rounded bg-rose-500/15 text-rose-400 hover:bg-rose-500/25 text-xs"
                               >
-                                🗑️
+                                Xóa
                               </button>
                             </div>
                           )}
                         </div>
+
+                        <button
+                          onClick={() => handleToggleDevice(dev)}
+                          className={`w-full py-2 rounded-xl font-bold text-xs transition ${
+                            dev.is_on
+                              ? 'bg-emerald-500 text-slate-950'
+                              : 'bg-slate-800 text-slate-300 hover:bg-slate-700'
+                          }`}
+                        >
+                          {dev.is_on ? '● ĐANG BẬT (Nhấn để TẮT)' : '○ ĐANG TẮT (Nhấn để BẬT)'}
+                        </button>
                       </div>
                     );
-                  })}
-                </div>
-              </section>
+                  })
+                )}
+              </div>
             </div>
           )}
 
@@ -2089,163 +2926,156 @@ export function App() {
               {isOwnerOrAdmin && (
                 <form
                   onSubmit={handleCreateAutomation}
-                  className={`p-5 rounded-2xl border grid grid-cols-1 md:grid-cols-6 gap-3 items-end ${cardBg}`}
+                  className={`p-5 rounded-2xl border grid grid-cols-1 md:grid-cols-4 gap-3 items-end ${cardBg}`}
                 >
-                  <div className="md:col-span-2">
+                  <div>
                     <label className="block text-xs text-slate-400 mb-1">Tên kịch bản</label>
                     <input
                       type="text"
                       required
-                      value={autoName}
-                      onChange={(e) => setAutoName(e.target.value)}
-                      placeholder="VD: Nóng > 30°C tự bật quạt"
-                      className="w-full px-3 py-2 rounded-lg bg-slate-900 border border-slate-700 text-xs"
+                      value={newAutoName}
+                      onChange={(e) => setNewAutoName(e.target.value)}
+                      placeholder="VD: Tự động làm mát"
+                      className={`w-full px-3 py-2 rounded-xl border text-xs ${inputBg}`}
                     />
                   </div>
                   <div>
-                    <label className="block text-xs text-slate-400 mb-1">Cảm biến</label>
-                    <select
-                      value={autoCondType}
-                      onChange={(e) => setAutoCondType(e.target.value)}
-                      className="w-full px-3 py-2 rounded-lg bg-slate-900 border border-slate-700 text-xs"
-                    >
-                      <option value="temperature">Nhiệt độ (°C)</option>
-                      <option value="humidity">Độ ẩm (%)</option>
-                      <option value="lux">Ánh sáng (Lux)</option>
-                    </select>
-                  </div>
-                  <div className="flex gap-2">
-                    <select
-                      value={autoOperator}
-                      onChange={(e) => setAutoOperator(e.target.value)}
-                      className="w-16 px-2 py-2 rounded-lg bg-slate-900 border border-slate-700 text-xs"
-                    >
-                      <option value=">">&gt;</option>
-                      <option value="<">&lt;</option>
-                    </select>
+                    <label className="block text-xs text-slate-400 mb-1">Điều kiện (IF)</label>
                     <input
-                      type="number"
-                      value={autoThreshold}
-                      onChange={(e) => setAutoThreshold(Number(e.target.value))}
-                      className="w-full px-2 py-2 rounded-lg bg-slate-900 border border-slate-700 text-xs"
+                      type="text"
+                      required
+                      value={newAutoCondition}
+                      onChange={(e) => setNewAutoCondition(e.target.value)}
+                      placeholder="VD: temperature > 30"
+                      className={`w-full px-3 py-2 rounded-xl border text-xs ${inputBg}`}
                     />
                   </div>
                   <div>
-                    <label className="block text-xs text-slate-400 mb-1">Hành động</label>
-                    <select
-                      value={autoDeviceId}
-                      onChange={(e) => setAutoDeviceId(e.target.value)}
-                      className="w-full px-3 py-2 rounded-lg bg-slate-900 border border-slate-700 text-xs"
-                    >
-                      <option value="">-- Chọn thiết bị --</option>
-                      {devices
-                        .filter((d) => d.device_type !== 'sensor')
-                        .map((d) => (
-                          <option key={d.id} value={d.id}>
-                            {d.name}
-                          </option>
-                        ))}
-                    </select>
+                    <label className="block text-xs text-slate-400 mb-1">Hành động (THEN)</label>
+                    <input
+                      type="text"
+                      required
+                      value={newAutoAction}
+                      onChange={(e) => setNewAutoAction(e.target.value)}
+                      placeholder="VD: Bật quạt phòng khách"
+                      className={`w-full px-3 py-2 rounded-xl border text-xs ${inputBg}`}
+                    />
                   </div>
-                  <div className="flex gap-2">
-                    <select
-                      value={autoAction}
-                      onChange={(e) => setAutoAction(e.target.value)}
-                      className="px-2 py-2 rounded-lg bg-slate-900 border border-slate-700 text-xs"
-                    >
-                      <option value="ON">BẬT</option>
-                      <option value="OFF">TẮT</option>
-                    </select>
-                    <button
-                      type="submit"
-                      className="flex-1 py-2 px-3 rounded-lg bg-cyan-500 text-slate-950 font-bold text-xs"
-                    >
-                      + Thêm
-                    </button>
-                  </div>
+                  <button
+                    type="submit"
+                    className="py-2 px-4 rounded-xl bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-bold text-xs"
+                  >
+                    + Thêm Kịch bản
+                  </button>
                 </form>
               )}
 
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                {automations.map((rule) => {
-                  const active = rule.is_active ?? rule.enabled ?? true;
-                  return (
+                {automations.length === 0 ? (
+                  <div
+                    className={`col-span-full p-10 rounded-2xl border text-center text-xs text-slate-500 ${cardBg}`}
+                  >
+                    Chưa có kịch bản tự động hóa nào trong ngôi nhà của bạn.
+                  </div>
+                ) : (
+                  automations.map((rule) => (
                     <div
                       key={rule.id}
-                      className={`p-4 rounded-2xl border flex items-center justify-between ${cardBg}`}
+                      className={`p-4 rounded-2xl border flex items-center justify-between gap-3 ${cardBg}`}
                     >
                       <div>
-                        <div className="text-xs font-bold">{rule.name}</div>
-                        <div className="text-[11px] text-slate-400 mt-1">
-                          IF {rule.condition_type || rule.trigger_type} {rule.operator || '>'}{' '}
-                          {rule.threshold ?? rule.trigger_value} → THEN {rule.action || 'ON'}
+                        <div className="font-bold text-sm">{rule.name}</div>
+                        <div className="text-xs text-slate-400 mt-1">
+                          IF <span className="text-amber-400 font-mono">{rule.condition_text}</span>{' '}
+                          → THEN <span className="text-cyan-400">{rule.action_text}</span>
                         </div>
                       </div>
-                      <div className="flex items-center gap-2">
+                      <div className="flex items-center gap-2 shrink-0">
                         <button
-                          disabled={!isOwnerOrAdmin}
                           onClick={() => handleToggleAutomation(rule)}
-                          className={`px-2.5 py-1 rounded text-[11px] font-bold ${
-                            active
-                              ? 'bg-emerald-500/20 text-emerald-400'
+                          className={`px-3 py-1.5 rounded-lg text-xs font-bold ${
+                            rule.is_active
+                              ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30'
                               : 'bg-slate-800 text-slate-400'
-                          } disabled:cursor-default`}
+                          }`}
                         >
-                          {active ? 'Đang BẬT' : 'Đang TẮT'}
+                          {rule.is_active ? 'Đang BẬT' : 'Đang TẮT'}
                         </button>
                         {isOwnerOrAdmin && (
                           <button
-                            onClick={() => handleDeleteAutomation(rule.id)}
-                            className="p-1.5 rounded bg-red-500/15 text-red-400 text-xs"
+                            onClick={() => handleDeleteAutomation(rule)}
+                            className="px-2.5 py-1.5 rounded-lg bg-rose-500/15 text-rose-400 hover:bg-rose-500/25 text-xs"
                           >
-                            🗑️
+                            Xóa
                           </button>
                         )}
                       </div>
                     </div>
-                  );
-                })}
+                  ))
+                )}
               </div>
             </div>
           )}
 
-          {/* ==================== TAB 4: THỐNG KÊ NĂNG LƯỢNG (ĐÃ SỬA BIỂU ĐỒ) ==================== */}
+        {/* ==================== TAB 4: THỐNG KÊ NĂNG LƯỢNG ==================== */}
           {activeTab === 'energy' && (
             <EnergyAnalyticsPanel
-              isDark={isDark}
               energyData={energyData}
               devices={devices}
               rooms={rooms}
+              isDark={isDark}
+              period={energyPeriod}
+              onPeriodChange={(p: EnergyPeriod) => {
+                setEnergyPeriod(p);
+                fetchAllDatabaseData(p);
+              }}
             />
           )}
 
           {/* ==================== TAB 5: TRÍ TUỆ NHÂN TẠO (AI) ==================== */}
           {activeTab === 'ai' && (
-            <div className={`p-5 rounded-2xl border space-y-4 ${cardBg}`}>
+            <div className="space-y-4">
               <div className="flex items-center justify-between">
-                <h2 className="text-sm font-bold">🤖 Cảnh báo bất thường từ AI Engine</h2>
+                <div>
+                  <h1 className="text-lg font-bold">
+                    🤖 Trung tâm Giám sát An ninh & Bất thường AI
+                  </h1>
+                  <p className="text-xs text-slate-400">
+                    Phân tích Z-Score cảm biến thời gian thực riêng cho ngôi nhà của bạn
+                  </p>
+                </div>
                 {isOwnerOrAdmin && (
                   <button
                     onClick={handleSimulateAnomaly}
-                    className="px-3.5 py-1.5 rounded-lg bg-amber-500 text-slate-950 font-bold text-xs"
+                    className="px-4 py-2 rounded-xl bg-rose-500 hover:bg-rose-400 text-white font-bold text-xs"
                   >
                     ⚡ Mô phỏng bất thường
                   </button>
                 )}
               </div>
+
               {aiAlerts.length === 0 ? (
-                <div className="text-xs text-slate-400 py-6 text-center">
-                  Hệ thống vận hành bình thường, chưa ghi nhận cảnh báo bất thường nào.
+                <div
+                  className={`p-10 rounded-2xl border text-center text-xs text-emerald-400 ${cardBg}`}
+                >
+                  ✓ Không phát hiện sự cố hay bất thường nào trong ngôi nhà của bạn.
                 </div>
               ) : (
-                <div className="space-y-2">
-                  {aiAlerts.map((a, i) => (
+                <div className="space-y-3">
+                  {aiAlerts.map((al) => (
                     <div
-                      key={a.id || i}
-                      className="p-3 rounded-xl bg-red-500/10 border border-red-500/30 text-xs"
+                      key={al.id}
+                      className="p-4 rounded-2xl bg-rose-500/10 border border-rose-500/30 flex items-center justify-between gap-4"
                     >
-                      <div className="font-bold text-red-400">{a.title || 'Cảnh báo AI'}</div>
-                      <div className="text-slate-300 mt-0.5">{a.message}</div>
+                      <div>
+                        <div className="text-xs font-bold text-rose-400">
+                          {al.title || al.alert_type}
+                        </div>
+                        <div className="text-sm text-slate-200 mt-0.5">{al.message}</div>
+                      </div>
+                      <div className="text-xs font-mono text-slate-400 shrink-0">
+                        {al.created_at}
+                      </div>
                     </div>
                   ))}
                 </div>
@@ -2253,90 +3083,320 @@ export function App() {
             </div>
           )}
 
-          {/* ==================== TAB 6: QUẢN LÝ TÀI KHOẢN (CHỈ OWNER / ADMIN) ==================== */}
+          {/* ==================== TAB 6: QUẢN LÝ TÀI KHOẢN (OWNER / ADMIN) ==================== */}
           {activeTab === 'accounts' && isOwnerOrAdmin && (
-            <div className={`p-5 rounded-2xl border space-y-4 ${cardBg}`}>
+            <div className="space-y-6">
               <div className="flex flex-wrap items-center justify-between gap-3">
                 <div>
-                  <h2 className="text-sm font-bold">
-                    👥 Quản lý Tài khoản Người dùng ({usersList.length})
-                  </h2>
-                  <p className="text-xs text-slate-400 mt-0.5">
-                    Thêm tài khoản thủ công hoặc nhập / xuất danh sách qua file Excel (.xlsx).
+                  <h1 className="text-lg font-bold">
+                    👥 Quản lý Tài khoản Thành viên trong Gia đình
+                  </h1>
+                  <p className="text-xs text-slate-400">
+                    Cấp tài khoản phụ (Admin / Member / Guest) • Hỗ trợ nhập/xuất hàng loạt qua Excel (cột: HoTen, Email, MatKhau, VaiTro)
                   </p>
                 </div>
 
-                <div className="flex flex-wrap items-center gap-2">
+                <div className="flex items-center gap-2">
+                  <input
+                    ref={userExcelInputRef}
+                    type="file"
+                    accept=".xlsx,.xls,.csv"
+                    onChange={handleImportUsersExcel}
+                    className="hidden"
+                  />
                   <button
-                    onClick={() => {
-                      exportAccountsToExcel(usersList);
-                      addLog('EXCEL EXPORT: Đã xuất danh sách Tài khoản ra file .xlsx');
-                    }}
-                    className={`px-3.5 py-2 rounded-lg border text-xs font-bold transition ${
-                      isDark
-                        ? 'bg-slate-900 text-emerald-400 border-emerald-500/40 hover:bg-emerald-500/15'
-                        : 'bg-emerald-50 text-emerald-700 border-emerald-300 hover:bg-emerald-100'
-                    }`}
-                  >
-                    📤 Xuất Excel
-                  </button>
-
-                  <button
-                    onClick={() => {
-                      setExcelImportMode('accounts');
-                      setIsExcelModalOpen(true);
-                    }}
-                    className={`px-3.5 py-2 rounded-lg border text-xs font-bold transition ${
-                      isDark
-                        ? 'bg-slate-900 text-amber-400 border-amber-500/40 hover:bg-amber-500/15'
-                        : 'bg-amber-50 text-amber-700 border-amber-300 hover:bg-amber-100'
-                    }`}
+                    type="button"
+                    onClick={() => userExcelInputRef.current?.click()}
+                    className="px-3.5 py-2 rounded-xl bg-emerald-500/15 border border-emerald-500/30 text-emerald-400 hover:bg-emerald-500/25 text-xs font-semibold transition"
                   >
                     📥 Nhập Excel
                   </button>
-
                   <button
-                    onClick={() => {
-                      setAccountError('');
-                      setIsAccountModalOpen(true);
-                    }}
-                    className="px-4 py-2 bg-sky-600 hover:bg-sky-700 text-white font-bold rounded-lg text-xs transition"
+                    type="button"
+                    onClick={handleExportUsersExcel}
+                    className="px-3.5 py-2 rounded-xl bg-cyan-500/15 border border-cyan-500/30 text-cyan-400 hover:bg-cyan-500/25 text-xs font-semibold transition"
                   >
-                    + Tạo tài khoản mới
+                    📤 Xuất Excel
                   </button>
                 </div>
               </div>
 
-              <div className="overflow-x-auto rounded-xl border border-slate-800">
+              {/* BẢNG XEM TRƯỚC DANH SÁCH TÀI KHOẢN TỪ EXCEL */}
+              {excelPreviewUsers.length > 0 && (() => {
+                const validRows = excelPreviewUsers.filter((u) => u.isValid);
+                const invalidRows = excelPreviewUsers.filter((u) => !u.isValid);
+
+                return (
+                  <div className={`p-5 rounded-2xl border border-cyan-500/40 space-y-4 ${cardBg}`}>
+                    <div className="flex flex-wrap items-center justify-between gap-3">
+                      <div>
+                        <h2 className="text-sm font-bold text-cyan-400">
+                          📋 Danh sách kiểm tra dữ liệu từ file: {excelFileName}
+                        </h2>
+                        <div className="flex flex-wrap items-center gap-3 mt-1 text-xs">
+                          <span className="text-slate-400">
+                            Tổng cộng:{' '}
+                            <strong className="text-slate-200">{excelPreviewUsers.length}</strong> dòng
+                          </span>
+                          <span className="px-2 py-0.5 rounded bg-emerald-500/15 text-emerald-400 font-semibold">
+                            ✓ Hợp lệ: {validRows.length}
+                          </span>
+                          {invalidRows.length > 0 && (
+                            <span className="px-2 py-0.5 rounded bg-rose-500/15 text-rose-400 font-semibold">
+                              ✕ Không hợp lệ / Bị trùng: {invalidRows.length}
+                            </span>
+                          )}
+                        </div>
+                      </div>
+
+                      <div className="flex items-center gap-2">
+                        <button
+                          type="button"
+                          disabled={isImportingUsers}
+                          onClick={() => {
+                            setExcelPreviewUsers([]);
+                            setExcelFileName('');
+                          }}
+                          className="px-3.5 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-semibold transition disabled:opacity-50"
+                        >
+                          ✕ Hủy bỏ
+                        </button>
+                        <button
+                          type="button"
+                          disabled={validRows.length === 0 || isImportingUsers}
+                          onClick={handleConfirmImportValidUsers}
+                          className="px-4 py-2 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 text-xs font-bold transition disabled:opacity-40"
+                        >
+                          {isImportingUsers
+                            ? 'Đang tạo tài khoản...'
+                            : `✓ Xác nhận tạo ${validRows.length} tài khoản hợp lệ`}
+                        </button>
+                      </div>
+                    </div>
+
+                    <div className="rounded-xl border border-slate-800 overflow-x-auto max-h-72 overflow-y-auto">
+                      <table className="w-full text-left text-xs">
+                        <thead className="bg-slate-900/90 text-slate-400 uppercase text-[11px] sticky top-0">
+                          <tr>
+                            <th className="p-2.5">Dòng</th>
+                            <th className="p-2.5">Họ và tên</th>
+                            <th className="p-2.5">Email</th>
+                            <th className="p-2.5">Mật khẩu</th>
+                            <th className="p-2.5">Vai trò</th>
+                            <th className="p-2.5">Trạng thái kiểm tra</th>
+                            <th className="p-2.5 text-right">Bỏ</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-slate-800/70">
+                          {excelPreviewUsers.map((item) => (
+                            <tr
+                              key={item.rowNumber}
+                              className={
+                                item.isValid ? 'bg-emerald-500/5' : 'bg-rose-500/5 opacity-80'
+                              }
+                            >
+                              <td className="p-2.5 font-mono text-slate-500">#{item.rowNumber}</td>
+                              <td className="p-2.5 font-semibold">
+                                {item.name || <span className="text-rose-400 italic">(Trống)</span>}
+                              </td>
+                              <td className="p-2.5 font-mono text-slate-300">
+                                {item.email || <span className="text-rose-400 italic">(Trống)</span>}
+                              </td>
+                              <td className="p-2.5 font-mono text-slate-400">
+                                {item.isDefaultPassword ? '123456 (mặc định)' : '••••••'}
+                              </td>
+                              <td className="p-2.5">
+                                <span className="px-2 py-0.5 rounded bg-cyan-500/15 text-cyan-400 font-semibold">
+                                  {item.role}
+                                </span>
+                              </td>
+                              <td className="p-2.5">
+                                {item.isValid ? (
+                                  <span className="text-emerald-400 font-semibold">
+                                    ✓ Hợp lệ (Sẵn sàng tạo)
+                                  </span>
+                                ) : (
+                                  <span className="text-rose-400 font-medium">
+                                    ✕ {item.errorReason}
+                                  </span>
+                                )}
+                              </td>
+                              <td className="p-2.5 text-right">
+                                <button
+                                  type="button"
+                                  onClick={() => handleRemovePreviewUser(item.rowNumber)}
+                                  className="px-2 py-0.5 rounded hover:bg-slate-800 text-slate-400 hover:text-slate-200"
+                                  title="Loại khỏi danh sách nhập"
+                                >
+                                  ✕
+                                </button>
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                );
+              })()}
+
+              {/* Form tạo 1 tài khoản thủ công */}
+              <form
+                onSubmit={handleCreateSubUser}
+                className={`p-5 rounded-2xl border grid grid-cols-1 md:grid-cols-5 gap-3 items-end ${cardBg}`}
+              >
+                <div>
+                  <label className="block text-xs text-slate-400 mb-1">Họ và tên</label>
+                  <input
+                    type="text"
+                    required
+                    value={newUserName}
+                    onChange={(e) => setNewUserName(e.target.value)}
+                    placeholder="Nguyễn Văn C"
+                    className={`w-full px-3 py-2 rounded-xl border text-xs ${inputBg}`}
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs text-slate-400 mb-1">Email đăng nhập</label>
+                  <input
+                    type="email"
+                    required
+                    value={newUserEmail}
+                    onChange={(e) => setNewUserEmail(e.target.value)}
+                    placeholder="member@family.vn"
+                    className={`w-full px-3 py-2 rounded-xl border text-xs ${inputBg}`}
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs text-slate-400 mb-1">Mật khẩu</label>
+                  <input
+                    type="password"
+                    required
+                    value={newUserPassword}
+                    onChange={(e) => setNewUserPassword(e.target.value)}
+                    placeholder="••••••"
+                    className={`w-full px-3 py-2 rounded-xl border text-xs ${inputBg}`}
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs text-slate-400 mb-1">Vai trò</label>
+                  <select
+                    value={newUserRole}
+                    onChange={(e) => setNewUserRole(e.target.value)}
+                    className={`w-full px-3 py-2 rounded-xl border text-xs ${inputBg}`}
+                  >
+                    <option value="Member">Member (Thành viên)</option>
+                    <option value="Admin">Admin (Quản trị phụ)</option>
+                    <option value="Guest">Guest (Khách)</option>
+                  </select>
+                </div>
+                <button
+                  type="submit"
+                  className="py-2 px-4 rounded-xl bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-bold text-xs"
+                >
+                  + Tạo Tài khoản
+                </button>
+              </form>
+
+              {/* Inline Edit User Form */}
+              {editingUser && (
+                <form
+                  onSubmit={handleUpdateUser}
+                  className={`p-4 rounded-2xl border border-cyan-500/40 flex flex-wrap items-center gap-3 ${cardBg}`}
+                >
+                  <span className="text-xs font-bold text-cyan-400">
+                    ✏️ Sửa thành viên ({editingUser.email}):
+                  </span>
+                  <input
+                    type="text"
+                    required
+                    value={editingUser.name}
+                    onChange={(e) => setEditingUser({ ...editingUser, name: e.target.value })}
+                    className={`px-3 py-1.5 rounded-xl border text-xs ${inputBg}`}
+                  />
+                  <select
+                    value={editingUser.role}
+                    onChange={(e) => setEditingUser({ ...editingUser, role: e.target.value })}
+                    className={`px-3 py-1.5 rounded-xl border text-xs ${inputBg}`}
+                  >
+                    <option value="Member">Member</option>
+                    <option value="Admin">Admin</option>
+                    <option value="Guest">Guest</option>
+                  </select>
+                  <button
+                    type="submit"
+                    className="px-3 py-1.5 rounded-xl bg-cyan-500 text-slate-950 font-bold text-xs"
+                  >
+                    Lưu
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setEditingUser(null)}
+                    className="px-3 py-1.5 rounded-xl bg-slate-800 text-slate-300 text-xs"
+                  >
+                    Hủy
+                  </button>
+                </form>
+              )}
+
+              {/* Bảng danh sách thành viên hiện tại */}
+              <div className={`rounded-2xl border overflow-hidden ${cardBg}`}>
                 <table className="w-full text-left text-xs">
-                  <thead className="bg-slate-900/90 text-slate-300">
+                  <thead className="bg-slate-900/80 text-slate-400 uppercase text-[11px]">
                     <tr>
-                      <th className="p-3">Họ và tên</th>
+                      <th className="p-3">Tên thành viên</th>
                       <th className="p-3">Email</th>
                       <th className="p-3">Vai trò</th>
                       <th className="p-3 text-right">Thao tác</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-800/70">
-                    {usersList.map((u) => (
-                      <tr key={u.id}>
-                        <td className="p-3 font-bold">{u.name}</td>
-                        <td className="p-3 font-mono text-slate-400">{u.email}</td>
-                        <td className="p-3">
-                          <span className="px-2 py-0.5 rounded bg-cyan-500/15 text-cyan-400 font-semibold">
-                            {u.role}
-                          </span>
-                        </td>
-                        <td className="p-3 text-right">
-                          <button
-                            onClick={() => handleDeleteUser(u)}
-                            className="px-2.5 py-1 rounded bg-red-500/15 text-red-400 hover:bg-red-500/25"
-                          >
-                            Xóa
-                          </button>
-                        </td>
-                      </tr>
-                    ))}
+                    {(usersList.length > 0 ? usersList : [currentUser]).map((u) => {
+                      const isCurrentSelf =
+                        u.email.trim().toLowerCase() === currentUser.email.trim().toLowerCase();
+                      const isRootOwner = (u.role || '').trim().toLowerCase() === 'owner';
+
+                      return (
+                        <tr key={u.id}>
+                          <td className="p-3 font-bold">
+                            {u.name}
+                            {isCurrentSelf && (
+                              <span className="ml-2 px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-400 text-[10px] font-semibold">
+                                Bạn
+                              </span>
+                            )}
+                          </td>
+                          <td className="p-3 font-mono text-slate-400">{u.email}</td>
+                          <td className="p-3">
+                            <span className="px-2 py-0.5 rounded bg-cyan-500/15 text-cyan-400 font-semibold">
+                              {u.role}
+                            </span>
+                          </td>
+                          <td className="p-3 text-right">
+                            {isCurrentSelf || isRootOwner ? (
+                              <span className="text-[11px] text-slate-500 italic">
+                                {isCurrentSelf ? 'Đang đăng nhập' : 'Chủ nhà gốc'}
+                              </span>
+                            ) : (
+                              <div className="inline-flex items-center gap-1.5">
+                                <button
+                                  onClick={() => setEditingUser(u)}
+                                  className="px-2.5 py-1 rounded bg-sky-500/15 text-sky-400 hover:bg-sky-500/25 transition"
+                                >
+                                  Sửa
+                                </button>
+                                <button
+                                  onClick={() => handleDeleteUser(u)}
+                                  className="px-2.5 py-1 rounded bg-red-500/15 text-red-400 hover:bg-red-500/25 transition"
+                                >
+                                  Xóa
+                                </button>
+                              </div>
+                            )}
+                          </td>
+                        </tr>
+                      );
+                    })}
                   </tbody>
                 </table>
               </div>
@@ -2344,398 +3404,6 @@ export function App() {
           )}
         </main>
       </div>
-
-      {/* ==================== MODAL 1: THÊM / SỬA NGÔI NHÀ ==================== */}
-      {isHouseModalOpen && isOwnerOrAdmin && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/65 p-4">
-          <form
-            onSubmit={handleSaveHouse}
-            className={`w-full max-w-md rounded-2xl border p-6 shadow-2xl space-y-4 ${cardBg}`}
-          >
-            <h3 className="text-sm font-bold flex items-center gap-2">
-              <span>🏡</span>
-              <span>{editingHouse ? 'Cập nhật Ngôi nhà' : 'Thêm Ngôi nhà Mới'}</span>
-            </h3>
-
-            {houseError && (
-              <div className="p-3 rounded-lg bg-red-500/15 border border-red-500/40 text-red-400 text-xs">
-                {houseError}
-              </div>
-            )}
-
-            <div>
-              <label className="block text-xs font-semibold mb-1.5">Tên ngôi nhà *</label>
-              <input
-                type="text"
-                required
-                value={houseNameInput}
-                onChange={(e) => setHouseNameInput(e.target.value)}
-                placeholder="VD: Nhà Chính Quận 1"
-                className="w-full px-3.5 py-2.5 rounded-xl bg-slate-900 border border-slate-700 text-xs focus:outline-none focus:border-cyan-500"
-              />
-            </div>
-
-            <div>
-              <label className="block text-xs font-semibold mb-1.5">Địa chỉ</label>
-              <input
-                type="text"
-                value={houseAddressInput}
-                onChange={(e) => setHouseAddressInput(e.target.value)}
-                placeholder="VD: 111 Lê Trọng Tấn"
-                className="w-full px-3.5 py-2.5 rounded-xl bg-slate-900 border border-slate-700 text-xs focus:outline-none focus:border-cyan-500"
-              />
-            </div>
-
-            <div className="flex justify-end gap-2 pt-2">
-              <button
-                type="button"
-                onClick={() => setIsHouseModalOpen(false)}
-                className="px-4 py-2 rounded-lg border border-slate-700 text-xs font-semibold"
-              >
-                Hủy
-              </button>
-              <button
-                type="submit"
-                disabled={houseSaving}
-                className="px-4 py-2 rounded-lg bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-bold text-xs disabled:opacity-50"
-              >
-                {houseSaving ? 'Đang lưu...' : editingHouse ? 'Lưu thay đổi' : 'Tạo nhà'}
-              </button>
-            </div>
-          </form>
-        </div>
-      )}
-
-      {/* ==================== MODAL 2: THÊM / SỬA PHÒNG ==================== */}
-      {isRoomModalOpen && isOwnerOrAdmin && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/65 p-4">
-          <form
-            onSubmit={handleSaveRoom}
-            className={`w-full max-w-md rounded-2xl border p-6 shadow-2xl space-y-4 ${cardBg}`}
-          >
-            <h3 className="text-sm font-bold flex items-center gap-2">
-              <span>🚪</span>
-              <span>{editingRoom ? 'Cập nhật Phòng' : 'Thêm Phòng Mới'}</span>
-            </h3>
-
-            {roomError && (
-              <div className="p-3 rounded-lg bg-red-500/15 border border-red-500/40 text-red-400 text-xs">
-                {roomError}
-              </div>
-            )}
-
-            <div>
-              <label className="block text-xs font-semibold mb-1.5">Ngôi nhà trực thuộc *</label>
-              <select
-                required
-                value={roomHouseIdInput}
-                onChange={(e) => setRoomHouseIdInput(e.target.value)}
-                className="w-full px-3.5 py-2.5 rounded-xl bg-slate-900 border border-slate-700 text-xs focus:outline-none focus:border-cyan-500"
-              >
-                {houses.map((h) => (
-                  <option key={h.id} value={h.id}>
-                    {h.name}
-                  </option>
-                ))}
-              </select>
-            </div>
-
-            <div>
-              <label className="block text-xs font-semibold mb-1.5">Tên phòng *</label>
-              <input
-                type="text"
-                required
-                value={roomNameInput}
-                onChange={(e) => setRoomNameInput(e.target.value)}
-                placeholder="VD: Phòng Khách, Phòng Ngủ..."
-                className="w-full px-3.5 py-2.5 rounded-xl bg-slate-900 border border-slate-700 text-xs focus:outline-none focus:border-cyan-500"
-              />
-            </div>
-
-            <div>
-              <label className="block text-xs font-semibold mb-1.5">Tầng</label>
-              <input
-                type="number"
-                min={0}
-                max={50}
-                value={roomFloorInput}
-                onChange={(e) => setRoomFloorInput(Number(e.target.value))}
-                className="w-full px-3.5 py-2.5 rounded-xl bg-slate-900 border border-slate-700 text-xs focus:outline-none focus:border-cyan-500"
-              />
-            </div>
-
-            <div className="flex justify-end gap-2 pt-2">
-              <button
-                type="button"
-                onClick={() => setIsRoomModalOpen(false)}
-                className="px-4 py-2 rounded-lg border border-slate-700 text-xs font-semibold"
-              >
-                Hủy
-              </button>
-              <button
-                type="submit"
-                disabled={roomSaving}
-                className="px-4 py-2 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-xs disabled:opacity-50"
-              >
-                {roomSaving ? 'Đang lưu...' : editingRoom ? 'Lưu phòng' : 'Tạo phòng'}
-              </button>
-            </div>
-          </form>
-        </div>
-      )}
-
-      {/* ==================== MODAL 3: THÊM / SỬA THIẾT BỊ IOT ==================== */}
-      {isDeviceModalOpen && isOwnerOrAdmin && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/65 p-4">
-          <form
-            onSubmit={handleSaveDevice}
-            className={`w-full max-w-md rounded-2xl border p-6 shadow-2xl space-y-4 ${cardBg}`}
-          >
-            <h3 className="text-sm font-bold flex items-center gap-2">
-              <span>🔌</span>
-              <span>{editingDevice ? 'Cập nhật Thiết bị IoT' : 'Thêm Thiết bị IoT Mới'}</span>
-            </h3>
-
-            {devError && (
-              <div className="p-3 rounded-lg bg-red-500/15 border border-red-500/40 text-red-400 text-xs">
-                {devError}
-              </div>
-            )}
-
-            <div>
-              <label className="block text-xs font-semibold mb-1.5">Tên thiết bị *</label>
-              <input
-                type="text"
-                required
-                value={devNameInput}
-                onChange={(e) => setDevNameInput(e.target.value)}
-                placeholder="VD: Đèn Phòng Khách"
-                className="w-full px-3.5 py-2.5 rounded-xl bg-slate-900 border border-slate-700 text-xs"
-              />
-            </div>
-
-            <div>
-              <label className="block text-xs font-semibold mb-1.5">Loại thiết bị</label>
-              <select
-                value={devTypeInput}
-                onChange={(e) => setDevTypeInput(e.target.value)}
-                className="w-full px-3.5 py-2.5 rounded-xl bg-slate-900 border border-slate-700 text-xs"
-              >
-                <option value="light">Đèn chiếu sáng (Light)</option>
-                <option value="fan">Quạt / Điều hòa (Fan)</option>
-                <option value="switch">Công tắc thông minh (Switch)</option>
-                <option value="sensor">Cảm biến môi trường (Sensor)</option>
-              </select>
-            </div>
-
-            <div>
-              <label className="block text-xs font-semibold mb-1.5">Phòng trực thuộc</label>
-              <select
-                value={devRoomIdInput}
-                onChange={(e) => setDevRoomIdInput(e.target.value)}
-                className="w-full px-3.5 py-2.5 rounded-xl bg-slate-900 border border-slate-700 text-xs"
-              >
-                <option value="">-- Chưa phân phòng --</option>
-                {rooms.map((r) => {
-                  const hName =
-                    r.house_name || houses.find((h) => h.id === r.house_id)?.name || '';
-                  return (
-                    <option key={r.id} value={r.id}>
-                      {r.name} (Tầng {r.floor ?? 1}
-                      {hName ? ` — ${hName}` : ''})
-                    </option>
-                  );
-                })}
-              </select>
-            </div>
-
-            <div>
-              <label className="block text-xs font-semibold mb-1.5">MQTT Topic *</label>
-              <input
-                type="text"
-                required
-                value={devTopicInput}
-                onChange={(e) => setDevTopicInput(e.target.value)}
-                placeholder="smarthome/devices/led_phong_khach"
-                className="w-full px-3.5 py-2.5 rounded-xl bg-slate-900 border border-slate-700 text-xs font-mono"
-              />
-            </div>
-
-            <div className="flex justify-end gap-2 pt-2">
-              <button
-                type="button"
-                onClick={() => setIsDeviceModalOpen(false)}
-                className="px-4 py-2 rounded-lg border border-slate-700 text-xs font-semibold"
-              >
-                Hủy
-              </button>
-              <button
-                type="submit"
-                disabled={devSaving}
-                className="px-4 py-2 rounded-lg bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-bold text-xs disabled:opacity-50"
-              >
-                {devSaving ? 'Đang lưu...' : 'Lưu thiết bị'}
-              </button>
-            </div>
-          </form>
-        </div>
-      )}
-
-      {/* ==================== MODAL 4: QUÉT THIẾT BỊ WOKWI ==================== */}
-      {isDiscoverModalOpen && isOwnerOrAdmin && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/65 p-4">
-          <div className={`w-full max-w-lg rounded-2xl border p-6 shadow-2xl space-y-4 ${cardBg}`}>
-            <div className="flex justify-between items-center">
-              <h3 className="text-sm font-bold">📡 Quét thiết bị ESP32 Wokwi</h3>
-              <button
-                onClick={() => setIsDiscoverModalOpen(false)}
-                className="text-xs text-slate-400"
-              >
-                ✕
-              </button>
-            </div>
-
-            {isDiscovering ? (
-              <div className="py-6 text-center text-xs text-slate-400">
-                Đang gửi gói tin Discovery qua MQTT Broker...
-              </div>
-            ) : discoveredList.length === 0 ? (
-              <div className="py-6 text-center text-xs text-slate-400">
-                Tất cả thiết bị Wokwi đã được thêm vào hệ thống.
-              </div>
-            ) : (
-              <div className="space-y-2.5">
-                {discoveredList.map((item, idx) => (
-                  <div
-                    key={idx}
-                    className={`p-3 rounded-xl border flex items-center justify-between ${subCardBg}`}
-                  >
-                    <div>
-                      <div className="text-xs font-bold">{item.name}</div>
-                      <div className="text-[11px] font-mono text-slate-400">
-                        {item.mqtt_topic}
-                      </div>
-                    </div>
-                    <button
-                      onClick={() => handleAddDiscoveredDevice(item)}
-                      className="px-3 py-1.5 rounded-lg bg-cyan-500 text-slate-950 font-bold text-xs"
-                    >
-                      + Kết nối
-                    </button>
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-        </div>
-      )}
-
-      {/* ==================== MODAL 5: TẠO TÀI KHOẢN THỦ CÔNG ==================== */}
-      {isAccountModalOpen && isOwnerOrAdmin && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/65 p-4">
-          <form
-            onSubmit={handleCreateAccountManual}
-            className={`w-full max-w-md rounded-2xl border p-6 shadow-2xl space-y-4 ${cardBg}`}
-          >
-            <h3 className="text-sm font-bold">👤 Tạo Tài khoản Mới</h3>
-
-            {accountError && (
-              <div className="p-3 rounded-lg bg-red-500/15 border border-red-500/40 text-red-400 text-xs">
-                {accountError}
-              </div>
-            )}
-
-            <div>
-              <label className="block text-xs font-semibold mb-1.5">Họ và tên *</label>
-              <input
-                type="text"
-                required
-                value={accNameInput}
-                onChange={(e) => setAccNameInput(e.target.value)}
-                className="w-full px-3.5 py-2.5 rounded-xl bg-slate-900 border border-slate-700 text-xs"
-              />
-            </div>
-
-            <div>
-              <label className="block text-xs font-semibold mb-1.5">Email *</label>
-              <input
-                type="email"
-                required
-                value={accEmailInput}
-                onChange={(e) => setAccEmailInput(e.target.value)}
-                className="w-full px-3.5 py-2.5 rounded-xl bg-slate-900 border border-slate-700 text-xs"
-              />
-            </div>
-
-            <div>
-              <label className="block text-xs font-semibold mb-1.5">Mật khẩu *</label>
-              <input
-                type="password"
-                required
-                value={accPasswordInput}
-                onChange={(e) => setAccPasswordInput(e.target.value)}
-                className="w-full px-3.5 py-2.5 rounded-xl bg-slate-900 border border-slate-700 text-xs"
-              />
-            </div>
-
-            <div>
-              <label className="block text-xs font-semibold mb-1.5">Vai trò</label>
-              <select
-                value={accRoleInput}
-                onChange={(e) => setAccRoleInput(e.target.value as UserRole)}
-                className="w-full px-3.5 py-2.5 rounded-xl bg-slate-900 border border-slate-700 text-xs"
-              >
-                <option value="Member">Member</option>
-                <option value="Guest">Guest</option>
-                <option value="Admin">Admin</option>
-              </select>
-            </div>
-
-            <div className="flex justify-end gap-2 pt-2">
-              <button
-                type="button"
-                onClick={() => setIsAccountModalOpen(false)}
-                className="px-4 py-2 rounded-lg border border-slate-700 text-xs font-semibold"
-              >
-                Hủy
-              </button>
-              <button
-                type="submit"
-                disabled={accountSaving}
-                className="px-4 py-2 rounded-lg bg-sky-600 hover:bg-sky-700 text-white font-bold text-xs disabled:opacity-50"
-              >
-                {accountSaving ? 'Đang tạo...' : 'Tạo tài khoản'}
-              </button>
-            </div>
-          </form>
-        </div>
-      )}
-
-      {/* ==================== MODAL 6: NHẬP DỮ LIỆU EXCEL (.XLSX) ==================== */}
-      {isOwnerOrAdmin && (
-        <ExcelImportModal
-          isOpen={isExcelModalOpen}
-          isDark={isDark}
-          mode={excelImportMode}
-          houses={houses}
-          rooms={rooms}
-          devices={devices}
-          users={usersList}
-          ownerId={
-            currentUser?.id ||
-            usersList.find(
-              (u) => u.email.toLowerCase() === (currentUser?.email ?? '').toLowerCase()
-            )?.id ||
-            usersList[0]?.id ||
-            ''
-          }
-          onClose={() => setIsExcelModalOpen(false)}
-          onSuccess={async (msg) => {
-            addLog(msg);
-            await fetchAllDatabaseData();
-          }}
-        />
-      )}
     </div>
   );
 }
