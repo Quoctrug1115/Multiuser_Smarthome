@@ -1,5 +1,4 @@
 /target
 .env
-/docker-compose.yml
 .test
 .gitignore
