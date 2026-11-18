@@ -1,4 +1,4 @@
--- Active: 1794663811666@@127.0.0.1@5434@smarthome
+-- Active: 1794751769341@@127.0.0.1@5434@smarthome
 create extension if not EXISTS "uuid-ossp";
 create extension if not EXISTS timescaledb CASCADE;
 
@@ -238,5 +238,5 @@ SELECT * FROM roles;
 UPDATE users
 SET role = (SELECT id FROM roles WHERE name = 'Owner')
 WHERE email = 'letrung@gmail.com';
-
-SELECT id, name, full_name, email, role, is_active FROM users
+ALTER TABLE devices
+ADD COLUMN IF NOT EXISTS room_id UUID REFERENCES rooms(id) ON DELETE SET NULL;
