@@ -5,68 +5,57 @@ use axum::{
     Json,
 };
 use serde_json::{json, Value};
-use sqlx::Row;
 use std::sync::Arc;
+use tiberius::Query;
 use uuid::Uuid;
 
 use crate::controllers::user_controller::{ensure_owner_or_admin, resolve_tenant_id};
 use crate::models::user::Claims;
-use crate::AppState;
+use crate::{AppState, SqlPool};
 
-async fn ensure_automations_schema(pool: &sqlx::PgPool) {
-    let _ = sqlx::query(
-        r#"
-        CREATE TABLE IF NOT EXISTS automations (
-            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-            owner_id UUID REFERENCES users(id) ON DELETE CASCADE,
-            name VARCHAR(150) NOT NULL,
-            condition_text TEXT DEFAULT '',
-            action_text TEXT DEFAULT '',
-            condition_type VARCHAR(50) NOT NULL DEFAULT 'temperature',
-            operator VARCHAR(20) NOT NULL DEFAULT '>',
-            threshold DOUBLE PRECISION NOT NULL DEFAULT 30.0,
-            device_id VARCHAR(100) NOT NULL DEFAULT '',
-            action VARCHAR(20) NOT NULL DEFAULT 'ON',
-            is_active BOOLEAN NOT NULL DEFAULT TRUE,
-            created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
-        );
-        "#,
-    )
-    .execute(pool)
-    .await;
+async fn ensure_automations_schema(pool: &SqlPool) {
+    let Ok(mut conn) = pool.get().await else {
+        return;
+    };
 
     let migrations = [
-        "ALTER TABLE automations ADD COLUMN IF NOT EXISTS owner_id UUID REFERENCES users(id) ON DELETE CASCADE",
-        "ALTER TABLE automations ADD COLUMN IF NOT EXISTS condition_text TEXT DEFAULT ''",
-        "ALTER TABLE automations ADD COLUMN IF NOT EXISTS action_text TEXT DEFAULT ''",
-        "ALTER TABLE automations ADD COLUMN IF NOT EXISTS condition_type VARCHAR(50) DEFAULT 'temperature'",
-        "ALTER TABLE automations ADD COLUMN IF NOT EXISTS operator VARCHAR(20) DEFAULT '>'",
-        "ALTER TABLE automations ADD COLUMN IF NOT EXISTS threshold DOUBLE PRECISION DEFAULT 30.0",
-        "ALTER TABLE automations ADD COLUMN IF NOT EXISTS device_id VARCHAR(100) DEFAULT ''",
-        "ALTER TABLE automations ADD COLUMN IF NOT EXISTS action VARCHAR(20) DEFAULT 'ON'",
-        "ALTER TABLE automations ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE",
-        // Tự động gỡ bỏ NOT NULL trên tất cả các cột cũ còn sót lại (action_payload, trigger_value, v.v.)
         r#"
-        DO $$
-        DECLARE
-            col_name text;
+        IF OBJECT_ID(N'dbo.automations', N'U') IS NULL
         BEGIN
-            FOR col_name IN
-                SELECT column_name
-                FROM information_schema.columns
-                WHERE table_schema = 'public'
-                  AND table_name = 'automations'
-                  AND is_nullable = 'NO'
-                  AND column_name NOT IN ('id', 'name')
-            LOOP
-                EXECUTE format('ALTER TABLE automations ALTER COLUMN %I DROP NOT NULL', col_name);
-            END LOOP;
-        END $$;
+            CREATE TABLE dbo.automations (
+                id UNIQUEIDENTIFIER PRIMARY KEY DEFAULT NEWID(),
+                house_id UNIQUEIDENTIFIER NULL,
+                owner_id UNIQUEIDENTIFIER NULL,
+                name NVARCHAR(100) NOT NULL,
+                condition_text NVARCHAR(255) NULL DEFAULT N'',
+                action_text NVARCHAR(255) NULL DEFAULT N'',
+                trigger_device_id UNIQUEIDENTIFIER NULL,
+                condition_type NVARCHAR(30) NOT NULL DEFAULT N'temperature',
+                operator NVARCHAR(10) NOT NULL DEFAULT N'>',
+                threshold FLOAT NOT NULL DEFAULT 30.0,
+                trigger_value FLOAT NOT NULL DEFAULT 30.0,
+                action NVARCHAR(20) NOT NULL DEFAULT N'ON',
+                device_id NVARCHAR(50) NULL DEFAULT N'',
+                action_device_id UNIQUEIDENTIFIER NULL,
+                action_payload NVARCHAR(MAX) NOT NULL DEFAULT N'{"power": "ON"}',
+                is_active BIT NOT NULL DEFAULT 1,
+                created_at DATETIMEOFFSET NOT NULL DEFAULT SYSDATETIMEOFFSET()
+            );
+        END
         "#,
+        "IF COL_LENGTH(N'dbo.automations', N'owner_id') IS NULL ALTER TABLE dbo.automations ADD owner_id UNIQUEIDENTIFIER NULL",
+        "IF COL_LENGTH(N'dbo.automations', N'condition_text') IS NULL ALTER TABLE dbo.automations ADD condition_text NVARCHAR(255) NULL DEFAULT N''",
+        "IF COL_LENGTH(N'dbo.automations', N'action_text') IS NULL ALTER TABLE dbo.automations ADD action_text NVARCHAR(255) NULL DEFAULT N''",
+        "IF COL_LENGTH(N'dbo.automations', N'condition_type') IS NULL ALTER TABLE dbo.automations ADD condition_type NVARCHAR(30) NOT NULL DEFAULT N'temperature'",
+        "IF COL_LENGTH(N'dbo.automations', N'operator') IS NULL ALTER TABLE dbo.automations ADD operator NVARCHAR(10) NOT NULL DEFAULT N'>'",
+        "IF COL_LENGTH(N'dbo.automations', N'threshold') IS NULL ALTER TABLE dbo.automations ADD threshold FLOAT NOT NULL DEFAULT 30.0",
+        "IF COL_LENGTH(N'dbo.automations', N'device_id') IS NULL ALTER TABLE dbo.automations ADD device_id NVARCHAR(50) NULL DEFAULT N''",
+        "IF COL_LENGTH(N'dbo.automations', N'action') IS NULL ALTER TABLE dbo.automations ADD action NVARCHAR(20) NOT NULL DEFAULT N'ON'",
+        "IF COL_LENGTH(N'dbo.automations', N'is_active') IS NULL ALTER TABLE dbo.automations ADD is_active BIT NOT NULL DEFAULT 1",
     ];
 
     for sql in migrations {
-        let _ = sqlx::query(sql).execute(pool).await;
+        let _ = conn.execute(sql, &[]).await;
     }
 }
 
@@ -117,14 +106,21 @@ pub async fn get_automations(
         Err(resp) => return resp,
     };
 
-    let rows = match sqlx::query("SELECT * FROM automations WHERE owner_id = $1")
-        .bind(tenant_id)
-        .fetch_all(&state.db_pool)
-        .await
-    {
-        Ok(r) => r,
+    let mut conn = match state.db_pool.get().await {
+        Ok(c) => c,
         Err(e) => {
-            eprintln!("❌ [GET AUTOMATIONS ERROR]: {:?}", e);
+            eprintln!("[GET AUTOMATIONS CONN ERROR]: {:?}", e);
+            return (StatusCode::OK, Json(Vec::<Value>::new())).into_response();
+        }
+    };
+
+    let mut query = Query::new("SELECT * FROM dbo.automations WHERE owner_id = @P1 ORDER BY created_at DESC");
+    query.bind(tenant_id);
+
+    let rows = match query.query(&mut conn).await {
+        Ok(stream) => stream.into_first_result().await.unwrap_or_default(),
+        Err(e) => {
+            eprintln!("[GET AUTOMATIONS ERROR]: {:?}", e);
             return (StatusCode::OK, Json(Vec::<Value>::new())).into_response();
         }
     };
@@ -132,57 +128,77 @@ pub async fn get_automations(
     let mut list = Vec::new();
     for row in rows {
         let id = row
-            .try_get::<String, _>("id")
-            .or_else(|_| row.try_get::<Uuid, _>("id").map(|u| u.to_string()))
-            .or_else(|_| row.try_get::<i32, _>("id").map(|i| i.to_string()))
+            .try_get::<Uuid, _>("id")
+            .ok()
+            .flatten()
+            .map(|u| u.to_string())
+            .or_else(|| row.try_get::<&str, _>("id").ok().flatten().map(|s| s.to_string()))
             .unwrap_or_default();
 
         let name = row
-            .try_get::<String, _>("name")
-            .unwrap_or_else(|_| "Kịch bản tự động".to_string());
+            .try_get::<&str, _>("name")
+            .ok()
+            .flatten()
+            .unwrap_or("Kịch bản tự động")
+            .to_string();
 
         let condition_type = row
-            .try_get::<String, _>("condition_type")
-            .or_else(|_| row.try_get::<String, _>("trigger_type"))
-            .unwrap_or_else(|_| "temperature".to_string());
+            .try_get::<&str, _>("condition_type")
+            .ok()
+            .flatten()
+            .or_else(|| row.try_get::<&str, _>("trigger_type").ok().flatten())
+            .unwrap_or("temperature")
+            .to_string();
 
         let operator = row
-            .try_get::<String, _>("operator")
-            .or_else(|_| row.try_get::<String, _>("condition"))
-            .unwrap_or_else(|_| ">".to_string());
+            .try_get::<&str, _>("operator")
+            .ok()
+            .flatten()
+            .or_else(|| row.try_get::<&str, _>("condition").ok().flatten())
+            .unwrap_or(">")
+            .to_string();
 
         let threshold = row
             .try_get::<f64, _>("threshold")
-            .or_else(|_| row.try_get::<f64, _>("trigger_value"))
-            .or_else(|_| row.try_get::<f32, _>("threshold").map(|v| v as f64))
-            .or_else(|_| {
-                row.try_get::<String, _>("trigger_value")
+            .ok()
+            .flatten()
+            .or_else(|| row.try_get::<f64, _>("trigger_value").ok().flatten())
+            .or_else(|| {
+                row.try_get::<f32, _>("threshold")
                     .ok()
-                    .and_then(|s| s.parse::<f64>().ok())
-                    .ok_or(sqlx::Error::ColumnNotFound("trigger_value".into()))
+                    .flatten()
+                    .map(|v| v as f64)
             })
             .unwrap_or(30.0);
 
         let action = row
-            .try_get::<String, _>("action")
-            .or_else(|_| row.try_get::<String, _>("action_payload"))
-            .unwrap_or_else(|_| "ON".to_string());
+            .try_get::<&str, _>("action")
+            .ok()
+            .flatten()
+            .unwrap_or("ON")
+            .to_string();
 
         let condition_text = row
-            .try_get::<String, _>("condition_text")
+            .try_get::<&str, _>("condition_text")
             .ok()
+            .flatten()
+            .map(|s| s.to_string())
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| format!("{} {} {}", condition_type, operator, threshold));
 
         let action_text = row
-            .try_get::<String, _>("action_text")
+            .try_get::<&str, _>("action_text")
             .ok()
+            .flatten()
+            .map(|s| s.to_string())
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| format!("Lệnh thực thi: {}", action));
 
         let is_active = row
             .try_get::<bool, _>("is_active")
-            .or_else(|_| row.try_get::<bool, _>("enabled"))
+            .ok()
+            .flatten()
+            .or_else(|| row.try_get::<bool, _>("enabled").ok().flatten())
             .unwrap_or(true);
 
         list.push(json!({
@@ -217,6 +233,17 @@ pub async fn create_automation(
     };
 
     ensure_automations_schema(&state.db_pool).await;
+
+    let mut conn = match state.db_pool.get().await {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("Lỗi kết nối SQL Server: {}", e) })),
+            )
+                .into_response();
+        }
+    };
 
     let id = Uuid::new_v4();
     let name = payload
@@ -261,23 +288,23 @@ pub async fn create_automation(
 
     if target_device_id.is_empty() {
         let act_lower = action_text.to_lowercase();
-        let dev_query = r#"
-            SELECT d.id::text AS id, d.name, d.device_type, d.mqtt_topic
-            FROM devices d
-            LEFT JOIN rooms r ON d.room_id = r.id
-            LEFT JOIN houses h ON r.house_id = h.id
-            WHERE d.owner_id = $1 OR h.owner_id = $1
+        let dev_sql = r#"
+            SELECT CAST(d.id AS NVARCHAR(36)) AS id, d.name, d.device_type, d.mqtt_topic
+            FROM dbo.devices d
+            LEFT JOIN dbo.rooms r ON d.room_id = r.id
+            LEFT JOIN dbo.houses h ON r.house_id = h.id
+            WHERE d.owner_id = @P1 OR h.owner_id = @P1
         "#;
 
-        if let Ok(dev_rows) = sqlx::query(dev_query)
-            .bind(tenant_id)
-            .fetch_all(&state.db_pool)
-            .await
-        {
+        let mut dev_q = Query::new(dev_sql);
+        dev_q.bind(tenant_id);
+
+        if let Ok(stream) = dev_q.query(&mut conn).await {
+            let dev_rows = stream.into_first_result().await.unwrap_or_default();
             for r in dev_rows {
-                let d_id: String = r.try_get("id").unwrap_or_default();
-                let d_name: String = r.try_get::<String, _>("name").unwrap_or_default().to_lowercase();
-                let d_type: String = r.try_get::<String, _>("device_type").unwrap_or_default().to_lowercase();
+                let d_id = r.get::<&str, _>("id").unwrap_or("").to_string();
+                let d_name = r.get::<&str, _>("name").unwrap_or("").to_lowercase();
+                let d_type = r.get::<&str, _>("device_type").unwrap_or("").to_lowercase();
 
                 if (!d_name.is_empty() && act_lower.contains(&d_name))
                     || ((act_lower.contains("quạt") || act_lower.contains("fan")) && d_type == "fan")
@@ -290,37 +317,34 @@ pub async fn create_automation(
         }
     }
 
-    let insert_res = sqlx::query(
+    let action_payload_json = json!({ "power": action_upper }).to_string();
+
+    let mut insert_q = Query::new(
         r#"
-        INSERT INTO automations (id, name, condition_text, action_text, condition_type, operator, threshold, device_id, action, owner_id, is_active)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, TRUE)
+        INSERT INTO dbo.automations (
+            id, name, condition_text, action_text, condition_type,
+            operator, threshold, trigger_value, device_id, action,
+            action_payload, owner_id, is_active, created_at
+        )
+        VALUES (@P1, @P2, @P3, @P4, @P5, @P6, @P7, @P7, @P8, @P9, @P10, @P11, 1, SYSDATETIMEOFFSET())
         "#,
-    )
-    .bind(id)
-    .bind(&name)
-    .bind(&condition_text)
-    .bind(&action_text)
-    .bind(&parsed_type)
-    .bind(&parsed_op)
-    .bind(parsed_val)
-    .bind(&target_device_id)
-    .bind(&action_upper)
-    .bind(tenant_id)
-    .execute(&state.db_pool)
-    .await;
+    );
+    insert_q.bind(id);
+    insert_q.bind(&name);
+    insert_q.bind(&condition_text);
+    insert_q.bind(&action_text);
+    insert_q.bind(&parsed_type);
+    insert_q.bind(&parsed_op);
+    insert_q.bind(parsed_val);
+    insert_q.bind(&target_device_id);
+    insert_q.bind(&action_upper);
+    insert_q.bind(&action_payload_json);
+    insert_q.bind(tenant_id);
 
-    match insert_res {
+    match insert_q.execute(&mut conn).await {
         Ok(_) => {
-            let _ = sqlx::query("UPDATE automations SET trigger_type = $1, trigger_value = $2, action_payload = $3 WHERE id = $4")
-                .bind(&parsed_type)
-                .bind(parsed_val)
-                .bind(&action_upper)
-                .bind(id)
-                .execute(&state.db_pool)
-                .await;
-
             println!(
-                "✅ [AUTOMATION SAVED] {} ({} {} {}) -> Device: {} [{}]",
+                "[AUTOMATION SAVED] {} ({} {} {}) -> Device: {} [{}]",
                 name, parsed_type, parsed_op, parsed_val, target_device_id, action_upper
             );
 
@@ -342,7 +366,7 @@ pub async fn create_automation(
                 .into_response()
         }
         Err(e) => {
-            eprintln!("❌ [CREATE AUTOMATION DB ERROR]: {:?}", e);
+            eprintln!("[CREATE AUTOMATION DB ERROR]: {:?}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({ "error": e.to_string() })),
@@ -367,13 +391,26 @@ pub async fn delete_automation(
         Err(resp) => return resp,
     };
 
-    match sqlx::query("DELETE FROM automations WHERE id::text = $1 AND owner_id = $2")
-        .bind(id.trim())
-        .bind(tenant_id)
-        .execute(&state.db_pool)
-        .await
-    {
-        Ok(res) if res.rows_affected() > 0 => StatusCode::NO_CONTENT.into_response(),
+    let mut conn = match state.db_pool.get().await {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("Lỗi kết nối SQL Server: {}", e) })),
+            )
+                .into_response();
+        }
+    };
+
+    let trimmed_id = id.trim();
+    let mut del_q = Query::new(
+        "DELETE FROM dbo.automations WHERE LOWER(CAST(id AS NVARCHAR(36))) = LOWER(@P1) AND owner_id = @P2",
+    );
+    del_q.bind(trimmed_id);
+    del_q.bind(tenant_id);
+
+    match del_q.execute(&mut conn).await {
+        Ok(res) if res.rows_affected().iter().sum::<u64>() > 0 => StatusCode::NO_CONTENT.into_response(),
         Ok(_) => (
             StatusCode::NOT_FOUND,
             Json(json!({ "error": "Không tìm thấy kịch bản thuộc quyền quản lý của bạn" })),
@@ -401,6 +438,18 @@ pub async fn toggle_automation(
         Err(resp) => return resp,
     };
 
+    let mut conn = match state.db_pool.get().await {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("Lỗi kết nối SQL Server: {}", e) })),
+            )
+                .into_response();
+        }
+    };
+
+    let trimmed_id = id.trim();
     let payload = serde_json::from_slice::<Value>(&body).ok();
     let explicit_state = payload.as_ref().and_then(|v| {
         v.get("is_active")
@@ -411,14 +460,21 @@ pub async fn toggle_automation(
     let new_active = match explicit_state {
         Some(val) => val,
         None => {
-            let current: Option<bool> = sqlx::query_scalar(
-                "SELECT COALESCE(is_active, TRUE) FROM automations WHERE id::text = $1 AND owner_id = $2",
-            )
-            .bind(id.trim())
-            .bind(tenant_id)
-            .fetch_optional(&state.db_pool)
-            .await
-            .unwrap_or(None);
+            let mut cur_q = Query::new(
+                "SELECT TOP 1 COALESCE(is_active, CAST(1 AS BIT)) AS is_active FROM dbo.automations WHERE LOWER(CAST(id AS NVARCHAR(36))) = LOWER(@P1) AND owner_id = @P2",
+            );
+            cur_q.bind(trimmed_id);
+            cur_q.bind(tenant_id);
+
+            let current: Option<bool> = match cur_q.query(&mut conn).await {
+                Ok(stream) => stream
+                    .into_row()
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|r| r.get::<bool, _>("is_active")),
+                Err(_) => None,
+            };
 
             match current {
                 Some(cur) => !cur,
@@ -433,17 +489,15 @@ pub async fn toggle_automation(
         }
     };
 
-    let update_res = sqlx::query(
-        "UPDATE automations SET is_active = $1 WHERE id::text = $2 AND owner_id = $3",
-    )
-    .bind(new_active)
-    .bind(id.trim())
-    .bind(tenant_id)
-    .execute(&state.db_pool)
-    .await;
+    let mut upd_q = Query::new(
+        "UPDATE dbo.automations SET is_active = @P1 WHERE LOWER(CAST(id AS NVARCHAR(36))) = LOWER(@P2) AND owner_id = @P3",
+    );
+    upd_q.bind(new_active);
+    upd_q.bind(trimmed_id);
+    upd_q.bind(tenant_id);
 
-    if let Ok(res) = update_res {
-        if res.rows_affected() == 0 {
+    if let Ok(res) = upd_q.execute(&mut conn).await {
+        if res.rows_affected().iter().sum::<u64>() == 0 {
             return (
                 StatusCode::NOT_FOUND,
                 Json(json!({ "error": "Không tìm thấy kịch bản trong nhà của bạn" })),
@@ -453,15 +507,16 @@ pub async fn toggle_automation(
     }
 
     // Đồng bộ thêm cột `enabled` cũ nếu có trong Database
-    let _ = sqlx::query("UPDATE automations SET enabled = $1 WHERE id::text = $2 AND owner_id = $3")
-        .bind(new_active)
-        .bind(id.trim())
-        .bind(tenant_id)
-        .execute(&state.db_pool)
-        .await;
+    let mut sync_q = Query::new(
+        "IF COL_LENGTH(N'dbo.automations', N'enabled') IS NOT NULL UPDATE dbo.automations SET enabled = @P1 WHERE LOWER(CAST(id AS NVARCHAR(36))) = LOWER(@P2) AND owner_id = @P3",
+    );
+    sync_q.bind(new_active);
+    sync_q.bind(trimmed_id);
+    sync_q.bind(tenant_id);
+    let _ = sync_q.execute(&mut conn).await;
 
     println!(
-        "🔄 [AUTOMATION TOGGLE] ID: {} -> {}",
+        "[AUTOMATION TOGGLE] ID: {} -> {}",
         id,
         if new_active { "BẬT" } else { "TẮT" }
     );

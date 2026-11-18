@@ -1,15 +1,13 @@
 use axum::{
-    extract::{ws::{Message, WebSocket, WebSocketUpgrade}, State},
+    extract::{
+        ws::{Message, WebSocket, WebSocketUpgrade},
+        State,
+    },
     response::IntoResponse,
 };
 use std::sync::Arc;
-use tokio::sync::broadcast;
 
-pub struct AppState {
-    pub db_pool: sqlx::PgPool,
-    pub tx_ws: broadcast::Sender<String>,
-    pub mqtt_client: rumqttc::AsyncClient,
-}
+use crate::AppState;
 
 pub async fn ws_handler(
     ws: WebSocketUpgrade,
@@ -19,8 +17,8 @@ pub async fn ws_handler(
 }
 
 async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
-    println!("🌐 [WebSocket] Client connected!");
-    let mut rx = state.tx_ws.subscribe();
+    println!("[WebSocket] Client connected!");
+    let mut rx = state.tx.subscribe();
 
     loop {
         tokio::select! {
@@ -42,5 +40,5 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
         }
     }
 
-    println!("❌ [WebSocket] Client disconnected!");
+    println!("[WebSocket] Client disconnected!");
 }

@@ -6,8 +6,8 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
-use sqlx::Row;
 use std::sync::Arc;
+use tiberius::Query;
 use uuid::Uuid;
 
 use crate::controllers::user_controller::{ensure_owner_or_admin, resolve_tenant_id};
@@ -38,41 +38,52 @@ pub async fn get_rooms(
         Err(resp) => return resp,
     };
 
-    let query = r#"
+    let mut conn = match state.db_pool.get().await {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("Lỗi kết nối SQL Server: {}", e) })),
+            )
+                .into_response();
+        }
+    };
+
+    let sql = r#"
         SELECT
             r.id,
             r.house_id,
             h.name AS house_name,
             r.name,
             COALESCE(r.floor, 1) AS floor
-        FROM rooms r
-        INNER JOIN houses h ON r.house_id = h.id
-        WHERE h.owner_id = $1
+        FROM dbo.rooms r
+        INNER JOIN dbo.houses h ON r.house_id = h.id
+        WHERE h.owner_id = @P1
         ORDER BY h.name ASC, r.floor ASC, r.name ASC
     "#;
 
-    match sqlx::query(query)
-        .bind(tenant_id)
-        .fetch_all(&state.db_pool)
-        .await
-    {
-        Ok(rows) => {
+    let mut query = Query::new(sql);
+    query.bind(tenant_id);
+
+    let response = match query.query(&mut conn).await {
+        Ok(stream) => {
+            let rows = stream.into_first_result().await.unwrap_or_default();
             let rooms: Vec<Value> = rows
                 .into_iter()
-                .map(|row| {
-                    let id: Uuid = row.get("id");
-                    let house_id: Uuid = row.get("house_id");
-                    let house_name: String = row.try_get("house_name").unwrap_or_default();
-                    let name: String = row.get("name");
-                    let floor: i32 = row.try_get("floor").unwrap_or(1);
+                .filter_map(|row| {
+                    let id = row.get::<Uuid, _>("id")?;
+                    let house_id = row.get::<Uuid, _>("house_id")?;
+                    let house_name = row.get::<&str, _>("house_name").unwrap_or("").to_string();
+                    let name = row.get::<&str, _>("name").unwrap_or("").to_string();
+                    let floor = row.get::<i32, _>("floor").unwrap_or(1);
 
-                    json!({
+                    Some(json!({
                         "id": id.to_string(),
                         "house_id": house_id.to_string(),
                         "house_name": house_name,
                         "name": name,
                         "floor": floor
-                    })
+                    }))
                 })
                 .collect();
 
@@ -83,7 +94,8 @@ pub async fn get_rooms(
             Json(json!({ "error": format!("Lỗi truy vấn danh sách phòng: {}", e) })),
         )
             .into_response(),
-    }
+    };
+    response
 }
 
 // POST /api/v1/rooms
@@ -118,22 +130,42 @@ pub async fn create_room(
             .into_response();
     }
 
-    // Xác minh ngôi nhà trực thuộc đúng hộ gia đình của user
-    let house_row = sqlx::query("SELECT name FROM houses WHERE id = $1 AND owner_id = $2")
-        .bind(house_uuid)
-        .bind(tenant_id)
-        .fetch_optional(&state.db_pool)
-        .await;
-
-    let house_name: String = match house_row {
-        Ok(Some(r)) => r.get("name"),
-        Ok(None) => {
+    let mut conn = match state.db_pool.get().await {
+        Ok(c) => c,
+        Err(e) => {
             return (
-                StatusCode::FORBIDDEN,
-                Json(json!({ "error": "Ngôi nhà không tồn tại hoặc không thuộc quyền quản lý của bạn" })),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("Lỗi kết nối SQL Server: {}", e) })),
             )
                 .into_response();
         }
+    };
+
+    // Xác minh ngôi nhà trực thuộc đúng hộ gia đình của user
+    let mut house_q = Query::new(
+        "SELECT TOP 1 name FROM dbo.houses WHERE id = @P1 AND owner_id = @P2",
+    );
+    house_q.bind(house_uuid);
+    house_q.bind(tenant_id);
+
+    let house_name: String = match house_q.query(&mut conn).await {
+        Ok(stream) => match stream.into_row().await {
+            Ok(Some(r)) => r.get::<&str, _>("name").unwrap_or("").to_string(),
+            Ok(None) => {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(json!({ "error": "Ngôi nhà không tồn tại hoặc không thuộc quyền quản lý của bạn" })),
+                )
+                    .into_response();
+            }
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": e.to_string() })),
+                )
+                    .into_response();
+            }
+        },
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -146,14 +178,15 @@ pub async fn create_room(
     let floor = payload.floor.unwrap_or(1);
     let room_id = Uuid::new_v4();
 
-    match sqlx::query("INSERT INTO rooms (id, house_id, name, floor) VALUES ($1, $2, $3, $4)")
-        .bind(room_id)
-        .bind(house_uuid)
-        .bind(&name)
-        .bind(floor)
-        .execute(&state.db_pool)
-        .await
-    {
+    let mut insert_q = Query::new(
+        "INSERT INTO dbo.rooms (id, house_id, name, floor) VALUES (@P1, @P2, @P3, @P4)",
+    );
+    insert_q.bind(room_id);
+    insert_q.bind(house_uuid);
+    insert_q.bind(&name);
+    insert_q.bind(floor);
+
+    match insert_q.execute(&mut conn).await {
         Ok(_) => (
             StatusCode::CREATED,
             Json(json!({
@@ -189,7 +222,7 @@ pub async fn update_room(
         Err(resp) => return resp,
     };
 
-    let Ok(room_uuid) = Uuid::parse_str(&id) else {
+    let Ok(room_uuid) = Uuid::parse_str(id.trim()) else {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({ "error": "ID phòng không hợp lệ" })),
@@ -197,26 +230,46 @@ pub async fn update_room(
             .into_response();
     };
 
-    let current = sqlx::query(
-        "SELECT r.house_id, r.name, COALESCE(r.floor, 1) AS floor
-         FROM rooms r
-         INNER JOIN houses h ON r.house_id = h.id
-         WHERE r.id = $1 AND h.owner_id = $2",
-    )
-    .bind(room_uuid)
-    .bind(tenant_id)
-    .fetch_optional(&state.db_pool)
-    .await;
-
-    let row = match current {
-        Ok(Some(r)) => r,
-        Ok(None) => {
+    let mut conn = match state.db_pool.get().await {
+        Ok(c) => c,
+        Err(e) => {
             return (
-                StatusCode::NOT_FOUND,
-                Json(json!({ "error": "Không tìm thấy phòng thuộc quyền quản lý của bạn" })),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("Lỗi kết nối SQL Server: {}", e) })),
             )
                 .into_response();
         }
+    };
+
+    let mut cur_q = Query::new(
+        r#"
+        SELECT TOP 1 r.house_id, r.name, COALESCE(r.floor, 1) AS floor
+        FROM dbo.rooms r
+        INNER JOIN dbo.houses h ON r.house_id = h.id
+        WHERE r.id = @P1 AND h.owner_id = @P2
+        "#,
+    );
+    cur_q.bind(room_uuid);
+    cur_q.bind(tenant_id);
+
+    let row = match cur_q.query(&mut conn).await {
+        Ok(stream) => match stream.into_row().await {
+            Ok(Some(r)) => r,
+            Ok(None) => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({ "error": "Không tìm thấy phòng thuộc quyền quản lý của bạn" })),
+                )
+                    .into_response();
+            }
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": e.to_string() })),
+                )
+                    .into_response();
+            }
+        },
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -226,9 +279,15 @@ pub async fn update_room(
         }
     };
 
-    let old_house_id: Uuid = row.get("house_id");
-    let old_name: String = row.get("name");
-    let old_floor: i32 = row.try_get("floor").unwrap_or(1);
+    let Some(old_house_id) = row.get::<Uuid, _>("house_id") else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "Dữ liệu house_id của phòng không hợp lệ" })),
+        )
+            .into_response();
+    };
+    let old_name = row.get::<&str, _>("name").unwrap_or("").to_string();
+    let old_floor = row.get::<i32, _>("floor").unwrap_or(1);
 
     let target_house_id = if let Some(hid_str) = payload.house_id.filter(|s| !s.trim().is_empty()) {
         let Ok(parsed_hid) = Uuid::parse_str(hid_str.trim()) else {
@@ -239,14 +298,18 @@ pub async fn update_room(
                 .into_response();
         };
 
-        let valid_target = sqlx::query("SELECT id FROM houses WHERE id = $1 AND owner_id = $2")
-            .bind(parsed_hid)
-            .bind(tenant_id)
-            .fetch_optional(&state.db_pool)
-            .await
-            .unwrap_or(None);
+        let mut valid_q = Query::new(
+            "SELECT TOP 1 id FROM dbo.houses WHERE id = @P1 AND owner_id = @P2",
+        );
+        valid_q.bind(parsed_hid);
+        valid_q.bind(tenant_id);
 
-        if valid_target.is_none() {
+        let is_valid = match valid_q.query(&mut conn).await {
+            Ok(stream) => stream.into_row().await.ok().flatten().is_some(),
+            Err(_) => false,
+        };
+
+        if !is_valid {
             return (
                 StatusCode::FORBIDDEN,
                 Json(json!({ "error": "Ngôi nhà đích không thuộc quyền quản lý của bạn" })),
@@ -265,14 +328,15 @@ pub async fn update_room(
         .unwrap_or(old_name);
     let new_floor = payload.floor.unwrap_or(old_floor);
 
-    match sqlx::query("UPDATE rooms SET house_id = $1, name = $2, floor = $3 WHERE id = $4")
-        .bind(target_house_id)
-        .bind(&new_name)
-        .bind(new_floor)
-        .bind(room_uuid)
-        .execute(&state.db_pool)
-        .await
-    {
+    let mut upd_q = Query::new(
+        "UPDATE dbo.rooms SET house_id = @P1, name = @P2, floor = @P3 WHERE id = @P4",
+    );
+    upd_q.bind(target_house_id);
+    upd_q.bind(&new_name);
+    upd_q.bind(new_floor);
+    upd_q.bind(room_uuid);
+
+    match upd_q.execute(&mut conn).await {
         Ok(_) => (
             StatusCode::OK,
             Json(json!({
@@ -306,7 +370,7 @@ pub async fn delete_room(
         Err(resp) => return resp,
     };
 
-    let Ok(room_uuid) = Uuid::parse_str(&id) else {
+    let Ok(room_uuid) = Uuid::parse_str(id.trim()) else {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({ "error": "ID phòng không hợp lệ" })),
@@ -314,19 +378,35 @@ pub async fn delete_room(
             .into_response();
     };
 
-    // Kiểm tra quyền sở hữu phòng thông qua ngôi nhà cha
-    let owned = sqlx::query(
-        "SELECT r.id FROM rooms r
-         INNER JOIN houses h ON r.house_id = h.id
-         WHERE r.id = $1 AND h.owner_id = $2",
-    )
-    .bind(room_uuid)
-    .bind(tenant_id)
-    .fetch_optional(&state.db_pool)
-    .await
-    .unwrap_or(None);
+    let mut conn = match state.db_pool.get().await {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("Lỗi kết nối SQL Server: {}", e) })),
+            )
+                .into_response();
+        }
+    };
 
-    if owned.is_none() {
+    // Kiểm tra quyền sở hữu phòng thông qua ngôi nhà cha
+    let mut check_q = Query::new(
+        r#"
+        SELECT TOP 1 r.id
+        FROM dbo.rooms r
+        INNER JOIN dbo.houses h ON r.house_id = h.id
+        WHERE r.id = @P1 AND h.owner_id = @P2
+        "#,
+    );
+    check_q.bind(room_uuid);
+    check_q.bind(tenant_id);
+
+    let owned = match check_q.query(&mut conn).await {
+        Ok(stream) => stream.into_row().await.ok().flatten().is_some(),
+        Err(_) => false,
+    };
+
+    if !owned {
         return (
             StatusCode::NOT_FOUND,
             Json(json!({ "error": "Không tìm thấy phòng thuộc quyền quản lý của bạn" })),
@@ -335,16 +415,14 @@ pub async fn delete_room(
     }
 
     // Chuyển các thiết bị trong phòng về "Chưa phân phòng" trước khi xóa phòng
-    let _ = sqlx::query("UPDATE devices SET room_id = NULL WHERE room_id = $1")
-        .bind(room_uuid)
-        .execute(&state.db_pool)
-        .await;
+    let mut unlink_q = Query::new("UPDATE dbo.devices SET room_id = NULL WHERE room_id = @P1");
+    unlink_q.bind(room_uuid);
+    let _ = unlink_q.execute(&mut conn).await;
 
-    match sqlx::query("DELETE FROM rooms WHERE id = $1")
-        .bind(room_uuid)
-        .execute(&state.db_pool)
-        .await
-    {
+    let mut del_q = Query::new("DELETE FROM dbo.rooms WHERE id = @P1");
+    del_q.bind(room_uuid);
+
+    match del_q.execute(&mut conn).await {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,

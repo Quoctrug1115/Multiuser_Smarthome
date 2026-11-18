@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use tiberius::{AuthMethod, Config, ToSql};
+use tiberius::{AuthMethod, Config};
 use tokio::sync::{broadcast, RwLock};
 use tower_http::cors::{Any, CorsLayer};
 

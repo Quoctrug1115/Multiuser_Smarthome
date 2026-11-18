@@ -7,14 +7,14 @@ use axum::{
 use rumqttc::QoS;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use sqlx::Row;
 use std::collections::HashSet;
 use std::sync::Arc;
+use tiberius::Query;
 use uuid::Uuid;
 
 use crate::controllers::user_controller::{ensure_owner_or_admin, resolve_tenant_id};
 use crate::models::user::Claims;
-use crate::AppState;
+use crate::{AppState, SqlPool};
 
 #[derive(Deserialize)]
 pub struct CreateDevicePayload {
@@ -38,19 +38,26 @@ pub struct ControlDevicePayload {
     pub is_on: Option<bool>,
 }
 
-/// Chuyển ràng buộc unique mqtt_topic từ toàn hệ thống sang theo từng Chủ nhà (owner_id)
-async fn ensure_device_tenant_index(pool: &sqlx::PgPool) {
-    let _ = sqlx::query("ALTER TABLE devices DROP CONSTRAINT IF EXISTS devices_mqtt_topic_key")
-        .execute(pool)
-        .await;
-    let _ = sqlx::query("DROP INDEX IF EXISTS devices_mqtt_topic_key")
-        .execute(pool)
-        .await;
-    let _ = sqlx::query(
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_devices_owner_mqtt_topic ON devices (owner_id, LOWER(mqtt_topic))",
-    )
-    .execute(pool)
-    .await;
+/// Đảm bảo chỉ mục duy nhất (owner_id, mqtt_topic) trên SQL Server
+async fn ensure_device_tenant_index(pool: &SqlPool) {
+    let Ok(mut conn) = pool.get().await else {
+        return;
+    };
+
+    let sql = r#"
+        IF NOT EXISTS (
+            SELECT 1 FROM sys.indexes
+            WHERE name = N'idx_devices_owner_mqtt_topic'
+              AND object_id = OBJECT_ID(N'dbo.devices')
+        )
+        BEGIN
+            CREATE UNIQUE INDEX idx_devices_owner_mqtt_topic
+                ON dbo.devices (owner_id, mqtt_topic)
+                WHERE owner_id IS NOT NULL;
+        END
+    "#;
+
+    let _ = conn.execute(sql, &[]).await;
 }
 
 // GET /api/v1/devices
@@ -63,42 +70,54 @@ pub async fn get_devices(
         Err(resp) => return resp,
     };
 
-    let query = r#"
+    let mut conn = match state.db_pool.get().await {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("Lỗi kết nối SQL Server: {}", e) })),
+            )
+                .into_response();
+        }
+    };
+
+    let sql = r#"
         SELECT
             d.id,
             d.name,
-            d.device_type,
-            d.mqtt_topic,
+            COALESCE(d.device_type, N'switch') AS device_type,
+            COALESCE(d.mqtt_topic, N'') AS mqtt_topic,
             d.room_id,
             r.name AS room_name,
-            COALESCE(d.is_on, false) AS is_on
-        FROM devices d
-        LEFT JOIN rooms r ON d.room_id = r.id
-        LEFT JOIN houses h ON r.house_id = h.id
-        WHERE d.owner_id = $1 OR h.owner_id = $1
+            COALESCE(d.is_on, CAST(0 AS BIT)) AS is_on
+        FROM dbo.devices d
+        LEFT JOIN dbo.rooms r ON d.room_id = r.id
+        LEFT JOIN dbo.houses h ON r.house_id = h.id
+        WHERE d.owner_id = @P1 OR h.owner_id = @P1
         ORDER BY d.name ASC
     "#;
 
-    match sqlx::query(query)
-        .bind(tenant_id)
-        .fetch_all(&state.db_pool)
-        .await
-    {
-        Ok(rows) => {
+    let mut query = Query::new(sql);
+    query.bind(tenant_id);
+
+    let response = match query.query(&mut conn).await {
+        Ok(stream) => {
+            let rows = stream.into_first_result().await.unwrap_or_default();
             let list: Vec<Value> = rows
                 .into_iter()
-                .map(|row| {
-                    let id: Uuid = row.get("id");
-                    let name: String = row.get("name");
-                    let device_type: String = row
-                        .try_get("device_type")
-                        .unwrap_or_else(|_| "switch".to_string());
-                    let mqtt_topic: String = row.try_get("mqtt_topic").unwrap_or_default();
-                    let room_id: Option<Uuid> = row.try_get("room_id").unwrap_or(None);
-                    let room_name: Option<String> = row.try_get("room_name").unwrap_or(None);
-                    let is_on: bool = row.try_get("is_on").unwrap_or(false);
+                .filter_map(|row| {
+                    let id = row.get::<Uuid, _>("id")?;
+                    let name = row.get::<&str, _>("name").unwrap_or("").to_string();
+                    let device_type = row
+                        .get::<&str, _>("device_type")
+                        .unwrap_or("switch")
+                        .to_string();
+                    let mqtt_topic = row.get::<&str, _>("mqtt_topic").unwrap_or("").to_string();
+                    let room_id: Option<Uuid> = row.get::<Uuid, _>("room_id");
+                    let room_name = row.get::<&str, _>("room_name").map(|s| s.to_string());
+                    let is_on = row.get::<bool, _>("is_on").unwrap_or(false);
 
-                    json!({
+                    Some(json!({
                         "id": id.to_string(),
                         "name": name,
                         "device_type": device_type,
@@ -107,7 +126,7 @@ pub async fn get_devices(
                         "room_name": room_name,
                         "is_on": is_on,
                         "status": if is_on { "ON" } else { "OFF" }
-                    })
+                    }))
                 })
                 .collect();
 
@@ -118,7 +137,8 @@ pub async fn get_devices(
             Json(json!({ "error": format!("Lỗi truy vấn thiết bị: {}", e) })),
         )
             .into_response(),
-    }
+    };
+    response
 }
 
 // POST /api/v1/devices
@@ -148,22 +168,32 @@ pub async fn create_device(
             .into_response();
     }
 
-    // Kiểm tra trùng MQTT Topic trong phạm vi ngôi nhà của Chủ nhà hiện tại
-    let dup_check = sqlx::query(
-        "SELECT id FROM devices WHERE owner_id = $1 AND LOWER(mqtt_topic) = LOWER($2) LIMIT 1",
-    )
-    .bind(tenant_id)
-    .bind(&mqtt_topic)
-    .fetch_optional(&state.db_pool)
-    .await
-    .unwrap_or(None);
+    let mut conn = match state.db_pool.get().await {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("Lỗi kết nối SQL Server: {}", e) })),
+            )
+                .into_response();
+        }
+    };
 
-    if dup_check.is_some() {
-        return (
-            StatusCode::CONFLICT,
-            Json(json!({ "error": "MQTT Topic này đã tồn tại trong ngôi nhà của bạn" })),
-        )
-            .into_response();
+    // Kiểm tra trùng MQTT Topic trong phạm vi ngôi nhà của Chủ nhà hiện tại
+    let mut dup_q = Query::new(
+        "SELECT TOP 1 id FROM dbo.devices WHERE owner_id = @P1 AND LOWER(mqtt_topic) = LOWER(@P2)",
+    );
+    dup_q.bind(tenant_id);
+    dup_q.bind(&mqtt_topic);
+
+    if let Ok(stream) = dup_q.query(&mut conn).await {
+        if let Ok(Some(_)) = stream.into_row().await {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({ "error": "MQTT Topic này đã tồn tại trong ngôi nhà của bạn" })),
+            )
+                .into_response();
+        }
     }
 
     let device_type = payload
@@ -182,16 +212,18 @@ pub async fn create_device(
                     .into_response();
             };
 
-            let valid_room = sqlx::query(
-                "SELECT r.id FROM rooms r INNER JOIN houses h ON r.house_id = h.id WHERE r.id = $1 AND h.owner_id = $2",
-            )
-            .bind(parsed)
-            .bind(tenant_id)
-            .fetch_optional(&state.db_pool)
-            .await
-            .unwrap_or(None);
+            let mut room_q = Query::new(
+                "SELECT TOP 1 r.id FROM dbo.rooms r INNER JOIN dbo.houses h ON r.house_id = h.id WHERE r.id = @P1 AND h.owner_id = @P2",
+            );
+            room_q.bind(parsed);
+            room_q.bind(tenant_id);
 
-            if valid_room.is_none() {
+            let is_valid = match room_q.query(&mut conn).await {
+                Ok(stream) => stream.into_row().await.ok().flatten().is_some(),
+                Err(_) => false,
+            };
+
+            if !is_valid {
                 return (
                     StatusCode::FORBIDDEN,
                     Json(json!({ "error": "Phòng không thuộc quyền quản lý của bạn" })),
@@ -205,19 +237,20 @@ pub async fn create_device(
 
     let device_id = Uuid::new_v4();
 
-    match sqlx::query(
-        "INSERT INTO devices (id, name, device_type, mqtt_topic, room_id, owner_id, is_on)
-         VALUES ($1, $2, $3, $4, $5, $6, false)",
-    )
-    .bind(device_id)
-    .bind(&name)
-    .bind(&device_type)
-    .bind(&mqtt_topic)
-    .bind(room_uuid)
-    .bind(tenant_id)
-    .execute(&state.db_pool)
-    .await
-    {
+    let mut insert_q = Query::new(
+        r#"
+        INSERT INTO dbo.devices (id, name, device_type, mqtt_topic, room_id, owner_id, status, is_on)
+        VALUES (@P1, @P2, @P3, @P4, @P5, @P6, N'OFF', 0)
+        "#,
+    );
+    insert_q.bind(device_id);
+    insert_q.bind(&name);
+    insert_q.bind(&device_type);
+    insert_q.bind(&mqtt_topic);
+    insert_q.bind(room_uuid);
+    insert_q.bind(tenant_id);
+
+    match insert_q.execute(&mut conn).await {
         Ok(_) => (
             StatusCode::CREATED,
             Json(json!({
@@ -226,7 +259,8 @@ pub async fn create_device(
                 "device_type": device_type,
                 "mqtt_topic": mqtt_topic,
                 "room_id": room_uuid.map(|u| u.to_string()),
-                "is_on": false
+                "is_on": false,
+                "status": "OFF"
             })),
         )
             .into_response(),
@@ -256,7 +290,7 @@ pub async fn update_device(
 
     ensure_device_tenant_index(&state.db_pool).await;
 
-    let Ok(dev_uuid) = Uuid::parse_str(&id) else {
+    let Ok(dev_uuid) = Uuid::parse_str(id.trim()) else {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({ "error": "ID thiết bị không hợp lệ" })),
@@ -264,27 +298,47 @@ pub async fn update_device(
             .into_response();
     };
 
-    let current = sqlx::query(
-        "SELECT d.name, d.device_type, d.mqtt_topic, d.room_id
-         FROM devices d
-         LEFT JOIN rooms r ON d.room_id = r.id
-         LEFT JOIN houses h ON r.house_id = h.id
-         WHERE d.id = $1 AND (d.owner_id = $2 OR h.owner_id = $2)",
-    )
-    .bind(dev_uuid)
-    .bind(tenant_id)
-    .fetch_optional(&state.db_pool)
-    .await;
-
-    let row = match current {
-        Ok(Some(r)) => r,
-        Ok(None) => {
+    let mut conn = match state.db_pool.get().await {
+        Ok(c) => c,
+        Err(e) => {
             return (
-                StatusCode::NOT_FOUND,
-                Json(json!({ "error": "Không tìm thấy thiết bị thuộc quyền quản lý của bạn" })),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("Lỗi kết nối SQL Server: {}", e) })),
             )
                 .into_response();
         }
+    };
+
+    let mut cur_q = Query::new(
+        r#"
+        SELECT TOP 1 d.name, d.device_type, d.mqtt_topic, d.room_id
+        FROM dbo.devices d
+        LEFT JOIN dbo.rooms r ON d.room_id = r.id
+        LEFT JOIN dbo.houses h ON r.house_id = h.id
+        WHERE d.id = @P1 AND (d.owner_id = @P2 OR h.owner_id = @P2)
+        "#,
+    );
+    cur_q.bind(dev_uuid);
+    cur_q.bind(tenant_id);
+
+    let row = match cur_q.query(&mut conn).await {
+        Ok(stream) => match stream.into_row().await {
+            Ok(Some(r)) => r,
+            Ok(None) => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({ "error": "Không tìm thấy thiết bị thuộc quyền quản lý của bạn" })),
+                )
+                    .into_response();
+            }
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": e.to_string() })),
+                )
+                    .into_response();
+            }
+        },
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -294,9 +348,12 @@ pub async fn update_device(
         }
     };
 
-    let old_name: String = row.get("name");
-    let old_type: String = row.get("device_type");
-    let old_topic: String = row.get("mqtt_topic");
+    let old_name = row.get::<&str, _>("name").unwrap_or("").to_string();
+    let old_type = row
+        .get::<&str, _>("device_type")
+        .unwrap_or("switch")
+        .to_string();
+    let old_topic = row.get::<&str, _>("mqtt_topic").unwrap_or("").to_string();
 
     let new_name = payload
         .name
@@ -317,21 +374,24 @@ pub async fn update_device(
     let new_room_id: Option<Uuid> = match payload.room_id {
         Some(ref s) if s.trim().is_empty() => None,
         Some(ref s) => Uuid::parse_str(s.trim()).ok(),
-        None => row.try_get("room_id").unwrap_or(None),
+        None => row.get::<Uuid, _>("room_id"),
     };
 
-    match sqlx::query(
-        "UPDATE devices SET name = $1, device_type = $2, mqtt_topic = $3, room_id = $4, owner_id = $5 WHERE id = $6",
-    )
-    .bind(&new_name)
-    .bind(&new_type)
-    .bind(&new_topic)
-    .bind(new_room_id)
-    .bind(tenant_id)
-    .bind(dev_uuid)
-    .execute(&state.db_pool)
-    .await
-    {
+    let mut upd_q = Query::new(
+        r#"
+        UPDATE dbo.devices
+        SET name = @P1, device_type = @P2, mqtt_topic = @P3, room_id = @P4, owner_id = @P5
+        WHERE id = @P6
+        "#,
+    );
+    upd_q.bind(&new_name);
+    upd_q.bind(&new_type);
+    upd_q.bind(&new_topic);
+    upd_q.bind(new_room_id);
+    upd_q.bind(tenant_id);
+    upd_q.bind(dev_uuid);
+
+    match upd_q.execute(&mut conn).await {
         Ok(_) => (
             StatusCode::OK,
             Json(json!({ "message": "Đã cập nhật thiết bị" })),
@@ -345,7 +405,7 @@ pub async fn update_device(
     }
 }
 
-// POST /api/v1/devices/{id}/control (Cả Owner, Admin, Member đều bật/tắt được thiết bị trong nhà mình)
+// POST /api/v1/devices/{id}/control
 pub async fn control_device(
     claims: Claims,
     Path(id): Path<String>,
@@ -357,12 +417,23 @@ pub async fn control_device(
         Err(resp) => return resp,
     };
 
-    let Ok(dev_uuid) = Uuid::parse_str(&id) else {
+    let Ok(dev_uuid) = Uuid::parse_str(id.trim()) else {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({ "error": "ID thiết bị không hợp lệ" })),
         )
             .into_response();
+    };
+
+    let mut conn = match state.db_pool.get().await {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("Lỗi kết nối SQL Server: {}", e) })),
+            )
+                .into_response();
+        }
     };
 
     let next_state = payload.is_on.unwrap_or_else(|| {
@@ -373,27 +444,36 @@ pub async fn control_device(
             .unwrap_or(false)
     });
 
-    let target_row = sqlx::query(
-        "SELECT d.id, d.mqtt_topic
-         FROM devices d
-         LEFT JOIN rooms r ON d.room_id = r.id
-         LEFT JOIN houses h ON r.house_id = h.id
-         WHERE d.id = $1 AND (d.owner_id = $2 OR h.owner_id = $2)",
-    )
-    .bind(dev_uuid)
-    .bind(tenant_id)
-    .fetch_optional(&state.db_pool)
-    .await;
+    let mut target_q = Query::new(
+        r#"
+        SELECT TOP 1 d.id, d.mqtt_topic
+        FROM dbo.devices d
+        LEFT JOIN dbo.rooms r ON d.room_id = r.id
+        LEFT JOIN dbo.houses h ON r.house_id = h.id
+        WHERE d.id = @P1 AND (d.owner_id = @P2 OR h.owner_id = @P2)
+        "#,
+    );
+    target_q.bind(dev_uuid);
+    target_q.bind(tenant_id);
 
-    let mqtt_topic: String = match target_row {
-        Ok(Some(row)) => row.try_get("mqtt_topic").unwrap_or_default(),
-        Ok(None) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(json!({ "error": "Không tìm thấy thiết bị trong nhà của bạn" })),
-            )
-                .into_response();
-        }
+    let mqtt_topic: String = match target_q.query(&mut conn).await {
+        Ok(stream) => match stream.into_row().await {
+            Ok(Some(row)) => row.get::<&str, _>("mqtt_topic").unwrap_or("").to_string(),
+            Ok(None) => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({ "error": "Không tìm thấy thiết bị trong nhà của bạn" })),
+                )
+                    .into_response();
+            }
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": e.to_string() })),
+                )
+                    .into_response();
+            }
+        },
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -403,12 +483,16 @@ pub async fn control_device(
         }
     };
 
-    if let Err(e) = sqlx::query("UPDATE devices SET is_on = $1 WHERE id = $2")
-        .bind(next_state)
-        .bind(dev_uuid)
-        .execute(&state.db_pool)
-        .await
-    {
+    let cmd = if next_state { "ON" } else { "OFF" };
+
+    let mut upd_q = Query::new(
+        "UPDATE dbo.devices SET is_on = @P1, status = @P2, last_seen = SYSDATETIMEOFFSET() WHERE id = @P3",
+    );
+    upd_q.bind(next_state);
+    upd_q.bind(cmd);
+    upd_q.bind(dev_uuid);
+
+    if let Err(e) = upd_q.execute(&mut conn).await {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": e.to_string() })),
@@ -417,7 +501,6 @@ pub async fn control_device(
     }
 
     // Gửi lệnh điều khiển qua MQTT Broker xuống ESP32/Wokwi
-    let cmd = if next_state { "ON" } else { "OFF" };
     if !mqtt_topic.trim().is_empty() {
         let _ = state
             .mqtt_client
@@ -470,7 +553,7 @@ pub async fn delete_device(
         Err(resp) => return resp,
     };
 
-    let Ok(dev_uuid) = Uuid::parse_str(&id) else {
+    let Ok(dev_uuid) = Uuid::parse_str(id.trim()) else {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({ "error": "ID thiết bị không hợp lệ" })),
@@ -478,22 +561,63 @@ pub async fn delete_device(
             .into_response();
     };
 
-    match sqlx::query(
-        "DELETE FROM devices d
-         USING (
-             SELECT d2.id FROM devices d2
-             LEFT JOIN rooms r ON d2.room_id = r.id
-             LEFT JOIN houses h ON r.house_id = h.id
-             WHERE d2.id = $1 AND (d2.owner_id = $2 OR h.owner_id = $2)
-         ) sub
-         WHERE d.id = sub.id",
-    )
-    .bind(dev_uuid)
-    .bind(tenant_id)
-    .execute(&state.db_pool)
-    .await
-    {
-        Ok(res) if res.rows_affected() > 0 => StatusCode::NO_CONTENT.into_response(),
+    let mut conn = match state.db_pool.get().await {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("Lỗi kết nối SQL Server: {}", e) })),
+            )
+                .into_response();
+        }
+    };
+
+    // Kiểm tra thiết bị có thuộc nhà của người dùng trước khi dọn liên kết khóa ngoại
+    let mut check_q = Query::new(
+        r#"
+        SELECT TOP 1 d.id
+        FROM dbo.devices d
+        LEFT JOIN dbo.rooms r ON d.room_id = r.id
+        LEFT JOIN dbo.houses h ON r.house_id = h.id
+        WHERE d.id = @P1 AND (d.owner_id = @P2 OR h.owner_id = @P2)
+        "#,
+    );
+    check_q.bind(dev_uuid);
+    check_q.bind(tenant_id);
+
+    let exists = match check_q.query(&mut conn).await {
+        Ok(stream) => stream.into_row().await.ok().flatten().is_some(),
+        Err(_) => false,
+    };
+
+    if !exists {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "Không tìm thấy thiết bị trong nhà của bạn" })),
+        )
+            .into_response();
+    }
+
+    // Gỡ liên kết ở các bảng có ON DELETE NO ACTION trong SQL Server
+    let cleanup_queries = [
+        "DELETE FROM dbo.guest_access WHERE device_id = @P1",
+        "UPDATE dbo.energy_logs SET device_id = NULL WHERE device_id = @P1",
+        "UPDATE dbo.ai_alerts SET device_id = NULL WHERE device_id = @P1",
+        "UPDATE dbo.ai_suggestions SET device_id = NULL WHERE device_id = @P1",
+        "UPDATE dbo.automations SET trigger_device_id = NULL WHERE trigger_device_id = @P1",
+        "UPDATE dbo.automations SET action_device_id = NULL WHERE action_device_id = @P1",
+    ];
+    for sql in cleanup_queries {
+        let mut q = Query::new(sql);
+        q.bind(dev_uuid);
+        let _ = q.execute(&mut conn).await;
+    }
+
+    let mut del_q = Query::new("DELETE FROM dbo.devices WHERE id = @P1");
+    del_q.bind(dev_uuid);
+
+    match del_q.execute(&mut conn).await {
+        Ok(res) if res.rows_affected().iter().sum::<u64>() > 0 => StatusCode::NO_CONTENT.into_response(),
         Ok(_) => (
             StatusCode::NOT_FOUND,
             Json(json!({ "error": "Không tìm thấy thiết bị trong nhà của bạn" })),
@@ -542,41 +666,47 @@ pub async fn discover_devices(
         }
     }
 
-    // 2. Lấy thêm các thiết bị mẫu/chưa gán chủ sở hữu trong bảng devices (owner_id IS NULL)
-    let query = r#"
-        SELECT
-            id,
-            name,
-            COALESCE(device_type, 'switch') AS device_type,
-            COALESCE(mqtt_topic, '') AS mqtt_topic,
-            COALESCE(is_on, false) AS is_on
-        FROM devices
-        WHERE owner_id IS NULL
-        ORDER BY name ASC
-    "#;
+    // 2. Lấy thêm các thiết bị mẫu/chưa gán chủ sở hữu trong bảng dbo.devices (owner_id IS NULL)
+    if let Ok(mut conn) = state.db_pool.get().await {
+        let sql = r#"
+            SELECT
+                id,
+                name,
+                COALESCE(device_type, N'switch') AS device_type,
+                COALESCE(mqtt_topic, N'') AS mqtt_topic,
+                COALESCE(is_on, CAST(0 AS BIT)) AS is_on
+            FROM dbo.devices
+            WHERE owner_id IS NULL
+            ORDER BY name ASC
+        "#;
 
-    if let Ok(rows) = sqlx::query(query).fetch_all(&state.db_pool).await {
-        for row in rows {
-            let mqtt_topic: String = row.try_get("mqtt_topic").unwrap_or_default();
-            let clean_topic = mqtt_topic.trim().to_string();
-            if clean_topic.is_empty() || !seen_topics.insert(clean_topic.to_lowercase()) {
-                continue;
+        if let Ok(stream) = conn.query(sql, &[]).await {
+            let rows = stream.into_first_result().await.unwrap_or_default();
+            for row in rows {
+                let mqtt_topic = row.get::<&str, _>("mqtt_topic").unwrap_or("");
+                let clean_topic = mqtt_topic.trim().to_string();
+                if clean_topic.is_empty() || !seen_topics.insert(clean_topic.to_lowercase()) {
+                    continue;
+                }
+
+                let Some(id) = row.get::<Uuid, _>("id") else {
+                    continue;
+                };
+                let name = row.get::<&str, _>("name").unwrap_or("").to_string();
+                let device_type = row
+                    .get::<&str, _>("device_type")
+                    .unwrap_or("switch")
+                    .to_string();
+                let is_on = row.get::<bool, _>("is_on").unwrap_or(false);
+
+                discovered.push(json!({
+                    "id": id.to_string(),
+                    "name": name,
+                    "device_type": device_type,
+                    "mqtt_topic": clean_topic,
+                    "is_on": is_on
+                }));
             }
-
-            let id: Uuid = row.get("id");
-            let name: String = row.get("name");
-            let device_type: String = row
-                .try_get("device_type")
-                .unwrap_or_else(|_| "switch".to_string());
-            let is_on: bool = row.try_get("is_on").unwrap_or(false);
-
-            discovered.push(json!({
-                "id": id.to_string(),
-                "name": name,
-                "device_type": device_type,
-                "mqtt_topic": clean_topic,
-                "is_on": is_on
-            }));
         }
     }
 

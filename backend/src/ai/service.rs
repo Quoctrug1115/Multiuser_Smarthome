@@ -1,15 +1,14 @@
 use std::sync::Arc;
 use chrono::{Timelike, Utc};
 use serde_json::json;
-use sqlx::Row;
+use tiberius::Query;
 use tokio::time::{sleep, Duration};
 
 use crate::ai::anomaly::{detect_sensor_anomaly, is_unusual_time_window};
-
-use crate::ws::handler::AppState;
+use crate::AppState;
 
 pub async fn start_ai_worker(state: Arc<AppState>) {
-    println!("🤖 [AI Service] Background worker started!");
+    println!("[AI Service] Background worker started!");
 
     tokio::spawn(async move {
         loop {
@@ -29,55 +28,90 @@ pub async fn start_ai_worker(state: Arc<AppState>) {
 }
 
 async fn run_anomaly_detection(state: &Arc<AppState>) {
-    // Lấy danh sách các cảm biến nhiệt độ
-    let devices = sqlx::query("SELECT id FROM devices WHERE device_type = 'SENSOR'")
-        .fetch_all(&state.db_pool)
-        .await;
+    let Ok(mut conn) = state.db_pool.get().await else {
+        return;
+    };
 
-    if let Ok(device_rows) = devices {
-        for row in device_rows {
-            let device_id: uuid::Uuid = row.get("id");
+    // Lấy danh sách các cảm biến (kèm owner_id để phân tách cảnh báo theo từng hộ gia đình)
+    let device_rows = match conn
+        .query(
+            "SELECT id, owner_id FROM dbo.devices WHERE LOWER(device_type) IN (N'sensor', N'dht22')",
+            &[],
+        )
+        .await
+    {
+        Ok(stream) => stream.into_first_result().await.unwrap_or_default(),
+        Err(_) => return,
+    };
 
-            // Lấy 20 dữ liệu cảm biến gần nhất từ TimescaleDB
-            let history_rows = sqlx::query(
-                "SELECT value FROM sensor_data WHERE device_id = $1 ORDER BY time DESC LIMIT 20"
-            )
-            .bind(device_id)
-            .fetch_all(&state.db_pool)
-            .await;
+    for row in device_rows {
+        let Some(device_id) = row.get::<uuid::Uuid, _>("id") else {
+            continue;
+        };
+        let owner_id: Option<uuid::Uuid> = row.get::<uuid::Uuid, _>("owner_id");
 
-            if let Ok(records) = history_rows {
-                if records.is_empty() { continue; }
+        // Lấy 20 dữ liệu cảm biến gần nhất từ SQL Server (dùng TOP 20 thay cho LIMIT 20)
+        let mut history_q = Query::new(
+            "SELECT TOP 20 [value] FROM dbo.sensor_data WHERE device_id = @P1 ORDER BY [time] DESC",
+        );
+        history_q.bind(device_id);
 
-                let current_val: f64 = records[0].get("value");
-                let past_vals: Vec<f64> = records.iter().skip(1).map(|r| r.get("value")).collect();
+        let records = match history_q.query(&mut conn).await {
+            Ok(stream) => stream.into_first_result().await.unwrap_or_default(),
+            Err(_) => continue,
+        };
 
-                if let Some((anomaly_type, z_score)) = detect_sensor_anomaly(&past_vals, current_val) {
-                    let msg = format!("Thấy biến động bất thường! Giá trị: {}, Z-Score: {:.2}", current_val, z_score);
+        if records.is_empty() {
+            continue;
+        }
 
-                    // Lưu vào DB
-                    let _ = sqlx::query(
-                        "INSERT INTO ai_alerts (device_id, alert_type, severity, message, metadata) VALUES ($1, $2, $3, $4, $5)"
-                    )
-                    .bind(device_id)
-                    .bind(&anomaly_type)
-                    .bind("HIGH")
-                    .bind(&msg)
-                    .bind(json!({ "current_value": current_val, "z_score": z_score }))
-                    .execute(&state.db_pool)
-                    .await;
+        let Some(current_val) = records[0].get::<f64, _>("value") else {
+            continue;
+        };
+        let past_vals: Vec<f64> = records
+            .iter()
+            .skip(1)
+            .filter_map(|r| r.get::<f64, _>("value"))
+            .collect();
 
-                    // Broadcast báo động tức thì qua WebSocket tới ứng dụng
-                    let alert_event = json!({
-                        "event_type": "AI_ANOMALY_ALERT",
-                        "device_id": device_id,
-                        "alert_type": anomaly_type,
-                        "message": msg
-                    }).to_string();
+        if let Some((anomaly_type, z_score)) = detect_sensor_anomaly(&past_vals, current_val) {
+            let msg = format!(
+                "Thấy biến động bất thường! Giá trị: {}, Z-Score: {:.2}",
+                current_val, z_score
+            );
+            let metadata_str = json!({
+                "current_value": current_val,
+                "z_score": z_score
+            })
+            .to_string();
 
-                    let _ = state.tx_ws.send(alert_event);
-                }
-            }
+            // Lưu cảnh báo vào SQL Server
+            let mut insert_q = Query::new(
+                r#"
+                INSERT INTO dbo.ai_alerts (id, device_id, owner_id, alert_type, severity, message, metadata, created_at)
+                VALUES (NEWID(), @P1, @P2, @P3, @P4, @P5, @P6, SYSDATETIMEOFFSET())
+                "#,
+            );
+            insert_q.bind(device_id);
+            insert_q.bind(owner_id);
+            insert_q.bind(&anomaly_type);
+            insert_q.bind("HIGH");
+            insert_q.bind(&msg);
+            insert_q.bind(&metadata_str);
+
+            let _ = insert_q.execute(&mut conn).await;
+
+            // Broadcast báo động tức thì qua WebSocket tới ứng dụng
+            let alert_event = json!({
+                "type": "AI_ANOMALY_ALERT",
+                "event_type": "AI_ANOMALY_ALERT",
+                "device_id": device_id,
+                "alert_type": anomaly_type,
+                "message": msg
+            })
+            .to_string();
+
+            let _ = state.tx.send(alert_event);
         }
     }
 }

@@ -6,14 +6,14 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
-use sqlx::{PgPool, Row};
 use std::sync::Arc;
+use tiberius::Query;
 use uuid::Uuid;
 
 use crate::models::user::Claims;
 use crate::services::auth_service::hash_password;
 use crate::services::rbac_service::check_permission;
-use crate::AppState;
+use crate::{AppState, SqlPool};
 
 #[derive(Deserialize)]
 pub struct CreateUserPayload {
@@ -38,10 +38,20 @@ pub struct UpdateUserPayload {
 /// Xác định ID Chủ nhà gốc (tenant_id) của người dùng đang đăng nhập:
 /// - Nếu user tự đăng ký (owner_id IS NULL) -> trả về chính user_id đó.
 /// - Nếu user là tài khoản phụ (Admin/Member/Guest do Owner tạo) -> trả về owner_id của họ.
-pub async fn resolve_tenant_id(pool: &PgPool, user_id: Uuid) -> Result<Uuid, Response> {
-    let row = sqlx::query("SELECT owner_id FROM users WHERE id = $1")
-        .bind(user_id)
-        .fetch_optional(pool)
+pub async fn resolve_tenant_id(pool: &SqlPool, user_id: Uuid) -> Result<Uuid, Response> {
+    let mut conn = pool.get().await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("Lỗi kết nối SQL Server: {}", e) })),
+        )
+            .into_response()
+    })?;
+
+    let mut q = Query::new("SELECT TOP 1 owner_id FROM dbo.users WHERE id = @P1");
+    q.bind(user_id);
+
+    let row = q
+        .query(&mut conn)
         .await
         .map_err(|e| {
             (
@@ -49,11 +59,20 @@ pub async fn resolve_tenant_id(pool: &PgPool, user_id: Uuid) -> Result<Uuid, Res
                 Json(json!({ "error": format!("Lỗi truy vấn người dùng: {}", e) })),
             )
                 .into_response()
+        })?
+        .into_row()
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("Lỗi đọc dữ liệu người dùng: {}", e) })),
+            )
+                .into_response()
         })?;
 
     match row {
         Some(r) => {
-            let parent_owner: Option<Uuid> = r.try_get("owner_id").unwrap_or(None);
+            let parent_owner: Option<Uuid> = r.get::<Uuid, _>("owner_id");
             Ok(parent_owner.unwrap_or(user_id))
         }
         None => Err((
@@ -64,19 +83,29 @@ pub async fn resolve_tenant_id(pool: &PgPool, user_id: Uuid) -> Result<Uuid, Res
     }
 }
 
-pub async fn ensure_owner_or_admin(pool: &PgPool, claims: &Claims) -> Result<(), Response> {
-    let db_role: Option<String> = sqlx::query_scalar(
-        r#"
-        SELECT COALESCE(NULLIF(TRIM(r.name), ''), NULLIF(TRIM(u.role), ''), 'Member')
-        FROM users u
-        LEFT JOIN roles r ON u.role_id = r.id
-        WHERE u.id = $1
-        "#,
-    )
-    .bind(claims.sub)
-    .fetch_optional(pool)
-    .await
-    .unwrap_or(None);
+pub async fn ensure_owner_or_admin(pool: &SqlPool, claims: &Claims) -> Result<(), Response> {
+    let mut db_role: Option<String> = None;
+
+    if let Ok(mut conn) = pool.get().await {
+        let mut q = Query::new(
+            r#"
+            SELECT TOP 1
+                COALESCE(NULLIF(TRIM(r.name), N''), NULLIF(TRIM(u.role), N''), N'Member') AS effective_role
+            FROM dbo.users u
+            LEFT JOIN dbo.roles r ON u.role_id = r.id
+            WHERE u.id = @P1
+            "#,
+        );
+        q.bind(claims.sub);
+
+        if let Ok(stream) = q.query(&mut conn).await {
+            if let Ok(Some(row)) = stream.into_row().await {
+                db_role = row
+                    .get::<&str, _>("effective_role")
+                    .map(|s| s.to_string());
+            }
+        }
+    }
 
     let effective_role = db_role
         .unwrap_or_else(|| claims.role_name.clone())
@@ -111,88 +140,65 @@ pub async fn get_users(
         Err(resp) => return resp,
     };
 
-    let query = r#"
+    let mut conn = match state.db_pool.get().await {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("Lỗi kết nối SQL Server: {}", e) })),
+            )
+                .into_response();
+        }
+    };
+
+    let sql = r#"
         SELECT
-            to_jsonb(u) - 'password_hash' - 'password' AS user_data,
-            r.name AS joined_role
-        FROM users u
-        LEFT JOIN roles r ON u.role_id = r.id
-        WHERE u.owner_id = $1 OR u.id = $1
-        ORDER BY (u.id = $1) DESC, u.email ASC
+            u.id,
+            u.email,
+            COALESCE(
+                NULLIF(TRIM(u.full_name), N''),
+                NULLIF(NULLIF(TRIM(u.name), N''), N'User'),
+                LEFT(u.email, CHARINDEX(N'@', u.email + N'@') - 1),
+                N'User'
+            ) AS display_name,
+            COALESCE(NULLIF(TRIM(r.name), N''), NULLIF(TRIM(u.role), N''), N'Member') AS role_name,
+            COALESCE(u.is_active, CAST(1 AS BIT)) AS is_active
+        FROM dbo.users u
+        LEFT JOIN dbo.roles r ON u.role_id = r.id
+        WHERE u.owner_id = @P1 OR u.id = @P1
+        ORDER BY CASE WHEN u.id = @P1 THEN 0 ELSE 1 END ASC, u.email ASC
     "#;
 
-    match sqlx::query(query)
-        .bind(tenant_id)
-        .fetch_all(&state.db_pool)
-        .await
-    {
-        Ok(rows) => {
+    let mut q = Query::new(sql);
+    q.bind(tenant_id);
+
+    let response = match q.query(&mut conn).await {
+        Ok(stream) => {
+            let rows = stream.into_first_result().await.unwrap_or_default();
             let users: Vec<Value> = rows
                 .into_iter()
-                .map(|row| {
-                    let user_data: Value = row.try_get("user_data").unwrap_or_else(|_| json!({}));
-                    let joined_role: Option<String> = row.try_get("joined_role").ok();
-
-                    let id = user_data
-                        .get("id")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default()
+                .filter_map(|row| {
+                    let id = row.get::<Uuid, _>("id")?;
+                    let email = row.get::<&str, _>("email").unwrap_or("").to_string();
+                    let display_name = row
+                        .get::<&str, _>("display_name")
+                        .unwrap_or("User")
                         .to_string();
-                    let email = user_data
-                        .get("email")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default()
+                    let role = row
+                        .get::<&str, _>("role_name")
+                        .unwrap_or("Member")
                         .to_string();
+                    let is_active = row.get::<bool, _>("is_active").unwrap_or(true);
 
-                    let full_name = user_data
-                        .get("full_name")
-                        .and_then(|v| v.as_str())
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty());
-                    let raw_name = user_data
-                        .get("name")
-                        .and_then(|v| v.as_str())
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty() && *s != "User");
-
-                    let display_name = full_name
-                        .or(raw_name)
-                        .map(ToString::to_string)
-                        .unwrap_or_else(|| {
-                            email
-                                .split('@')
-                                .next()
-                                .filter(|s| !s.is_empty())
-                                .unwrap_or("User")
-                                .to_string()
-                        });
-
-                    let role = joined_role
-                        .filter(|s| !s.trim().is_empty())
-                        .or_else(|| {
-                            user_data
-                                .get("role")
-                                .and_then(|v| v.as_str())
-                                .map(str::trim)
-                                .filter(|s| !s.is_empty())
-                                .map(ToString::to_string)
-                        })
-                        .unwrap_or_else(|| "Member".to_string());
-
-                    let is_active = user_data
-                        .get("is_active")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(true);
-
-                    json!({
-                        "id": id,
+                    Some(json!({
+                        "id": id.to_string(),
                         "name": display_name,
                         "full_name": display_name,
                         "email": email,
                         "role": role,
                         "role_name": role,
                         "is_active": is_active
-                    })
+                    }))
                 })
                 .collect();
 
@@ -203,7 +209,8 @@ pub async fn get_users(
             Json(json!({ "error": format!("Lỗi truy vấn người dùng: {}", e) })),
         )
             .into_response(),
-    }
+    };
+    response
 }
 
 // POST /api/v1/users
@@ -221,12 +228,21 @@ pub async fn create_user(
         Err(resp) => return resp,
     };
 
+    let email = payload.email.trim().to_string();
+    if email.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "Email không được để trống" })),
+        )
+            .into_response();
+    }
+
     let display_name = payload
         .full_name
         .or(payload.name)
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| payload.email.split('@').next().unwrap_or("User").to_string());
+        .unwrap_or_else(|| email.split('@').next().unwrap_or("User").to_string());
 
     let requested_role = payload
         .role_name
@@ -243,13 +259,63 @@ pub async fn create_user(
             .into_response();
     }
 
-    let role_row = sqlx::query("SELECT id, name FROM roles WHERE LOWER(name) = LOWER($1)")
-        .bind(&requested_role)
-        .fetch_optional(&state.db_pool)
-        .await;
+    let mut conn = match state.db_pool.get().await {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("Lỗi kết nối SQL Server: {}", e) })),
+            )
+                .into_response();
+        }
+    };
+
+    // Kiểm tra email đã tồn tại chưa
+    let email_exists = {
+        let mut dup_q =
+            Query::new("SELECT TOP 1 id FROM dbo.users WHERE LOWER(email) = LOWER(@P1)");
+        dup_q.bind(&email);
+
+        match dup_q.query(&mut conn).await {
+            Ok(stream) => stream.into_row().await.ok().flatten().is_some(),
+            Err(_) => false,
+        }
+    };
+
+    if email_exists {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "Email này đã được sử dụng" })),
+        )
+            .into_response();
+    }
+
+    let role_row = {
+        let mut role_q =
+            Query::new("SELECT TOP 1 id, name FROM dbo.roles WHERE LOWER(name) = LOWER(@P1)");
+        role_q.bind(&requested_role);
+
+        match role_q.query(&mut conn).await {
+            Ok(stream) => stream.into_row().await,
+            Err(e) => Err(e),
+        }
+    };
 
     let (role_id, canonical_role): (Uuid, String) = match role_row {
-        Ok(Some(r)) => (r.get("id"), r.get("name")),
+        Ok(Some(r)) => {
+            let Some(rid) = r.get::<Uuid, _>("id") else {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": "Dữ liệu role_id không hợp lệ" })),
+                )
+                    .into_response();
+            };
+            let rname = r
+                .get::<&str, _>("name")
+                .unwrap_or(&requested_role)
+                .to_string();
+            (rid, rname)
+        }
         Ok(None) => {
             return (
                 StatusCode::BAD_REQUEST,
@@ -283,24 +349,23 @@ pub async fn create_user(
     };
 
     let id = Uuid::new_v4();
-    let email = payload.email.trim().to_string();
 
-    let insert_res = sqlx::query(
-        "INSERT INTO users (id, name, full_name, email, password_hash, role, role_id, owner_id, is_active)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true)",
-    )
-    .bind(id)
-    .bind(&display_name)
-    .bind(&display_name)
-    .bind(&email)
-    .bind(&hashed_password)
-    .bind(&canonical_role)
-    .bind(role_id)
-    .bind(tenant_id)
-    .execute(&state.db_pool)
-    .await;
+    let mut insert_q = Query::new(
+        r#"
+        INSERT INTO dbo.users (id, name, full_name, email, password_hash, role, role_id, owner_id, is_active, created_at)
+        VALUES (@P1, @P2, @P3, @P4, @P5, @P6, @P7, @P8, 1, SYSDATETIMEOFFSET())
+        "#,
+    );
+    insert_q.bind(id);
+    insert_q.bind(&display_name);
+    insert_q.bind(&display_name);
+    insert_q.bind(&email);
+    insert_q.bind(&hashed_password);
+    insert_q.bind(&canonical_role);
+    insert_q.bind(role_id);
+    insert_q.bind(tenant_id);
 
-    match insert_res {
+    match insert_q.execute(&mut conn).await {
         Ok(_) => (
             StatusCode::CREATED,
             Json(json!({
@@ -338,7 +403,7 @@ pub async fn update_user(
         Err(resp) => return resp,
     };
 
-    let Ok(uuid_val) = Uuid::parse_str(&id) else {
+    let Ok(uuid_val) = Uuid::parse_str(id.trim()) else {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({ "error": "ID người dùng không hợp lệ" })),
@@ -346,15 +411,32 @@ pub async fn update_user(
             .into_response();
     };
 
-    // Kiểm tra user mục tiêu có thuộc hộ gia đình hiện tại không
-    let exists = sqlx::query("SELECT id FROM users WHERE id = $1 AND (owner_id = $2 OR id = $2)")
-        .bind(uuid_val)
-        .bind(tenant_id)
-        .fetch_optional(&state.db_pool)
-        .await
-        .unwrap_or(None);
+    let mut conn = match state.db_pool.get().await {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("Lỗi kết nối SQL Server: {}", e) })),
+            )
+                .into_response();
+        }
+    };
 
-    if exists.is_none() {
+    // Kiểm tra user mục tiêu có thuộc hộ gia đình hiện tại không
+    let exists = {
+        let mut check_q = Query::new(
+            "SELECT TOP 1 id FROM dbo.users WHERE id = @P1 AND (owner_id = @P2 OR id = @P2)",
+        );
+        check_q.bind(uuid_val);
+        check_q.bind(tenant_id);
+
+        match check_q.query(&mut conn).await {
+            Ok(stream) => stream.into_row().await.ok().flatten().is_some(),
+            Err(_) => false,
+        }
+    };
+
+    if !exists {
         return (
             StatusCode::NOT_FOUND,
             Json(json!({ "error": "Không tìm thấy tài khoản trong gia đình của bạn" })),
@@ -368,12 +450,10 @@ pub async fn update_user(
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
     {
-        if let Err(e) = sqlx::query("UPDATE users SET name = $1, full_name = $1 WHERE id = $2")
-            .bind(&new_name)
-            .bind(uuid_val)
-            .execute(&state.db_pool)
-            .await
-        {
+        let mut q = Query::new("UPDATE dbo.users SET name = @P1, full_name = @P1 WHERE id = @P2");
+        q.bind(&new_name);
+        q.bind(uuid_val);
+        if let Err(e) = q.execute(&mut conn).await {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({ "error": e.to_string() })),
@@ -396,23 +476,39 @@ pub async fn update_user(
                 .into_response();
         }
 
-        let role_row = sqlx::query("SELECT id, name FROM roles WHERE LOWER(name) = LOWER($1)")
-            .bind(&requested_role)
-            .fetch_optional(&state.db_pool)
-            .await;
+        // Giải phóng QueryStream trước khi gọi upd_role_q.execute(&mut conn)
+        let role_row = {
+            let mut role_q =
+                Query::new("SELECT TOP 1 id, name FROM dbo.roles WHERE LOWER(name) = LOWER(@P1)");
+            role_q.bind(&requested_role);
+
+            match role_q.query(&mut conn).await {
+                Ok(stream) => stream.into_row().await,
+                Err(e) => Err(e),
+            }
+        };
 
         match role_row {
             Ok(Some(r)) => {
-                let role_id: Uuid = r.get("id");
-                let canonical_role: String = r.get("name");
-                if let Err(e) =
-                    sqlx::query("UPDATE users SET role = $1, role_id = $2 WHERE id = $3")
-                        .bind(&canonical_role)
-                        .bind(role_id)
-                        .bind(uuid_val)
-                        .execute(&state.db_pool)
-                        .await
-                {
+                let Some(role_id) = r.get::<Uuid, _>("id") else {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({ "error": "Dữ liệu role_id không hợp lệ" })),
+                    )
+                        .into_response();
+                };
+                let canonical_role = r
+                    .get::<&str, _>("name")
+                    .unwrap_or(&requested_role)
+                    .to_string();
+
+                let mut upd_role_q =
+                    Query::new("UPDATE dbo.users SET role = @P1, role_id = @P2 WHERE id = @P3");
+                upd_role_q.bind(&canonical_role);
+                upd_role_q.bind(role_id);
+                upd_role_q.bind(uuid_val);
+
+                if let Err(e) = upd_role_q.execute(&mut conn).await {
                     return (
                         StatusCode::INTERNAL_SERVER_ERROR,
                         Json(json!({ "error": e.to_string() })),
@@ -446,12 +542,11 @@ pub async fn update_user(
                 .into_response();
         }
 
-        if let Err(e) = sqlx::query("UPDATE users SET is_active = $1 WHERE id = $2")
-            .bind(is_active)
-            .bind(uuid_val)
-            .execute(&state.db_pool)
-            .await
-        {
+        let mut upd_active_q = Query::new("UPDATE dbo.users SET is_active = @P1 WHERE id = @P2");
+        upd_active_q.bind(is_active);
+        upd_active_q.bind(uuid_val);
+
+        if let Err(e) = upd_active_q.execute(&mut conn).await {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({ "error": e.to_string() })),
@@ -463,12 +558,12 @@ pub async fn update_user(
     if let Some(new_pass) = payload.password.filter(|p| !p.trim().is_empty()) {
         match hash_password(new_pass.trim()) {
             Ok(hashed) => {
-                if let Err(e) = sqlx::query("UPDATE users SET password_hash = $1 WHERE id = $2")
-                    .bind(&hashed)
-                    .bind(uuid_val)
-                    .execute(&state.db_pool)
-                    .await
-                {
+                let mut upd_pass_q =
+                    Query::new("UPDATE dbo.users SET password_hash = @P1 WHERE id = @P2");
+                upd_pass_q.bind(&hashed);
+                upd_pass_q.bind(uuid_val);
+
+                if let Err(e) = upd_pass_q.execute(&mut conn).await {
                     return (
                         StatusCode::INTERNAL_SERVER_ERROR,
                         Json(json!({ "error": e.to_string() })),
@@ -508,7 +603,7 @@ pub async fn delete_user(
         Err(resp) => return resp,
     };
 
-    let Ok(uuid_val) = Uuid::parse_str(&id) else {
+    let Ok(uuid_val) = Uuid::parse_str(id.trim()) else {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({ "error": "ID người dùng không hợp lệ" })),
@@ -524,13 +619,39 @@ pub async fn delete_user(
             .into_response();
     }
 
-    match sqlx::query("DELETE FROM users WHERE id = $1 AND owner_id = $2")
-        .bind(uuid_val)
-        .bind(tenant_id)
-        .execute(&state.db_pool)
-        .await
-    {
-        Ok(res) if res.rows_affected() > 0 => StatusCode::NO_CONTENT.into_response(),
+    let mut conn = match state.db_pool.get().await {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("Lỗi kết nối SQL Server: {}", e) })),
+            )
+                .into_response();
+        }
+    };
+
+    // Gỡ liên kết khóa ngoại trên các bảng có ON DELETE NO ACTION trước khi xóa tài khoản phụ
+    let cleanup_queries = [
+        "DELETE FROM dbo.guest_access WHERE guest_user_id = @P1 OR granted_by = @P1",
+        "UPDATE dbo.houses SET owner_id = @P2 WHERE owner_id = @P1",
+        "UPDATE dbo.devices SET owner_id = @P2 WHERE owner_id = @P1",
+        "UPDATE dbo.automations SET owner_id = @P2 WHERE owner_id = @P1",
+        "UPDATE dbo.ai_alerts SET owner_id = @P2 WHERE owner_id = @P1",
+        "UPDATE dbo.energy_logs SET owner_id = @P2 WHERE owner_id = @P1",
+    ];
+    for sql in cleanup_queries {
+        let mut q = Query::new(sql);
+        q.bind(uuid_val);
+        q.bind(tenant_id);
+        let _ = q.execute(&mut conn).await;
+    }
+
+    let mut del_q = Query::new("DELETE FROM dbo.users WHERE id = @P1 AND owner_id = @P2");
+    del_q.bind(uuid_val);
+    del_q.bind(tenant_id);
+
+    match del_q.execute(&mut conn).await {
+        Ok(res) if res.rows_affected().iter().sum::<u64>() > 0 => StatusCode::NO_CONTENT.into_response(),
         Ok(_) => (
             StatusCode::NOT_FOUND,
             Json(json!({ "error": "Không tìm thấy tài khoản trong gia đình của bạn" })),

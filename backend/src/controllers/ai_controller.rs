@@ -6,13 +6,13 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
-use sqlx::Row;
 use std::sync::Arc;
+use tiberius::Query;
 use uuid::Uuid;
 
 use crate::controllers::user_controller::{ensure_owner_or_admin, resolve_tenant_id};
 use crate::models::user::Claims;
-use crate::AppState;
+use crate::{AppState, SqlPool};
 
 #[derive(Deserialize, Default)]
 pub struct AnomalyPayload {
@@ -20,34 +20,36 @@ pub struct AnomalyPayload {
     pub sensor_id: Option<String>,
 }
 
-async fn ensure_ai_alerts_schema(pool: &sqlx::PgPool) {
-    let _ = sqlx::query(
+async fn ensure_ai_alerts_schema(pool: &SqlPool) {
+    let Ok(mut conn) = pool.get().await else {
+        return;
+    };
+
+    let init_queries = [
         r#"
-        CREATE TABLE IF NOT EXISTS ai_alerts (
-            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-            owner_id UUID REFERENCES users(id) ON DELETE CASCADE,
-            alert_type VARCHAR(100) NOT NULL DEFAULT 'ANOMALY',
-            title VARCHAR(150) NOT NULL DEFAULT 'Cảnh báo AI',
-            message TEXT NOT NULL,
-            severity VARCHAR(30) NOT NULL DEFAULT 'high',
-            created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
-        );
+        IF OBJECT_ID(N'dbo.ai_alerts', N'U') IS NULL
+        BEGIN
+            CREATE TABLE dbo.ai_alerts (
+                id UNIQUEIDENTIFIER PRIMARY KEY DEFAULT NEWID(),
+                device_id UNIQUEIDENTIFIER NULL,
+                owner_id UNIQUEIDENTIFIER NULL,
+                title NVARCHAR(200) NULL DEFAULT N'Cảnh báo AI',
+                alert_type NVARCHAR(50) NOT NULL DEFAULT N'ANOMALY',
+                severity NVARCHAR(20) NOT NULL DEFAULT N'HIGH',
+                message NVARCHAR(MAX) NOT NULL,
+                metadata NVARCHAR(MAX) NULL,
+                created_at DATETIMEOFFSET NOT NULL DEFAULT SYSDATETIMEOFFSET(),
+                CONSTRAINT FK_ai_alerts_users FOREIGN KEY (owner_id) REFERENCES dbo.users(id) ON DELETE CASCADE
+            );
+        END
         "#,
-    )
-    .execute(pool)
-    .await;
+        "IF COL_LENGTH(N'dbo.ai_alerts', N'owner_id') IS NULL ALTER TABLE dbo.ai_alerts ADD owner_id UNIQUEIDENTIFIER NULL",
+        "IF COL_LENGTH(N'dbo.ai_alerts', N'title') IS NULL ALTER TABLE dbo.ai_alerts ADD title NVARCHAR(200) NULL DEFAULT N'Cảnh báo AI'",
+    ];
 
-    let _ = sqlx::query(
-        "ALTER TABLE ai_alerts ADD COLUMN IF NOT EXISTS owner_id UUID REFERENCES users(id) ON DELETE CASCADE",
-    )
-    .execute(pool)
-    .await;
-
-    let _ = sqlx::query(
-        "ALTER TABLE ai_alerts ADD COLUMN IF NOT EXISTS title VARCHAR(150) DEFAULT 'Cảnh báo AI'",
-    )
-    .execute(pool)
-    .await;
+    for q in init_queries {
+        let _ = conn.execute(q, &[]).await;
+    }
 }
 
 // GET /api/v1/ai/alerts
@@ -62,35 +64,57 @@ pub async fn get_alerts(
         Err(resp) => return resp,
     };
 
-    let query = r#"
-        SELECT
-            id::text AS id,
-            COALESCE(alert_type, 'ANOMALY') AS alert_type,
-            COALESCE(title, 'Cảnh báo AI') AS title,
-            COALESCE(message, '') AS message,
-            COALESCE(severity, 'high') AS severity,
-            to_char(created_at AT TIME ZONE 'Asia/Ho_Chi_Minh', 'HH24:MI:SS DD/MM') AS created_at
-        FROM ai_alerts
-        WHERE owner_id = $1
+    let mut conn = match state.db_pool.get().await {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("Lỗi kết nối SQL Server: {}", e) })),
+            )
+                .into_response();
+        }
+    };
+
+    let sql = r#"
+        SELECT TOP 30
+            CAST(id AS NVARCHAR(36)) AS id,
+            COALESCE(alert_type, N'ANOMALY') AS alert_type,
+            COALESCE(title, N'Cảnh báo AI') AS title,
+            COALESCE(message, N'') AS message,
+            COALESCE(severity, N'high') AS severity,
+            FORMAT(created_at AT TIME ZONE 'SE Asia Standard Time', 'HH:mm:ss dd/MM') AS created_at
+        FROM dbo.ai_alerts
+        WHERE owner_id = @P1
         ORDER BY created_at DESC
-        LIMIT 30
     "#;
 
-    match sqlx::query(query)
-        .bind(tenant_id)
-        .fetch_all(&state.db_pool)
-        .await
-    {
-        Ok(rows) => {
+    let mut query = Query::new(sql);
+    query.bind(tenant_id);
+
+    let response = match query.query(&mut conn).await {
+        Ok(stream) => {
+            let rows = stream.into_first_result().await.unwrap_or_default();
             let alerts: Vec<Value> = rows
                 .into_iter()
                 .map(|row| {
-                    let id: String = row.try_get("id").unwrap_or_default();
-                    let alert_type: String = row.try_get("alert_type").unwrap_or_default();
-                    let title: String = row.try_get("title").unwrap_or_else(|_| "Cảnh báo AI".to_string());
-                    let message: String = row.try_get("message").unwrap_or_default();
-                    let severity: String = row.try_get("severity").unwrap_or_else(|_| "high".to_string());
-                    let created_at: String = row.try_get("created_at").unwrap_or_default();
+                    let id = row
+                        .get::<Uuid, _>("id")
+                        .map(|u| u.to_string())
+                        .unwrap_or_default();
+                    let alert_type = row
+                        .get::<&str, _>("alert_type")
+                        .unwrap_or("ANOMALY")
+                        .to_string();
+                    let title = row
+                        .get::<&str, _>("title")
+                        .unwrap_or("Cảnh báo AI")
+                        .to_string();
+                    let message = row.get::<&str, _>("message").unwrap_or("").to_string();
+                    let severity = row
+                        .get::<&str, _>("severity")
+                        .unwrap_or("high")
+                        .to_string();
+                    let created_at = row.get::<&str, _>("created_at").unwrap_or("").to_string();
 
                     json!({
                         "id": id,
@@ -110,7 +134,8 @@ pub async fn get_alerts(
             Json(json!({ "error": format!("Lỗi truy vấn cảnh báo AI: {}", e) })),
         )
             .into_response(),
-    }
+    };
+    response
 }
 
 // POST /api/v1/ai/simulate-anomaly
@@ -130,6 +155,17 @@ pub async fn simulate_anomaly(
 
     ensure_ai_alerts_schema(&state.db_pool).await;
 
+    let mut conn = match state.db_pool.get().await {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("Lỗi kết nối SQL Server: {}", e) })),
+            )
+                .into_response();
+        }
+    };
+
     let body = payload.map(|Json(p)| p).unwrap_or_default();
     let temperature = body.temperature.unwrap_or(65.0);
     let sensor_id = body
@@ -146,17 +182,25 @@ pub async fn simulate_anomaly(
     );
     let now_str = chrono::Local::now().format("%H:%M:%S %d/%m").to_string();
 
-    let _ = sqlx::query(
-        "INSERT INTO ai_alerts (id, owner_id, alert_type, title, message, severity)
-         VALUES ($1, $2, $3, $4, $5, 'high')",
-    )
-    .bind(alert_id)
-    .bind(tenant_id)
-    .bind(alert_type)
-    .bind(title)
-    .bind(&message)
-    .execute(&state.db_pool)
-    .await;
+    let mut insert_q = Query::new(
+        r#"
+        INSERT INTO dbo.ai_alerts (id, owner_id, alert_type, title, message, severity, created_at)
+        VALUES (@P1, @P2, @P3, @P4, @P5, N'high', SYSDATETIMEOFFSET())
+        "#,
+    );
+    insert_q.bind(alert_id);
+    insert_q.bind(tenant_id);
+    insert_q.bind(alert_type);
+    insert_q.bind(title);
+    insert_q.bind(&message);
+
+    if let Err(e) = insert_q.execute(&mut conn).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("Lỗi lưu cảnh báo AI: {}", e) })),
+        )
+            .into_response();
+    }
 
     let alert_msg = json!({
         "id": alert_id.to_string(),

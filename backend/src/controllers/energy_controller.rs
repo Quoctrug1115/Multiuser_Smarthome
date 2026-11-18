@@ -5,8 +5,8 @@ use axum::{
     Json,
 };
 use serde::{Deserialize, Serialize};
-use sqlx::Row;
 use std::sync::Arc;
+use tiberius::Query as TSqlQuery;
 
 use crate::controllers::user_controller::resolve_tenant_id;
 use crate::models::user::Claims;
@@ -62,16 +62,27 @@ pub async fn get_analytics(
         Err(resp) => return resp,
     };
 
-    // Đảm bảo bảng energy_logs có đầy đủ các cột cần thiết cho multi-tenant
+    let mut conn = match state.db_pool.get().await {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("Lỗi kết nối SQL Server: {}", e) })),
+            )
+                .into_response();
+        }
+    };
+
+    // Đảm bảo bảng dbo.energy_logs có đầy đủ các cột cần thiết cho multi-tenant
     for alter_sql in [
-        "ALTER TABLE energy_logs ADD COLUMN IF NOT EXISTS owner_id UUID",
-        "ALTER TABLE energy_logs ADD COLUMN IF NOT EXISTS power_watt DOUBLE PRECISION DEFAULT 0",
-        "ALTER TABLE energy_logs ADD COLUMN IF NOT EXISTS kwh_consumed DOUBLE PRECISION DEFAULT 0",
-        "ALTER TABLE energy_logs ADD COLUMN IF NOT EXISTS kwh DOUBLE PRECISION DEFAULT 0",
-        "ALTER TABLE energy_logs ADD COLUMN IF NOT EXISTS time TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP",
-        "ALTER TABLE energy_logs ADD COLUMN IF NOT EXISTS recorded_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP",
+        "IF COL_LENGTH(N'dbo.energy_logs', N'owner_id') IS NULL ALTER TABLE dbo.energy_logs ADD owner_id UNIQUEIDENTIFIER NULL",
+        "IF COL_LENGTH(N'dbo.energy_logs', N'power_watt') IS NULL ALTER TABLE dbo.energy_logs ADD power_watt FLOAT NOT NULL DEFAULT 0",
+        "IF COL_LENGTH(N'dbo.energy_logs', N'kwh_consumed') IS NULL ALTER TABLE dbo.energy_logs ADD kwh_consumed FLOAT NOT NULL DEFAULT 0",
+        "IF COL_LENGTH(N'dbo.energy_logs', N'kwh') IS NULL ALTER TABLE dbo.energy_logs ADD kwh FLOAT NOT NULL DEFAULT 0",
+        "IF COL_LENGTH(N'dbo.energy_logs', N'time') IS NULL ALTER TABLE dbo.energy_logs ADD [time] DATETIMEOFFSET NOT NULL DEFAULT SYSDATETIMEOFFSET()",
+        "IF COL_LENGTH(N'dbo.energy_logs', N'recorded_at') IS NULL ALTER TABLE dbo.energy_logs ADD recorded_at DATETIMEOFFSET NOT NULL DEFAULT SYSDATETIMEOFFSET()",
     ] {
-        let _ = sqlx::query(alter_sql).execute(&state.db_pool).await;
+        let _ = conn.execute(alter_sql, &[]).await;
     }
 
     let raw_period = params
@@ -82,97 +93,93 @@ pub async fn get_analytics(
         .trim()
         .to_lowercase();
 
-    let (series_sql, interval_filter) = match raw_period.as_str() {
-        "day" | "ngay" | "today" | "24h" => (
-            r#"
-            WITH tenant_logs AS (
+    let is_day = matches!(raw_period.as_str(), "day" | "ngay" | "today" | "24h");
+    let lookback_days: i32 = match raw_period.as_str() {
+        "day" | "ngay" | "today" | "24h" => 1,
+        "month" | "thang" | "30d" => 30,
+        _ => 7,
+    };
+
+    let series_query = if is_day {
+        let sql = r#"
+            WITH nums AS (
+                SELECT 0 AS n
+                UNION ALL
+                SELECT n + 1 FROM nums WHERE n < 23
+            ),
+            hours AS (
+                SELECT DATEADD(
+                    HOUR,
+                    n,
+                    CAST(CAST(SYSDATETIMEOFFSET() AT TIME ZONE 'SE Asia Standard Time' AS DATE) AS DATETIME2)
+                ) AS hr
+                FROM nums
+            ),
+            tenant_logs AS (
                 SELECT
-                    COALESCE(e.time, e.recorded_at) AS log_time,
-                    e.device_id,
+                    CAST(COALESCE(e.[time], e.recorded_at) AT TIME ZONE 'SE Asia Standard Time' AS DATETIME2) AS local_time,
                     COALESCE(e.power_watt, 0.0) AS power_watt,
                     COALESCE(e.kwh_consumed, e.kwh, 0.0) AS kwh_val
-                FROM energy_logs e
-                LEFT JOIN devices d ON e.device_id::text = d.id::text
-                LEFT JOIN rooms r ON d.room_id = r.id
-                LEFT JOIN houses h ON r.house_id = h.id
-                WHERE e.owner_id = $1 OR d.owner_id = $1 OR h.owner_id = $1
+                FROM dbo.energy_logs e
+                LEFT JOIN dbo.devices d ON e.device_id = d.id
+                LEFT JOIN dbo.rooms r ON d.room_id = r.id
+                LEFT JOIN dbo.houses h ON r.house_id = h.id
+                WHERE e.owner_id = @P1 OR d.owner_id = @P1 OR h.owner_id = @P1
             )
-            SELECT 
-                TO_CHAR(h.hr, 'HH24:00') AS label,
-                COALESCE(SUM(e.kwh_val), 0.0)::DOUBLE PRECISION AS period_kwh,
-                COALESCE(MAX(e.power_watt), 0.0)::DOUBLE PRECISION AS peak_watt
-            FROM generate_series(
-                DATE_TRUNC('day', CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Ho_Chi_Minh'),
-                DATE_TRUNC('day', CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Ho_Chi_Minh') + INTERVAL '23 hours',
-                INTERVAL '1 hour'
-            ) AS h(hr)
-            LEFT JOIN tenant_logs e 
-                ON DATE_TRUNC('hour', e.log_time AT TIME ZONE 'Asia/Ho_Chi_Minh') = h.hr
-            GROUP BY h.hr
-            ORDER BY h.hr ASC
-            "#,
-            "INTERVAL '1 day'",
-        ),
-        "month" | "thang" | "30d" => (
-            r#"
-            WITH tenant_logs AS (
+            SELECT
+                FORMAT(hr.hr, 'HH:00') AS label,
+                CAST(COALESCE(SUM(e.kwh_val), 0.0) AS FLOAT) AS period_kwh,
+                CAST(COALESCE(MAX(e.power_watt), 0.0) AS FLOAT) AS peak_watt
+            FROM hours hr
+            LEFT JOIN tenant_logs e
+                ON e.local_time >= hr.hr AND e.local_time < DATEADD(HOUR, 1, hr.hr)
+            GROUP BY hr.hr
+            ORDER BY hr.hr ASC
+        "#;
+        let mut q = TSqlQuery::new(sql);
+        q.bind(tenant_id);
+        q
+    } else {
+        let span_offset: i32 = lookback_days - 1;
+        let sql = r#"
+            WITH nums AS (
+                SELECT 0 AS n
+                UNION ALL
+                SELECT n + 1 FROM nums WHERE n < @P2
+            ),
+            days AS (
+                SELECT DATEADD(
+                    DAY,
+                    n - @P2,
+                    CAST(SYSDATETIMEOFFSET() AT TIME ZONE 'SE Asia Standard Time' AS DATE)
+                ) AS day_date
+                FROM nums
+            ),
+            tenant_logs AS (
                 SELECT
-                    COALESCE(e.time, e.recorded_at) AS log_time,
-                    e.device_id,
+                    CAST(COALESCE(e.[time], e.recorded_at) AT TIME ZONE 'SE Asia Standard Time' AS DATE) AS local_date,
                     COALESCE(e.power_watt, 0.0) AS power_watt,
                     COALESCE(e.kwh_consumed, e.kwh, 0.0) AS kwh_val
-                FROM energy_logs e
-                LEFT JOIN devices d ON e.device_id::text = d.id::text
-                LEFT JOIN rooms r ON d.room_id = r.id
-                LEFT JOIN houses h ON r.house_id = h.id
-                WHERE e.owner_id = $1 OR d.owner_id = $1 OR h.owner_id = $1
+                FROM dbo.energy_logs e
+                LEFT JOIN dbo.devices d ON e.device_id = d.id
+                LEFT JOIN dbo.rooms r ON d.room_id = r.id
+                LEFT JOIN dbo.houses h ON r.house_id = h.id
+                WHERE e.owner_id = @P1 OR d.owner_id = @P1 OR h.owner_id = @P1
             )
-            SELECT 
-                TO_CHAR(d.day, 'DD/MM') AS label,
-                COALESCE(SUM(e.kwh_val), 0.0)::DOUBLE PRECISION AS period_kwh,
-                COALESCE(MAX(e.power_watt), 0.0)::DOUBLE PRECISION AS peak_watt
-            FROM generate_series(
-                (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Ho_Chi_Minh')::date - INTERVAL '29 days',
-                (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Ho_Chi_Minh')::date,
-                INTERVAL '1 day'
-            ) AS d(day)
-            LEFT JOIN tenant_logs e 
-                ON DATE(e.log_time AT TIME ZONE 'Asia/Ho_Chi_Minh') = DATE(d.day)
-            GROUP BY d.day
-            ORDER BY d.day ASC
-            "#,
-            "INTERVAL '30 days'",
-        ),
-        _ => (
-            r#"
-            WITH tenant_logs AS (
-                SELECT
-                    COALESCE(e.time, e.recorded_at) AS log_time,
-                    e.device_id,
-                    COALESCE(e.power_watt, 0.0) AS power_watt,
-                    COALESCE(e.kwh_consumed, e.kwh, 0.0) AS kwh_val
-                FROM energy_logs e
-                LEFT JOIN devices d ON e.device_id::text = d.id::text
-                LEFT JOIN rooms r ON d.room_id = r.id
-                LEFT JOIN houses h ON r.house_id = h.id
-                WHERE e.owner_id = $1 OR d.owner_id = $1 OR h.owner_id = $1
-            )
-            SELECT 
-                TO_CHAR(d.day, 'DD/MM') AS label,
-                COALESCE(SUM(e.kwh_val), 0.0)::DOUBLE PRECISION AS period_kwh,
-                COALESCE(MAX(e.power_watt), 0.0)::DOUBLE PRECISION AS peak_watt
-            FROM generate_series(
-                (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Ho_Chi_Minh')::date - INTERVAL '6 days',
-                (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Ho_Chi_Minh')::date,
-                INTERVAL '1 day'
-            ) AS d(day)
-            LEFT JOIN tenant_logs e 
-                ON DATE(e.log_time AT TIME ZONE 'Asia/Ho_Chi_Minh') = DATE(d.day)
-            GROUP BY d.day
-            ORDER BY d.day ASC
-            "#,
-            "INTERVAL '7 days'",
-        ),
+            SELECT
+                FORMAT(d.day_date, 'dd/MM') AS label,
+                CAST(COALESCE(SUM(e.kwh_val), 0.0) AS FLOAT) AS period_kwh,
+                CAST(COALESCE(MAX(e.power_watt), 0.0) AS FLOAT) AS peak_watt
+            FROM days d
+            LEFT JOIN tenant_logs e
+                ON e.local_date = d.day_date
+            GROUP BY d.day_date
+            ORDER BY d.day_date ASC
+        "#;
+        let mut q = TSqlQuery::new(sql);
+        q.bind(tenant_id);
+        q.bind(span_offset);
+        q
     };
 
     let mut labels = Vec::new();
@@ -181,18 +188,14 @@ pub async fn get_analytics(
     let mut total_kwh: f64 = 0.0;
     let mut peak_watt: f64 = 0.0;
 
-    match sqlx::query(series_sql)
-        .bind(tenant_id)
-        .fetch_all(&state.db_pool)
-        .await
-    {
-        Ok(records) => {
+    match series_query.query(&mut conn).await {
+        Ok(stream) => {
+            let records = stream.into_first_result().await.unwrap_or_default();
             for row in records {
-                let kwh: f64 = row.try_get("period_kwh").unwrap_or(0.0);
-                let watt: f64 = row.try_get("peak_watt").unwrap_or(0.0);
-                let label: String = row.try_get("label").unwrap_or_default();
+                let kwh: f64 = row.get::<f64, _>("period_kwh").unwrap_or(0.0);
+                let watt: f64 = row.get::<f64, _>("peak_watt").unwrap_or(0.0);
+                let label: String = row.get::<&str, _>("label").unwrap_or("").to_string();
 
-                // Giữ 4 chữ số thập phân để hiển thị nhạy ngay cả với mức tiêu thụ nhỏ theo từng phút
                 let rounded_kwh = (kwh * 10000.0).round() / 10000.0;
                 let rounded_watt = (watt * 10.0).round() / 10.0;
 
@@ -211,7 +214,7 @@ pub async fn get_analytics(
             }
         }
         Err(err) => {
-            eprintln!("❌ Lỗi truy vấn Database Energy: {:?}", err);
+            eprintln!("Lỗi truy vấn Database Energy: {:?}", err);
             labels = vec![
                 "T2".into(),
                 "T3".into(),
@@ -225,41 +228,46 @@ pub async fn get_analytics(
         }
     }
 
-    // Lấy danh sách bản ghi chi tiết thuộc đúng hộ gia đình (tenant_id)
-    let logs_sql = format!(
-        r#"
-        SELECT * FROM (
-            SELECT 
-                COALESCE(e.time, e.recorded_at) AS log_time,
-                TO_CHAR(COALESCE(e.time, e.recorded_at) AT TIME ZONE 'Asia/Ho_Chi_Minh', 'HH24:MI') AS formatted_time,
-                COALESCE(e.device_id::text, '') AS device_id,
-                COALESCE(e.power_watt, 0.0)::DOUBLE PRECISION AS power_watt,
-                COALESCE(e.kwh_consumed, e.kwh, 0.0)::DOUBLE PRECISION AS kwh_consumed
-            FROM energy_logs e
-            LEFT JOIN devices d ON e.device_id::text = d.id::text
-            LEFT JOIN rooms r ON d.room_id = r.id
-            LEFT JOIN houses h ON r.house_id = h.id
-            WHERE (e.owner_id = $1 OR d.owner_id = $1 OR h.owner_id = $1)
-              AND COALESCE(e.time, e.recorded_at) >= NOW() - {}
-            ORDER BY COALESCE(e.time, e.recorded_at) DESC
-            LIMIT 10
+    // Lấy 10 bản ghi chi tiết gần nhất thuộc đúng hộ gia đình (tenant_id)
+    let logs_sql = r#"
+        SELECT
+            formatted_time,
+            device_id,
+            power_watt,
+            kwh_consumed
+        FROM (
+            SELECT TOP 10
+                COALESCE(e.[time], e.recorded_at) AS log_time,
+                FORMAT(COALESCE(e.[time], e.recorded_at) AT TIME ZONE 'SE Asia Standard Time', 'HH:mm') AS formatted_time,
+                COALESCE(CAST(e.device_id AS NVARCHAR(36)), N'') AS device_id,
+                CAST(COALESCE(e.power_watt, 0.0) AS FLOAT) AS power_watt,
+                CAST(COALESCE(e.kwh_consumed, e.kwh, 0.0) AS FLOAT) AS kwh_consumed
+            FROM dbo.energy_logs e
+            LEFT JOIN dbo.devices d ON e.device_id = d.id
+            LEFT JOIN dbo.rooms r ON d.room_id = r.id
+            LEFT JOIN dbo.houses h ON r.house_id = h.id
+            WHERE (e.owner_id = @P1 OR d.owner_id = @P1 OR h.owner_id = @P1)
+              AND COALESCE(e.[time], e.recorded_at) >= DATEADD(DAY, -@P2, SYSDATETIMEOFFSET())
+            ORDER BY COALESCE(e.[time], e.recorded_at) DESC
         ) sub
         ORDER BY log_time ASC
-        "#,
-        interval_filter
-    );
+    "#;
+
+    let mut logs_q = TSqlQuery::new(logs_sql);
+    logs_q.bind(tenant_id);
+    logs_q.bind(lookback_days);
 
     let mut logs = Vec::new();
-    if let Ok(log_rows) = sqlx::query(&logs_sql)
-        .bind(tenant_id)
-        .fetch_all(&state.db_pool)
-        .await
-    {
+    if let Ok(stream) = logs_q.query(&mut conn).await {
+        let log_rows = stream.into_first_result().await.unwrap_or_default();
         for r in log_rows {
-            let formatted_time: String = r.try_get("formatted_time").unwrap_or_default();
-            let device_id: String = r.try_get("device_id").unwrap_or_default();
-            let watt: f64 = r.try_get("power_watt").unwrap_or(0.0);
-            let kwh: f64 = r.try_get("kwh_consumed").unwrap_or(0.0);
+            let formatted_time = r
+                .get::<&str, _>("formatted_time")
+                .unwrap_or("")
+                .to_string();
+            let device_id = r.get::<&str, _>("device_id").unwrap_or("").to_string();
+            let watt = r.get::<f64, _>("power_watt").unwrap_or(0.0);
+            let kwh = r.get::<f64, _>("kwh_consumed").unwrap_or(0.0);
             let rounded_kwh = (kwh * 10000.0).round() / 10000.0;
 
             logs.push(EnergyLogItem {
