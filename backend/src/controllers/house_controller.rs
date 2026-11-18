@@ -1,177 +1,279 @@
 use axum::{
     extract::{Path, State},
     http::StatusCode,
+    response::IntoResponse,
     Json,
 };
+use serde::Deserialize;
+use serde_json::{json, Value};
+use sqlx::Row;
 use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::models::house::{CreateHouseDto, House};
-use crate::models::room::{CreateRoomDto, Room};
+use crate::controllers::user_controller::{ensure_owner_or_admin, resolve_tenant_id};
 use crate::models::user::Claims;
-use crate::services::rbac_service::check_permission;
 use crate::AppState;
 
-// ==================== HOUSES ====================
-
-pub async fn get_houses(
-    State(state): State<Arc<AppState>>,
-) -> Result<Json<Vec<House>>, (StatusCode, String)> {
-    let houses = sqlx::query_as::<_, House>(
-        "SELECT id, name, address, owner_id, created_at FROM houses ORDER BY created_at ASC",
-    )
-    .fetch_all(&state.db_pool)
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    Ok(Json(houses))
+#[derive(Deserialize)]
+pub struct CreateHousePayload {
+    pub name: String,
+    pub address: Option<String>,
+    #[allow(dead_code)]
+    pub owner_id: Option<String>,
 }
 
+#[derive(Deserialize)]
+pub struct UpdateHousePayload {
+    pub name: Option<String>,
+    pub address: Option<String>,
+}
+
+// GET /api/v1/houses
+pub async fn get_houses(
+    claims: Claims,
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    let tenant_id = match resolve_tenant_id(&state.db_pool, claims.sub).await {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
+
+    let query = r#"
+        SELECT id, name, COALESCE(address, '') AS address, owner_id
+        FROM houses
+        WHERE owner_id = $1
+        ORDER BY name ASC
+    "#;
+
+    match sqlx::query(query)
+        .bind(tenant_id)
+        .fetch_all(&state.db_pool)
+        .await
+    {
+        Ok(rows) => {
+            let houses: Vec<Value> = rows
+                .into_iter()
+                .map(|row| {
+                    let id: Uuid = row.get("id");
+                    let name: String = row.get("name");
+                    let address: String = row.try_get("address").unwrap_or_default();
+                    let owner_id: Option<Uuid> = row.try_get("owner_id").unwrap_or(None);
+
+                    json!({
+                        "id": id.to_string(),
+                        "name": name,
+                        "address": address,
+                        "owner_id": owner_id.map(|u| u.to_string())
+                    })
+                })
+                .collect();
+
+            (StatusCode::OK, Json(json!(houses))).into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("Lỗi truy vấn danh sách nhà: {}", e) })),
+        )
+            .into_response(),
+    }
+}
+
+// POST /api/v1/houses
 pub async fn create_house(
     claims: Claims,
     State(state): State<Arc<AppState>>,
-    Json(payload): Json<CreateHouseDto>,
-) -> Result<(StatusCode, Json<House>), (StatusCode, String)> {
-    check_permission(&state.db_pool, &claims, &["Owner", "Admin", "owner", "admin"], None)
-        .await
-        .map_err(|e| (StatusCode::FORBIDDEN, e))?;
+    Json(payload): Json<CreateHousePayload>,
+) -> impl IntoResponse {
+    if let Err(resp) = ensure_owner_or_admin(&state.db_pool, &claims).await {
+        return resp;
+    }
 
-    let house = sqlx::query_as::<_, House>(
-        "INSERT INTO houses (name, address, owner_id) VALUES ($1, $2, $3) RETURNING *",
+    let tenant_id = match resolve_tenant_id(&state.db_pool, claims.sub).await {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
+
+    let name = payload.name.trim().to_string();
+    if name.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "Tên ngôi nhà không được để trống" })),
+        )
+            .into_response();
+    }
+
+    let address = payload.address.unwrap_or_default().trim().to_string();
+    let house_id = Uuid::new_v4();
+
+    let res = sqlx::query(
+        "INSERT INTO houses (id, name, address, owner_id) VALUES ($1, $2, $3, $4)",
     )
-    .bind(payload.name.trim())
-    .bind(&payload.address)
-    .bind(claims.sub)
-    .fetch_one(&state.db_pool)
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    .bind(house_id)
+    .bind(&name)
+    .bind(&address)
+    .bind(tenant_id)
+    .execute(&state.db_pool)
+    .await;
 
-    Ok((StatusCode::CREATED, Json(house)))
+    match res {
+        Ok(_) => (
+            StatusCode::CREATED,
+            Json(json!({
+                "id": house_id.to_string(),
+                "name": name,
+                "address": address,
+                "owner_id": tenant_id.to_string()
+            })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("Không thể tạo ngôi nhà: {}", e) })),
+        )
+            .into_response(),
+    }
 }
 
+// PUT /api/v1/houses/{id}
 pub async fn update_house(
     claims: Claims,
+    Path(id): Path<String>,
     State(state): State<Arc<AppState>>,
-    Path(id): Path<Uuid>,
-    Json(payload): Json<CreateHouseDto>,
-) -> Result<Json<House>, (StatusCode, String)> {
-    check_permission(&state.db_pool, &claims, &["Owner", "Admin", "owner", "admin"], None)
+    Json(payload): Json<UpdateHousePayload>,
+) -> impl IntoResponse {
+    if let Err(resp) = ensure_owner_or_admin(&state.db_pool, &claims).await {
+        return resp;
+    }
+
+    let tenant_id = match resolve_tenant_id(&state.db_pool, claims.sub).await {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
+
+    let Ok(house_uuid) = Uuid::parse_str(&id) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "ID ngôi nhà không hợp lệ" })),
+        )
+            .into_response();
+    };
+
+    let current = sqlx::query("SELECT name, COALESCE(address, '') AS address FROM houses WHERE id = $1 AND owner_id = $2")
+        .bind(house_uuid)
+        .bind(tenant_id)
+        .fetch_optional(&state.db_pool)
+        .await;
+
+    let row = match current {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "Không tìm thấy ngôi nhà thuộc quyền quản lý của bạn" })),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": e.to_string() })),
+            )
+                .into_response();
+        }
+    };
+
+    let old_name: String = row.get("name");
+    let old_address: String = row.try_get("address").unwrap_or_default();
+
+    let new_name = payload
+        .name
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(old_name);
+    let new_address = payload
+        .address
+        .map(|s| s.trim().to_string())
+        .unwrap_or(old_address);
+
+    match sqlx::query("UPDATE houses SET name = $1, address = $2 WHERE id = $3 AND owner_id = $4")
+        .bind(&new_name)
+        .bind(&new_address)
+        .bind(house_uuid)
+        .bind(tenant_id)
+        .execute(&state.db_pool)
         .await
-        .map_err(|e| (StatusCode::FORBIDDEN, e))?;
-
-    let house = sqlx::query_as::<_, House>(
-        "UPDATE houses SET name = $1, address = $2 WHERE id = $3 RETURNING *",
-    )
-    .bind(payload.name.trim())
-    .bind(&payload.address)
-    .bind(id)
-    .fetch_optional(&state.db_pool)
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-    .ok_or_else(|| (StatusCode::NOT_FOUND, "Không tìm thấy ngôi nhà".to_string()))?;
-
-    Ok(Json(house))
+    {
+        Ok(_) => (
+            StatusCode::OK,
+            Json(json!({
+                "id": house_uuid.to_string(),
+                "name": new_name,
+                "address": new_address,
+                "owner_id": tenant_id.to_string()
+            })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("Lỗi cập nhật ngôi nhà: {}", e) })),
+        )
+            .into_response(),
+    }
 }
 
+// DELETE /api/v1/houses/{id}
 pub async fn delete_house(
     claims: Claims,
+    Path(id): Path<String>,
     State(state): State<Arc<AppState>>,
-    Path(id): Path<Uuid>,
-) -> Result<StatusCode, (StatusCode, String)> {
-    check_permission(&state.db_pool, &claims, &["Owner", "Admin", "owner", "admin"], None)
-        .await
-        .map_err(|e| (StatusCode::FORBIDDEN, e))?;
+) -> impl IntoResponse {
+    if let Err(resp) = ensure_owner_or_admin(&state.db_pool, &claims).await {
+        return resp;
+    }
 
-    sqlx::query("DELETE FROM houses WHERE id = $1")
-        .bind(id)
+    let tenant_id = match resolve_tenant_id(&state.db_pool, claims.sub).await {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
+
+    let Ok(house_uuid) = Uuid::parse_str(&id) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "ID ngôi nhà không hợp lệ" })),
+        )
+            .into_response();
+    };
+
+    // Gỡ liên kết phòng khỏi thiết bị trước khi xóa phòng & nhà để tránh lỗi khóa ngoại
+    let _ = sqlx::query(
+        "UPDATE devices SET room_id = NULL
+         WHERE room_id IN (SELECT id FROM rooms WHERE house_id = $1)",
+    )
+    .bind(house_uuid)
+    .execute(&state.db_pool)
+    .await;
+
+    let _ = sqlx::query("DELETE FROM rooms WHERE house_id = $1")
+        .bind(house_uuid)
+        .execute(&state.db_pool)
+        .await;
+
+    match sqlx::query("DELETE FROM houses WHERE id = $1 AND owner_id = $2")
+        .bind(house_uuid)
+        .bind(tenant_id)
         .execute(&state.db_pool)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    Ok(StatusCode::NO_CONTENT)
-}
-
-// ==================== ROOMS ====================
-
-pub async fn get_rooms(
-    State(state): State<Arc<AppState>>,
-) -> Result<Json<Vec<Room>>, (StatusCode, String)> {
-    let rooms = sqlx::query_as::<_, Room>(
-        r#"
-        SELECT r.id, r.house_id, h.name AS house_name, r.name, COALESCE(r.floor, 1) AS floor
-        FROM rooms r
-        LEFT JOIN houses h ON r.house_id = h.id
-        ORDER BY r.floor ASC, r.name ASC
-        "#,
-    )
-    .fetch_all(&state.db_pool)
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    Ok(Json(rooms))
-}
-
-pub async fn create_room(
-    claims: Claims,
-    State(state): State<Arc<AppState>>,
-    Json(payload): Json<CreateRoomDto>,
-) -> Result<(StatusCode, Json<Room>), (StatusCode, String)> {
-    check_permission(&state.db_pool, &claims, &["Owner", "Admin", "owner", "admin"], None)
-        .await
-        .map_err(|e| (StatusCode::FORBIDDEN, e))?;
-
-    let room = sqlx::query_as::<_, Room>(
-        "INSERT INTO rooms (house_id, name, floor) VALUES ($1, $2, $3) RETURNING *",
-    )
-    .bind(payload.house_id)
-    .bind(payload.name.trim())
-    .bind(payload.floor)
-    .fetch_one(&state.db_pool)
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    Ok((StatusCode::CREATED, Json(room)))
-}
-
-pub async fn update_room(
-    claims: Claims,
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<Uuid>,
-    Json(payload): Json<CreateRoomDto>,
-) -> Result<Json<Room>, (StatusCode, String)> {
-    check_permission(&state.db_pool, &claims, &["Owner", "Admin", "owner", "admin"], None)
-        .await
-        .map_err(|e| (StatusCode::FORBIDDEN, e))?;
-
-    let room = sqlx::query_as::<_, Room>(
-        "UPDATE rooms SET house_id = $1, name = $2, floor = $3 WHERE id = $4 RETURNING *",
-    )
-    .bind(payload.house_id)
-    .bind(payload.name.trim())
-    .bind(payload.floor)
-    .bind(id)
-    .fetch_optional(&state.db_pool)
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-    .ok_or_else(|| (StatusCode::NOT_FOUND, "Không tìm thấy phòng".to_string()))?;
-
-    Ok(Json(room))
-}
-
-pub async fn delete_room(
-    claims: Claims,
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<Uuid>,
-) -> Result<StatusCode, (StatusCode, String)> {
-    check_permission(&state.db_pool, &claims, &["Owner", "Admin", "owner", "admin"], None)
-        .await
-        .map_err(|e| (StatusCode::FORBIDDEN, e))?;
-
-    sqlx::query("DELETE FROM rooms WHERE id = $1")
-        .bind(id)
-        .execute(&state.db_pool)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    Ok(StatusCode::NO_CONTENT)
+    {
+        Ok(res) if res.rows_affected() > 0 => StatusCode::NO_CONTENT.into_response(),
+        Ok(_) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "Không tìm thấy ngôi nhà thuộc quyền quản lý của bạn" })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("Lỗi xóa ngôi nhà: {}", e) })),
+        )
+            .into_response(),
+    }
 }

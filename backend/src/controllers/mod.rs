@@ -6,3 +6,4 @@ pub mod automation_controller;
 pub mod energy_controller;
 pub mod guest_controller;
 pub mod user_controller;
+pub mod room_controller;

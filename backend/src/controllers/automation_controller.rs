@@ -9,6 +9,8 @@ use sqlx::Row;
 use std::sync::Arc;
 use uuid::Uuid;
 
+use crate::controllers::user_controller::{ensure_owner_or_admin, resolve_tenant_id};
+use crate::models::user::Claims;
 use crate::AppState;
 
 async fn ensure_automations_schema(pool: &sqlx::PgPool) {
@@ -16,6 +18,7 @@ async fn ensure_automations_schema(pool: &sqlx::PgPool) {
         r#"
         CREATE TABLE IF NOT EXISTS automations (
             id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            owner_id UUID REFERENCES users(id) ON DELETE CASCADE,
             name VARCHAR(150) NOT NULL,
             condition_text TEXT DEFAULT '',
             action_text TEXT DEFAULT '',
@@ -33,6 +36,7 @@ async fn ensure_automations_schema(pool: &sqlx::PgPool) {
     .await;
 
     let migrations = [
+        "ALTER TABLE automations ADD COLUMN IF NOT EXISTS owner_id UUID REFERENCES users(id) ON DELETE CASCADE",
         "ALTER TABLE automations ADD COLUMN IF NOT EXISTS condition_text TEXT DEFAULT ''",
         "ALTER TABLE automations ADD COLUMN IF NOT EXISTS action_text TEXT DEFAULT ''",
         "ALTER TABLE automations ADD COLUMN IF NOT EXISTS condition_type VARCHAR(50) DEFAULT 'temperature'",
@@ -102,10 +106,19 @@ fn parse_condition_text(text: &str) -> (String, String, f64) {
 }
 
 // GET /api/v1/automations
-pub async fn get_automations(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+pub async fn get_automations(
+    claims: Claims,
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
     ensure_automations_schema(&state.db_pool).await;
 
-    let rows = match sqlx::query("SELECT * FROM automations")
+    let tenant_id = match resolve_tenant_id(&state.db_pool, claims.sub).await {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
+
+    let rows = match sqlx::query("SELECT * FROM automations WHERE owner_id = $1")
+        .bind(tenant_id)
         .fetch_all(&state.db_pool)
         .await
     {
@@ -187,11 +200,22 @@ pub async fn get_automations(State(state): State<Arc<AppState>>) -> impl IntoRes
 
     (StatusCode::OK, Json(list)).into_response()
 }
+
 // POST /api/v1/automations
 pub async fn create_automation(
+    claims: Claims,
     State(state): State<Arc<AppState>>,
     Json(payload): Json<Value>,
 ) -> impl IntoResponse {
+    if let Err(resp) = ensure_owner_or_admin(&state.db_pool, &claims).await {
+        return resp;
+    }
+
+    let tenant_id = match resolve_tenant_id(&state.db_pool, claims.sub).await {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
+
     ensure_automations_schema(&state.db_pool).await;
 
     let id = Uuid::new_v4();
@@ -227,7 +251,7 @@ pub async fn create_automation(
         "ON".to_string()
     };
 
-    // Tự động tìm device_id tương ứng trong bảng devices dựa theo action_text
+    // Chỉ tìm device_id trong phạm vi thiết bị thuộc đúng hộ gia đình (tenant_id)
     let mut target_device_id = payload
         .get("device_id")
         .and_then(|v| v.as_str())
@@ -237,7 +261,16 @@ pub async fn create_automation(
 
     if target_device_id.is_empty() {
         let act_lower = action_text.to_lowercase();
-        if let Ok(dev_rows) = sqlx::query("SELECT id::text AS id, name, device_type, mqtt_topic FROM devices")
+        let dev_query = r#"
+            SELECT d.id::text AS id, d.name, d.device_type, d.mqtt_topic
+            FROM devices d
+            LEFT JOIN rooms r ON d.room_id = r.id
+            LEFT JOIN houses h ON r.house_id = h.id
+            WHERE d.owner_id = $1 OR h.owner_id = $1
+        "#;
+
+        if let Ok(dev_rows) = sqlx::query(dev_query)
+            .bind(tenant_id)
             .fetch_all(&state.db_pool)
             .await
         {
@@ -259,8 +292,8 @@ pub async fn create_automation(
 
     let insert_res = sqlx::query(
         r#"
-        INSERT INTO automations (id, name, condition_text, action_text, condition_type, operator, threshold, device_id, action, is_active)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, TRUE)
+        INSERT INTO automations (id, name, condition_text, action_text, condition_type, operator, threshold, device_id, action, owner_id, is_active)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, TRUE)
         "#,
     )
     .bind(id)
@@ -272,6 +305,7 @@ pub async fn create_automation(
     .bind(parsed_val)
     .bind(&target_device_id)
     .bind(&action_upper)
+    .bind(tenant_id)
     .execute(&state.db_pool)
     .await;
 
@@ -317,17 +351,34 @@ pub async fn create_automation(
         }
     }
 }
+
 // DELETE /api/v1/automations/{id}
 pub async fn delete_automation(
+    claims: Claims,
     Path(id): Path<String>,
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
-    match sqlx::query("DELETE FROM automations WHERE id::text = $1")
+    if let Err(resp) = ensure_owner_or_admin(&state.db_pool, &claims).await {
+        return resp;
+    }
+
+    let tenant_id = match resolve_tenant_id(&state.db_pool, claims.sub).await {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
+
+    match sqlx::query("DELETE FROM automations WHERE id::text = $1 AND owner_id = $2")
         .bind(id.trim())
+        .bind(tenant_id)
         .execute(&state.db_pool)
         .await
     {
-        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Ok(res) if res.rows_affected() > 0 => StatusCode::NO_CONTENT.into_response(),
+        Ok(_) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "Không tìm thấy kịch bản thuộc quyền quản lý của bạn" })),
+        )
+            .into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": e.to_string() })),
@@ -338,11 +389,17 @@ pub async fn delete_automation(
 
 // POST/PUT/PATCH /api/v1/automations/{id}/toggle hoặc PUT/PATCH /api/v1/automations/{id}
 pub async fn toggle_automation(
+    claims: Claims,
     Path(id): Path<String>,
     State(state): State<Arc<AppState>>,
     body: axum::body::Bytes,
 ) -> impl IntoResponse {
     ensure_automations_schema(&state.db_pool).await;
+
+    let tenant_id = match resolve_tenant_id(&state.db_pool, claims.sub).await {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
 
     let payload = serde_json::from_slice::<Value>(&body).ok();
     let explicit_state = payload.as_ref().and_then(|v| {
@@ -354,28 +411,52 @@ pub async fn toggle_automation(
     let new_active = match explicit_state {
         Some(val) => val,
         None => {
-            let current: bool = sqlx::query_scalar(
-                "SELECT COALESCE(is_active, TRUE) FROM automations WHERE id::text = $1",
+            let current: Option<bool> = sqlx::query_scalar(
+                "SELECT COALESCE(is_active, TRUE) FROM automations WHERE id::text = $1 AND owner_id = $2",
             )
             .bind(id.trim())
+            .bind(tenant_id)
             .fetch_optional(&state.db_pool)
             .await
-            .unwrap_or(Some(true))
-            .unwrap_or(true);
-            !current
+            .unwrap_or(None);
+
+            match current {
+                Some(cur) => !cur,
+                None => {
+                    return (
+                        StatusCode::NOT_FOUND,
+                        Json(json!({ "error": "Không tìm thấy kịch bản trong nhà của bạn" })),
+                    )
+                        .into_response();
+                }
+            }
         }
     };
 
-    let _ = sqlx::query("UPDATE automations SET is_active = $1 WHERE id::text = $2")
-        .bind(new_active)
-        .bind(id.trim())
-        .execute(&state.db_pool)
-        .await;
+    let update_res = sqlx::query(
+        "UPDATE automations SET is_active = $1 WHERE id::text = $2 AND owner_id = $3",
+    )
+    .bind(new_active)
+    .bind(id.trim())
+    .bind(tenant_id)
+    .execute(&state.db_pool)
+    .await;
+
+    if let Ok(res) = update_res {
+        if res.rows_affected() == 0 {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "Không tìm thấy kịch bản trong nhà của bạn" })),
+            )
+                .into_response();
+        }
+    }
 
     // Đồng bộ thêm cột `enabled` cũ nếu có trong Database
-    let _ = sqlx::query("UPDATE automations SET enabled = $1 WHERE id::text = $2")
+    let _ = sqlx::query("UPDATE automations SET enabled = $1 WHERE id::text = $2 AND owner_id = $3")
         .bind(new_active)
         .bind(id.trim())
+        .bind(tenant_id)
         .execute(&state.db_pool)
         .await;
 

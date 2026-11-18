@@ -6,7 +6,7 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
-use sqlx::Row;
+use sqlx::{PgPool, Row};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -35,17 +35,63 @@ pub struct UpdateUserPayload {
     pub password: Option<String>,
 }
 
-async fn ensure_owner_or_admin(pool: &sqlx::PgPool, claims: &Claims) -> Result<(), Response> {
-    match check_permission(pool, claims, &["Owner", "Admin", "owner", "admin"], None).await {
-        Ok(true) => Ok(()),
-        Ok(false) => Err((
-            StatusCode::FORBIDDEN,
-            Json(json!({ "error": "Chỉ tài khoản Owner hoặc Admin mới có quyền quản lý tài khoản" })),
+/// Xác định ID Chủ nhà gốc (tenant_id) của người dùng đang đăng nhập:
+/// - Nếu user tự đăng ký (owner_id IS NULL) -> trả về chính user_id đó.
+/// - Nếu user là tài khoản phụ (Admin/Member/Guest do Owner tạo) -> trả về owner_id của họ.
+pub async fn resolve_tenant_id(pool: &PgPool, user_id: Uuid) -> Result<Uuid, Response> {
+    let row = sqlx::query("SELECT owner_id FROM users WHERE id = $1")
+        .bind(user_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("Lỗi truy vấn người dùng: {}", e) })),
+            )
+                .into_response()
+        })?;
+
+    match row {
+        Some(r) => {
+            let parent_owner: Option<Uuid> = r.try_get("owner_id").unwrap_or(None);
+            Ok(parent_owner.unwrap_or(user_id))
+        }
+        None => Err((
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "Tài khoản không tồn tại hoặc đã bị xóa" })),
         )
             .into_response()),
-        Err(e) => Err((
+    }
+}
+
+pub async fn ensure_owner_or_admin(pool: &PgPool, claims: &Claims) -> Result<(), Response> {
+    let db_role: Option<String> = sqlx::query_scalar(
+        r#"
+        SELECT COALESCE(NULLIF(TRIM(r.name), ''), NULLIF(TRIM(u.role), ''), 'Member')
+        FROM users u
+        LEFT JOIN roles r ON u.role_id = r.id
+        WHERE u.id = $1
+        "#,
+    )
+    .bind(claims.sub)
+    .fetch_optional(pool)
+    .await
+    .unwrap_or(None);
+
+    let effective_role = db_role
+        .unwrap_or_else(|| claims.role_name.clone())
+        .trim()
+        .to_lowercase();
+
+    if effective_role == "owner" || effective_role == "admin" {
+        return Ok(());
+    }
+
+    match check_permission(pool, claims, &["Owner", "Admin", "owner", "admin"], None).await {
+        Ok(true) => Ok(()),
+        _ => Err((
             StatusCode::FORBIDDEN,
-            Json(json!({ "error": format!("Không có quyền quản lý tài khoản: {}", e) })),
+            Json(json!({ "error": "Chỉ tài khoản Owner hoặc Admin mới có quyền thực hiện thao tác này" })),
         )
             .into_response()),
     }
@@ -60,16 +106,26 @@ pub async fn get_users(
         return resp;
     }
 
+    let tenant_id = match resolve_tenant_id(&state.db_pool, claims.sub).await {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
+
     let query = r#"
         SELECT
             to_jsonb(u) - 'password_hash' - 'password' AS user_data,
             r.name AS joined_role
         FROM users u
         LEFT JOIN roles r ON u.role_id = r.id
-        ORDER BY u.email ASC
+        WHERE u.owner_id = $1 OR u.id = $1
+        ORDER BY (u.id = $1) DESC, u.email ASC
     "#;
 
-    match sqlx::query(query).fetch_all(&state.db_pool).await {
+    match sqlx::query(query)
+        .bind(tenant_id)
+        .fetch_all(&state.db_pool)
+        .await
+    {
         Ok(rows) => {
             let users: Vec<Value> = rows
                 .into_iter()
@@ -160,6 +216,11 @@ pub async fn create_user(
         return resp;
     }
 
+    let tenant_id = match resolve_tenant_id(&state.db_pool, claims.sub).await {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
+
     let display_name = payload
         .full_name
         .or(payload.name)
@@ -174,6 +235,14 @@ pub async fn create_user(
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "Member".to_string());
 
+    if requested_role.eq_ignore_ascii_case("owner") {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "Chỉ được tạo tài khoản phụ với vai trò Admin, Member hoặc Guest" })),
+        )
+            .into_response();
+    }
+
     let role_row = sqlx::query("SELECT id, name FROM roles WHERE LOWER(name) = LOWER($1)")
         .bind(&requested_role)
         .fetch_optional(&state.db_pool)
@@ -184,7 +253,7 @@ pub async fn create_user(
         Ok(None) => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(json!({ "error": "Invalid role name" })),
+                Json(json!({ "error": "Tên vai trò không hợp lệ" })),
             )
                 .into_response();
         }
@@ -217,7 +286,8 @@ pub async fn create_user(
     let email = payload.email.trim().to_string();
 
     let insert_res = sqlx::query(
-        "INSERT INTO users (id, name, full_name, email, password_hash, role, role_id, is_active) VALUES ($1, $2, $3, $4, $5, $6, $7, true)",
+        "INSERT INTO users (id, name, full_name, email, password_hash, role, role_id, owner_id, is_active)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true)",
     )
     .bind(id)
     .bind(&display_name)
@@ -226,6 +296,7 @@ pub async fn create_user(
     .bind(&hashed_password)
     .bind(&canonical_role)
     .bind(role_id)
+    .bind(tenant_id)
     .execute(&state.db_pool)
     .await;
 
@@ -262,6 +333,11 @@ pub async fn update_user(
         return resp;
     }
 
+    let tenant_id = match resolve_tenant_id(&state.db_pool, claims.sub).await {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
+
     let Ok(uuid_val) = Uuid::parse_str(&id) else {
         return (
             StatusCode::BAD_REQUEST,
@@ -269,6 +345,22 @@ pub async fn update_user(
         )
             .into_response();
     };
+
+    // Kiểm tra user mục tiêu có thuộc hộ gia đình hiện tại không
+    let exists = sqlx::query("SELECT id FROM users WHERE id = $1 AND (owner_id = $2 OR id = $2)")
+        .bind(uuid_val)
+        .bind(tenant_id)
+        .fetch_optional(&state.db_pool)
+        .await
+        .unwrap_or(None);
+
+    if exists.is_none() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "Không tìm thấy tài khoản trong gia đình của bạn" })),
+        )
+            .into_response();
+    }
 
     if let Some(new_name) = payload
         .full_name
@@ -296,6 +388,14 @@ pub async fn update_user(
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
     {
+        if uuid_val == tenant_id || requested_role.eq_ignore_ascii_case("owner") {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "Không thể thay đổi vai trò Chủ nhà gốc" })),
+            )
+                .into_response();
+        }
+
         let role_row = sqlx::query("SELECT id, name FROM roles WHERE LOWER(name) = LOWER($1)")
             .bind(&requested_role)
             .fetch_optional(&state.db_pool)
@@ -323,7 +423,7 @@ pub async fn update_user(
             Ok(None) => {
                 return (
                     StatusCode::BAD_REQUEST,
-                    Json(json!({ "error": "Invalid role name" })),
+                    Json(json!({ "error": "Tên vai trò không hợp lệ" })),
                 )
                     .into_response();
             }
@@ -338,6 +438,14 @@ pub async fn update_user(
     }
 
     if let Some(is_active) = payload.is_active {
+        if uuid_val == tenant_id && !is_active {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "Không thể khóa tài khoản Chủ nhà gốc" })),
+            )
+                .into_response();
+        }
+
         if let Err(e) = sqlx::query("UPDATE users SET is_active = $1 WHERE id = $2")
             .bind(is_active)
             .bind(uuid_val)
@@ -395,6 +503,11 @@ pub async fn delete_user(
         return resp;
     }
 
+    let tenant_id = match resolve_tenant_id(&state.db_pool, claims.sub).await {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
+
     let Ok(uuid_val) = Uuid::parse_str(&id) else {
         return (
             StatusCode::BAD_REQUEST,
@@ -403,20 +516,26 @@ pub async fn delete_user(
             .into_response();
     };
 
-    if claims.sub == uuid_val {
+    if uuid_val == tenant_id || uuid_val == claims.sub {
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "Không thể tự xóa tài khoản đang đăng nhập" })),
+            Json(json!({ "error": "Không thể xóa tài khoản Chủ nhà gốc hoặc tài khoản đang đăng nhập" })),
         )
             .into_response();
     }
 
-    match sqlx::query("DELETE FROM users WHERE id = $1")
+    match sqlx::query("DELETE FROM users WHERE id = $1 AND owner_id = $2")
         .bind(uuid_val)
+        .bind(tenant_id)
         .execute(&state.db_pool)
         .await
     {
-        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Ok(res) if res.rows_affected() > 0 => StatusCode::NO_CONTENT.into_response(),
+        Ok(_) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "Không tìm thấy tài khoản trong gia đình của bạn" })),
+        )
+            .into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": e.to_string() })),
