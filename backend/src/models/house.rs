@@ -1,8 +1,8 @@
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-use chrono::{DateTime, Utc};
 
-#[derive(Debug, Serialize, Deserialize, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct House {
     pub id: Uuid,
     pub name: String,
@@ -15,4 +15,6 @@ pub struct House {
 pub struct CreateHouseDto {
     pub name: String,
     pub address: Option<String>,
+    #[serde(default)]
+    pub owner_id: Option<String>,
 }

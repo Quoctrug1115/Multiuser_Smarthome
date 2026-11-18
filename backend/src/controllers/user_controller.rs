@@ -1,7 +1,7 @@
 use axum::{
     extract::{Path, State},
     http::StatusCode,
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     Json,
 };
 use serde::Deserialize;
@@ -10,7 +10,9 @@ use sqlx::Row;
 use std::sync::Arc;
 use uuid::Uuid;
 
+use crate::models::user::Claims;
 use crate::services::auth_service::hash_password;
+use crate::services::rbac_service::check_permission;
 use crate::AppState;
 
 #[derive(Deserialize)]
@@ -33,8 +35,31 @@ pub struct UpdateUserPayload {
     pub password: Option<String>,
 }
 
+async fn ensure_owner_or_admin(pool: &sqlx::PgPool, claims: &Claims) -> Result<(), Response> {
+    match check_permission(pool, claims, &["Owner", "Admin", "owner", "admin"], None).await {
+        Ok(true) => Ok(()),
+        Ok(false) => Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "Chỉ tài khoản Owner hoặc Admin mới có quyền quản lý tài khoản" })),
+        )
+            .into_response()),
+        Err(e) => Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": format!("Không có quyền quản lý tài khoản: {}", e) })),
+        )
+            .into_response()),
+    }
+}
+
 // GET /api/v1/users
-pub async fn get_users(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+pub async fn get_users(
+    claims: Claims,
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    if let Err(resp) = ensure_owner_or_admin(&state.db_pool, &claims).await {
+        return resp;
+    }
+
     let query = r#"
         SELECT
             to_jsonb(u) - 'password_hash' - 'password' AS user_data,
@@ -127,9 +152,14 @@ pub async fn get_users(State(state): State<Arc<AppState>>) -> impl IntoResponse 
 
 // POST /api/v1/users
 pub async fn create_user(
+    claims: Claims,
     State(state): State<Arc<AppState>>,
     Json(payload): Json<CreateUserPayload>,
 ) -> impl IntoResponse {
+    if let Err(resp) = ensure_owner_or_admin(&state.db_pool, &claims).await {
+        return resp;
+    }
+
     let display_name = payload
         .full_name
         .or(payload.name)
@@ -172,7 +202,6 @@ pub async fn create_user(
         .filter(|p| !p.trim().is_empty())
         .unwrap_or_else(|| "123456".to_string());
 
-    // Dùng đúng hàm hash_password của auth_service để khớp với verify_password khi login
     let hashed_password = match hash_password(&raw_password) {
         Ok(h) => h,
         Err(e) => {
@@ -224,10 +253,15 @@ pub async fn create_user(
 
 // PUT /api/v1/users/{id}
 pub async fn update_user(
+    claims: Claims,
     Path(id): Path<String>,
     State(state): State<Arc<AppState>>,
     Json(payload): Json<UpdateUserPayload>,
 ) -> impl IntoResponse {
+    if let Err(resp) = ensure_owner_or_admin(&state.db_pool, &claims).await {
+        return resp;
+    }
+
     let Ok(uuid_val) = Uuid::parse_str(&id) else {
         return (
             StatusCode::BAD_REQUEST,
@@ -353,9 +387,14 @@ pub async fn update_user(
 
 // DELETE /api/v1/users/{id}
 pub async fn delete_user(
+    claims: Claims,
     Path(id): Path<String>,
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
+    if let Err(resp) = ensure_owner_or_admin(&state.db_pool, &claims).await {
+        return resp;
+    }
+
     let Ok(uuid_val) = Uuid::parse_str(&id) else {
         return (
             StatusCode::BAD_REQUEST,
@@ -363,6 +402,14 @@ pub async fn delete_user(
         )
             .into_response();
     };
+
+    if claims.sub == uuid_val {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "Không thể tự xóa tài khoản đang đăng nhập" })),
+        )
+            .into_response();
+    }
 
     match sqlx::query("DELETE FROM users WHERE id = $1")
         .bind(uuid_val)

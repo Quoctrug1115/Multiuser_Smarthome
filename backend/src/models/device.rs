@@ -1,32 +1,29 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-use chrono::{DateTime, Utc};
-use serde_json::Value as JsonValue;
 
-#[derive(Debug, Serialize, Deserialize, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Device {
     pub id: Uuid,
+    #[sqlx(default)]
     pub room_id: Option<Uuid>,
+    #[sqlx(default)]
+    pub room_name: Option<String>,
     pub name: String,
     pub device_type: String,
     pub mqtt_topic: String,
-    pub status: String,
-    pub current_state: Option<JsonValue>,
-    pub last_seen: Option<DateTime<Utc>>,
+    #[sqlx(default)]
+    pub is_on: bool,
+    #[sqlx(default)]
+    pub status: Option<String>,
+    #[sqlx(default)]
+    pub power_watt: Option<i32>,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct CreateDeviceDto {
-    pub room_id: Option<Uuid>,
+pub struct DevicePayload {
     pub name: String,
     pub device_type: String,
     pub mqtt_topic: String,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct GrantGuestAccessDto {
-    pub guest_id: Uuid,
-    pub device_id: Uuid,
-    pub valid_from: DateTime<Utc>,
-    pub valid_until: DateTime<Utc>,
+    #[serde(default)]
+    pub room_id: Option<String>,
 }

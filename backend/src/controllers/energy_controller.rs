@@ -162,15 +162,19 @@ pub async fn get_analytics(
     // Lấy danh sách bản ghi chi tiết từ energy_logs để hiển thị biểu đồ/bảng trên Mobile
     let logs_sql = format!(
         r#"
-        SELECT 
-            TO_CHAR(time AT TIME ZONE 'Asia/Ho_Chi_Minh', 'HH24:MI DD/MM') AS formatted_time,
-            device_id::text AS device_id,
-            COALESCE(power_watt, 0.0)::DOUBLE PRECISION AS power_watt,
-            COALESCE(kwh_consumed, 0.0)::DOUBLE PRECISION AS kwh_consumed
-        FROM energy_logs
-        WHERE time >= NOW() - {}
-        ORDER BY time DESC
-        LIMIT 50
+        SELECT * FROM (
+            SELECT 
+                time,
+                TO_CHAR(time AT TIME ZONE 'Asia/Ho_Chi_Minh', 'HH24:MI') AS formatted_time,
+                device_id::text AS device_id,
+                COALESCE(power_watt, 0.0)::DOUBLE PRECISION AS power_watt,
+                COALESCE(kwh_consumed, 0.0)::DOUBLE PRECISION AS kwh_consumed
+            FROM energy_logs
+            WHERE time >= NOW() - {}
+            ORDER BY time DESC
+            LIMIT 7
+        ) sub
+        ORDER BY time ASC
         "#,
         interval_filter
     );
