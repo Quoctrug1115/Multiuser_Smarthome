@@ -74,6 +74,10 @@ void callback(char* topic, byte* payload, unsigned int length) {
       digitalWrite(LED_FAN_PIN, LOW);
     }
   }
+  if (topicStr == "smarthome/discovery/request") {
+  publishDiscovery(); // Tên hàm gửi JSON lên smarthome/discovery của bạn
+  return;
+}
 }
 
 void reconnect() {
@@ -87,6 +91,7 @@ void reconnect() {
       client.subscribe("smarthome/devices/led_phong_khach/control");
       client.subscribe("smarthome/devices/quat_phong_khach");
       client.subscribe("smarthome/devices/quat_phong_khach/control");
+      client.subscribe("smarthome/discovery/request");
 
       // Báo danh 3 thiết bị lên topic discovery để Mobile quét tự động
       const char* lightDiscovery =
