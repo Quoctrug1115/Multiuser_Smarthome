@@ -97,10 +97,12 @@ pub async fn get_alerts(
             let alerts: Vec<Value> = rows
                 .into_iter()
                 .map(|row| {
-                    let id = row
-                        .get::<Uuid, _>("id")
-                        .map(|u| u.to_string())
-                        .unwrap_or_default();
+                    let id: String = row
+                        .try_get::<&str, _>("id")
+                        .ok()
+                        .flatten()
+                        .unwrap_or_default()
+                        .to_string();
                     let alert_type = row
                         .get::<&str, _>("alert_type")
                         .unwrap_or("ANOMALY")
