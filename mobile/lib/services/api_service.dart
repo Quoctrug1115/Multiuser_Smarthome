@@ -4,6 +4,8 @@ import 'dart:convert';
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 
+import '../models/smarthome_models.dart';
+
 typedef JsonMap = Map<String, dynamic>;
 typedef JsonList = List<JsonMap>;
 
@@ -23,7 +25,31 @@ class ApiService extends ChangeNotifier {
   String get baseUrl => _baseUrl;
   String? get token => _token;
   JsonMap? get currentUser => _currentUser;
+  UserProfile? get userProfile =>
+      _currentUser != null ? UserProfile.fromJson(_currentUser!) : null;
+
   bool get isAuthenticated => _token != null && _token!.isNotEmpty;
+
+  /// Tự động suy ra WebSocket URL tương ứng từ REST API Base URL
+  String get wsUrl {
+    String root = _baseUrl;
+    if (root.endsWith('/api/v1')) {
+      root = root.substring(0, root.length - 7);
+    }
+    if (root.startsWith('https://')) {
+      root = root.replaceFirst('https://', 'wss://');
+    } else if (root.startsWith('http://')) {
+      root = root.replaceFirst('http://', 'ws://');
+    }
+    return '$root/ws';
+  }
+
+  /// ID của Chủ hộ (dùng để lọc cảnh báo AI & dữ liệu Multi-tenant)
+  String get householdOwnerId {
+    final ownerId = _currentUser?['owner_id']?.toString() ?? '';
+    if (ownerId.isNotEmpty) return ownerId;
+    return _currentUser?['id']?.toString() ?? '';
+  }
 
   String get currentUserRole {
     final raw = _currentUser?['role'] ?? _currentUser?['role_name'] ?? 'Member';
@@ -37,6 +63,9 @@ class ApiService extends ChangeNotifier {
 
   void updateBaseUrl(String wsOrHttpUrl) {
     String clean = wsOrHttpUrl.trim();
+    if (clean.endsWith('/')) {
+      clean = clean.substring(0, clean.length - 1);
+    }
     if (clean.startsWith('ws://')) {
       clean = clean.replaceFirst('ws://', 'http://');
     } else if (clean.startsWith('wss://')) {
@@ -70,6 +99,11 @@ class ApiService extends ChangeNotifier {
   }
 
   dynamic _parseResponse(http.Response res) {
+    if (res.statusCode == 401) {
+      logout();
+      throw Exception('Phiên đăng nhập đã hết hạn. Vui lòng đăng nhập lại.');
+    }
+
     final bodyText = utf8.decode(res.bodyBytes);
     dynamic decoded;
 
@@ -115,9 +149,17 @@ class ApiService extends ChangeNotifier {
         _currentUser = JsonMap.from(data['user']);
       } else {
         _currentUser = {
+          'id': data['id'] ?? jwtClaims['sub'] ?? jwtClaims['id'] ?? '',
+          'owner_id': data['owner_id'] ?? jwtClaims['owner_id'] ?? '',
           'email': data['email'] ?? jwtClaims['email'] ?? email,
+          'name':
+              data['name'] ??
+              data['full_name'] ??
+              jwtClaims['name'] ??
+              email.split('@').first,
           'full_name':
               data['full_name'] ??
+              data['name'] ??
               jwtClaims['full_name'] ??
               email.split('@').first,
           'role':
@@ -129,22 +171,40 @@ class ApiService extends ChangeNotifier {
         };
       }
       notifyListeners();
+      // Đồng bộ lại thông tin mới nhất từ /auth/me
+      await fetchCurrentUser().catchError((_) {});
     }
   }
 
+  /// Đăng ký tài khoản Chủ nhà (Owner) mới giống luồng Web
   Future<void> register(String fullName, String email, String password) async {
     final res = await http.post(
       Uri.parse('$_baseUrl/auth/register'),
       headers: {'Content-Type': 'application/json'},
       body: jsonEncode({
-        'full_name': fullName,
         'name': fullName,
+        'full_name': fullName,
         'email': email,
         'password': password,
-        'role_name': 'Member',
       }),
     );
     _parseResponse(res);
+  }
+
+  Future<void> fetchCurrentUser() async {
+    if (!isAuthenticated) return;
+    final res = await http.get(
+      Uri.parse('$_baseUrl/auth/me'),
+      headers: _headers,
+    );
+    final data = _parseResponse(res);
+    if (data is Map) {
+      final userMap = data['user'] is Map
+          ? JsonMap.from(data['user'])
+          : JsonMap.from(data);
+      _currentUser = {...?_currentUser, ...userMap};
+      notifyListeners();
+    }
   }
 
   void logout() {
@@ -153,7 +213,100 @@ class ApiService extends ChangeNotifier {
     notifyListeners();
   }
 
-  // ==================== 2. DEVICES (CRUD + CONTROL) ====================
+  // ==================== 2. HOUSES & ROOMS (MULTI-TENANT) ====================
+
+  Future<JsonList> getHouses() async {
+    final res = await http.get(
+      Uri.parse('$_baseUrl/houses'),
+      headers: _headers,
+    );
+    final data = _parseResponse(res);
+    if (data is List) return data.map((e) => JsonMap.from(e)).toList();
+    if (data is Map && data['houses'] is List) {
+      return (data['houses'] as List).map((e) => JsonMap.from(e)).toList();
+    }
+    return [];
+  }
+
+  Future<void> createHouse({
+    required String name,
+    required String address,
+  }) async {
+    final res = await http.post(
+      Uri.parse('$_baseUrl/houses'),
+      headers: _headers,
+      body: jsonEncode({'name': name, 'address': address}),
+    );
+    _parseResponse(res);
+  }
+
+  Future<void> updateHouse(
+    String houseId, {
+    required String name,
+    required String address,
+  }) async {
+    final res = await http.put(
+      Uri.parse('$_baseUrl/houses/$houseId'),
+      headers: _headers,
+      body: jsonEncode({'name': name, 'address': address}),
+    );
+    _parseResponse(res);
+  }
+
+  Future<void> deleteHouse(String houseId) async {
+    final res = await http.delete(
+      Uri.parse('$_baseUrl/houses/$houseId'),
+      headers: _headers,
+    );
+    _parseResponse(res);
+  }
+
+  Future<JsonList> getRooms() async {
+    final res = await http.get(Uri.parse('$_baseUrl/rooms'), headers: _headers);
+    final data = _parseResponse(res);
+    if (data is List) return data.map((e) => JsonMap.from(e)).toList();
+    if (data is Map && data['rooms'] is List) {
+      return (data['rooms'] as List).map((e) => JsonMap.from(e)).toList();
+    }
+    return [];
+  }
+
+  Future<void> createRoom({
+    required String houseId,
+    required String name,
+    int floor = 1,
+  }) async {
+    final res = await http.post(
+      Uri.parse('$_baseUrl/rooms'),
+      headers: _headers,
+      body: jsonEncode({'house_id': houseId, 'name': name, 'floor': floor}),
+    );
+    _parseResponse(res);
+  }
+
+  Future<void> updateRoom(
+    String roomId, {
+    required String houseId,
+    required String name,
+    int floor = 1,
+  }) async {
+    final res = await http.put(
+      Uri.parse('$_baseUrl/rooms/$roomId'),
+      headers: _headers,
+      body: jsonEncode({'house_id': houseId, 'name': name, 'floor': floor}),
+    );
+    _parseResponse(res);
+  }
+
+  Future<void> deleteRoom(String roomId) async {
+    final res = await http.delete(
+      Uri.parse('$_baseUrl/rooms/$roomId'),
+      headers: _headers,
+    );
+    _parseResponse(res);
+  }
+
+  // ==================== 3. DEVICES (CRUD + CONTROL) ====================
 
   Future<JsonList> discoverWokwiDevices() async {
     final res = await http.get(
@@ -186,6 +339,7 @@ class ApiService extends ChangeNotifier {
     required String name,
     required String deviceType,
     required String mqttTopic,
+    String? roomId,
   }) async {
     final res = await http.post(
       Uri.parse('$_baseUrl/devices'),
@@ -194,6 +348,7 @@ class ApiService extends ChangeNotifier {
         'name': name,
         'device_type': deviceType,
         'mqtt_topic': mqttTopic,
+        if (roomId != null && roomId.isNotEmpty) 'room_id': roomId,
       }),
     );
     _parseResponse(res);
@@ -204,6 +359,7 @@ class ApiService extends ChangeNotifier {
     required String name,
     required String deviceType,
     required String mqttTopic,
+    String? roomId,
   }) async {
     final res = await http.put(
       Uri.parse('$_baseUrl/devices/$deviceId'),
@@ -212,6 +368,7 @@ class ApiService extends ChangeNotifier {
         'name': name,
         'device_type': deviceType,
         'mqtt_topic': mqttTopic,
+        if (roomId != null && roomId.isNotEmpty) 'room_id': roomId,
       }),
     );
     _parseResponse(res);
@@ -230,13 +387,14 @@ class ApiService extends ChangeNotifier {
     String action, {
     String? mqttTopic,
   }) async {
+    final isOn = action.toUpperCase() == 'ON';
     final res = await http.post(
       Uri.parse('$_baseUrl/devices/$id/control'),
       headers: _headers,
       body: jsonEncode({
-        'action': action,
-        'state': action,
-        'is_on': action.toUpperCase() == 'ON',
+        'action': isOn ? 'ON' : 'OFF',
+        'state': isOn ? 'ON' : 'OFF',
+        'is_on': isOn,
         if (mqttTopic != null && mqttTopic.isNotEmpty) 'mqtt_topic': mqttTopic,
       }),
     );
@@ -244,19 +402,15 @@ class ApiService extends ChangeNotifier {
   }
 
   Future<void> toggleDeviceApi(String deviceId, bool state) async {
-    final res = await http.post(
-      Uri.parse('$_baseUrl/devices/$deviceId/control'),
-      headers: _headers,
-      body: jsonEncode({'state': state, 'action': state ? 'ON' : 'OFF'}),
-    );
-    _parseResponse(res);
+    await controlDevice(deviceId, state ? 'ON' : 'OFF');
   }
 
-  // ==================== 3. ENERGY ====================
+  // ==================== 4. ENERGY ====================
 
   Future<JsonMap> getEnergyStats(String range) async {
+    final period = range.toLowerCase();
     final res = await http.get(
-      Uri.parse('$_baseUrl/energy/analytics?range=${range.toLowerCase()}'),
+      Uri.parse('$_baseUrl/energy/analytics?period=$period&range=$period'),
       headers: _headers,
     );
     final data = _parseResponse(res);
@@ -269,7 +423,7 @@ class ApiService extends ChangeNotifier {
     return {};
   }
 
-  // ==================== 4. AUTOMATIONS ====================
+  // ==================== 5. AUTOMATIONS ====================
 
   Future<JsonList> getAutomations() async {
     final res = await http.get(
@@ -304,11 +458,12 @@ class ApiService extends ChangeNotifier {
   }
 
   Future<void> toggleAutomation(String id, bool isActive) async {
-    final res = await http.patch(
-      Uri.parse('$_baseUrl/automations/$id/toggle'),
-      headers: _headers,
-      body: jsonEncode({'is_active': isActive}),
-    );
+    final uri = Uri.parse('$_baseUrl/automations/$id/toggle');
+    final body = jsonEncode({'is_active': isActive});
+    var res = await http.post(uri, headers: _headers, body: body);
+    if (res.statusCode == 405 || res.statusCode == 404) {
+      res = await http.patch(uri, headers: _headers, body: body);
+    }
     _parseResponse(res);
   }
 
@@ -320,7 +475,7 @@ class ApiService extends ChangeNotifier {
     _parseResponse(res);
   }
 
-  // ==================== 5. USERS & GUESTS (OWNER ONLY) ====================
+  // ==================== 6. USERS & AI ALERTS ====================
 
   Future<JsonList> getUsers() async {
     final res = await http.get(Uri.parse('$_baseUrl/users'), headers: _headers);
@@ -422,10 +577,14 @@ class ApiService extends ChangeNotifier {
     return [];
   }
 
-  Future<void> triggerAiAnalysis() async {
+  Future<void> triggerAiAnalysis({
+    double temperature = 65.0,
+    String sensorId = 'dht22_living_room',
+  }) async {
     final res = await http.post(
       Uri.parse('$_baseUrl/ai/simulate-anomaly'),
       headers: _headers,
+      body: jsonEncode({'temperature': temperature, 'sensor_id': sensorId}),
     );
     _parseResponse(res);
   }
