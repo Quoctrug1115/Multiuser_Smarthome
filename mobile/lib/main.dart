@@ -21,8 +21,41 @@ void main() {
   );
 }
 
-class SmartHomeApp extends StatelessWidget {
+class SmartHomeApp extends StatefulWidget {
   const SmartHomeApp({super.key});
+
+  @override
+  State<SmartHomeApp> createState() => _SmartHomeAppState();
+}
+
+class _SmartHomeAppState extends State<SmartHomeApp>
+    with WidgetsBindingObserver {
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    final api = ApiService();
+    final ws = WebSocketService();
+    if (!api.isAuthenticated) return;
+
+    if (state == AppLifecycleState.paused ||
+        state == AppLifecycleState.detached) {
+      ws.disconnect(temporary: true);
+    } else if (state == AppLifecycleState.resumed) {
+      ws.connect(api.wsUrl);
+      api.fetchCurrentUser().catchError((_) {});
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
