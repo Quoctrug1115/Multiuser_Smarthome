@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 
 import '../services/api_service.dart';
@@ -14,280 +15,382 @@ class SettingsScreen extends StatefulWidget {
 }
 
 class _SettingsScreenState extends State<SettingsScreen> {
-  final _wsUrlController = TextEditingController(
-    text: 'ws://localhost:3000/ws',
-  );
-  bool _overloadAlert = true;
+  late final TextEditingController _serverCtrl;
+  bool _isSyncingProfile = false;
+
+  @override
+  void initState() {
+    super.initState();
+    final api = ApiService();
+    final cleanRoot = api.baseUrl.replaceFirst(RegExp(r'/api/v1$'), '');
+    _serverCtrl = TextEditingController(text: cleanRoot);
+  }
 
   @override
   void dispose() {
-    _wsUrlController.dispose();
+    _serverCtrl.dispose();
     super.dispose();
+  }
+
+  void _showSnack(String msg, {bool isError = false}) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(msg, style: const TextStyle(fontWeight: FontWeight.w600)),
+        backgroundColor: isError ? AppColors.accent : AppColors.secondary,
+      ),
+    );
+  }
+
+  Future<void> _applyServerConfig() async {
+    final input = _serverCtrl.text.trim();
+    if (input.isEmpty) {
+      _showSnack('Vui lòng nhập địa chỉ máy chủ!', isError: true);
+      return;
+    }
+    final api = ApiService();
+    final ws = WebSocketService();
+    api.updateBaseUrl(input);
+    ws.disconnect(temporary: true);
+    if (api.isAuthenticated) {
+      ws.connect(api.wsUrl);
+    }
+    _showSnack('Đã cập nhật máy chủ: ${api.baseUrl}');
   }
 
   @override
   Widget build(BuildContext context) {
     final themeProvider = Provider.of<ThemeProvider>(context);
-    final wsService = Provider.of<WebSocketService>(context);
     final apiService = Provider.of<ApiService>(context);
-    final isDark = themeProvider.isDarkMode;
+    final wsService = Provider.of<WebSocketService>(context);
 
-    final user = apiService.currentUser;
-    final displayName =
-        (user?['full_name'] ?? user?['name'] ?? 'Chưa đăng nhập').toString();
-    final displayEmail = (user?['email'] ?? 'guest@local').toString();
-    final displayRole = (user?['role'] ?? 'USER').toString().toUpperCase();
+    final isDark = themeProvider.isDarkMode;
+    final cyan = isDark ? AppColors.primary : const Color(0xFF0284C7);
+    final green = isDark ? Colors.greenAccent : const Color(0xFF0D9488);
+    final profile = apiService.userProfile;
 
     return Scaffold(
       backgroundColor: AppColors.getBackground(isDark),
-      body: SingleChildScrollView(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Container(
-              padding: const EdgeInsets.all(16),
-              decoration: BoxDecoration(
-                color: AppColors.getSurface(isDark),
-                borderRadius: BorderRadius.circular(14),
-                border: Border.all(color: AppColors.primary.withOpacity(0.5)),
-              ),
-              child: Row(
-                children: [
-                  CircleAvatar(
-                    radius: 26,
-                    backgroundColor: AppColors.getGlowCyan(isDark),
-                    child: const Icon(
-                      Icons.person,
-                      color: AppColors.primary,
-                      size: 28,
+      body: ListView(
+        padding: const EdgeInsets.fromLTRB(16, 16, 16, 90),
+        children: [
+          // 1. THÔNG TIN TÀI KHOẢN & HỘ GIA ĐÌNH
+          Container(
+            padding: const EdgeInsets.all(16),
+            decoration: BoxDecoration(
+              color: AppColors.getSurface(isDark),
+              borderRadius: BorderRadius.circular(14),
+              border: Border.all(color: cyan.withOpacity(0.4)),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    CircleAvatar(
+                      radius: 24,
+                      backgroundColor: cyan.withOpacity(0.18),
+                      child: Text(
+                        (profile?.name.isNotEmpty == true
+                                ? profile!.name[0]
+                                : 'U')
+                            .toUpperCase(),
+                        style: TextStyle(
+                          color: cyan,
+                          fontSize: 18,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
                     ),
-                  ),
-                  const SizedBox(width: 14),
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          displayName,
-                          style: TextStyle(
-                            color: AppColors.getTextPrimary(isDark),
-                            fontSize: 16,
-                            fontWeight: FontWeight.bold,
-                          ),
-                        ),
-                        Text(
-                          displayEmail,
-                          style: const TextStyle(
-                            color: AppColors.textMuted,
-                            fontSize: 12,
-                          ),
-                        ),
-                        const SizedBox(height: 4),
-                        Container(
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 8,
-                            vertical: 2,
-                          ),
-                          decoration: BoxDecoration(
-                            color: AppColors.getGlowCyan(isDark),
-                            borderRadius: BorderRadius.circular(4),
-                          ),
-                          child: Text(
-                            displayRole,
-                            style: const TextStyle(
-                              color: AppColors.primary,
-                              fontSize: 9,
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            profile?.name ?? 'Người dùng SmartHome',
+                            style: TextStyle(
+                              color: AppColors.getTextPrimary(isDark),
+                              fontSize: 15,
                               fontWeight: FontWeight.bold,
                             ),
+                          ),
+                          const SizedBox(height: 2),
+                          Text(
+                            profile?.email ?? 'Chưa đồng bộ email',
+                            style: const TextStyle(
+                              color: AppColors.textMuted,
+                              fontSize: 12,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                    Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 9,
+                        vertical: 4,
+                      ),
+                      decoration: BoxDecoration(
+                        color: cyan.withOpacity(0.16),
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                      child: Text(
+                        apiService.currentUserRole.toUpperCase(),
+                        style: TextStyle(
+                          color: cyan,
+                          fontSize: 10,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+                const Divider(height: 22),
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    Expanded(
+                      child: Text(
+                        'Mã Hộ gia đình (Tenant): ${apiService.householdOwnerId.isEmpty ? "N/A" : apiService.householdOwnerId}',
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          color: AppColors.textMuted,
+                          fontSize: 11,
+                        ),
+                      ),
+                    ),
+                    if (apiService.householdOwnerId.isNotEmpty)
+                      IconButton(
+                        icon: Icon(Icons.copy, size: 16, color: cyan),
+                        tooltip: 'Sao chép ID hộ gia đình',
+                        onPressed: () {
+                          Clipboard.setData(
+                            ClipboardData(text: apiService.householdOwnerId),
+                          );
+                          _showSnack('Đã sao chép Mã hộ gia đình');
+                        },
+                      ),
+                  ],
+                ),
+                Align(
+                  alignment: Alignment.centerRight,
+                  child: TextButton.icon(
+                    onPressed: _isSyncingProfile
+                        ? null
+                        : () async {
+                            setState(() => _isSyncingProfile = true);
+                            try {
+                              await apiService.fetchCurrentUser();
+                              _showSnack('Đã đồng bộ hồ sơ từ /auth/me');
+                            } catch (e) {
+                              _showSnack(
+                                e.toString().replaceFirst('Exception: ', ''),
+                                isError: true,
+                              );
+                            } finally {
+                              if (mounted) {
+                                setState(() => _isSyncingProfile = false);
+                              }
+                            }
+                          },
+                    icon: Icon(Icons.sync, size: 16, color: cyan),
+                    label: Text(
+                      _isSyncingProfile ? 'ĐANG ĐỒNG BỘ...' : 'ĐỒNG BỘ HỒ SƠ',
+                      style: TextStyle(
+                        color: cyan,
+                        fontSize: 11,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 16),
+
+          // 2. GIAO DIỆN HIỂN THỊ
+          Material(
+            color: AppColors.getSurface(isDark),
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(14),
+              side: BorderSide(color: isDark ? Colors.white12 : Colors.black12),
+            ),
+            clipBehavior: Clip.antiAlias,
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
+              child: SwitchListTile(
+                contentPadding: EdgeInsets.zero,
+                secondary: Icon(
+                  isDark ? Icons.dark_mode : Icons.light_mode,
+                  color: isDark ? Colors.amber : AppColors.secondary,
+                ),
+                title: Text(
+                  'Chế độ Giao diện Tối (Sci-Fi Dark)',
+                  style: TextStyle(
+                    color: AppColors.getTextPrimary(isDark),
+                    fontSize: 13,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+                subtitle: const Text(
+                  'Đồng bộ giao diện sáng / tối toàn ứng dụng',
+                  style: TextStyle(color: AppColors.textMuted, fontSize: 11),
+                ),
+                value: isDark,
+                activeColor: cyan,
+                onChanged: (_) => themeProvider.toggleTheme(),
+              ),
+            ),
+          ),
+          const SizedBox(height: 16),
+
+          // 3. KẾT NỐI MÁY CHỦ RUST BACKEND & WEBSOCKET
+          Container(
+            padding: const EdgeInsets.all(14),
+            decoration: BoxDecoration(
+              color: AppColors.getSurface(isDark),
+              borderRadius: BorderRadius.circular(14),
+              border: Border.all(
+                color: isDark ? Colors.white12 : Colors.black12,
+              ),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    Text(
+                      'MÁY CHỦ BACKEND & WEBSOCKET',
+                      style: TextStyle(
+                        color: AppColors.getTextPrimary(isDark),
+                        fontSize: 12,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                    Row(
+                      children: [
+                        Icon(
+                          Icons.circle,
+                          size: 8,
+                          color: wsService.isConnected
+                              ? green
+                              : AppColors.accent,
+                        ),
+                        const SizedBox(width: 5),
+                        Text(
+                          wsService.isConnected ? 'WS CONNECTED' : 'WS OFFLINE',
+                          style: TextStyle(
+                            color: wsService.isConnected
+                                ? green
+                                : AppColors.accent,
+                            fontSize: 10,
+                            fontWeight: FontWeight.bold,
                           ),
                         ),
                       ],
                     ),
+                  ],
+                ),
+                const SizedBox(height: 10),
+                TextField(
+                  controller: _serverCtrl,
+                  style: TextStyle(
+                    color: AppColors.getTextPrimary(isDark),
+                    fontSize: 13,
                   ),
-                ],
-              ),
-            ),
-            const SizedBox(height: 20),
-
-            Text(
-              'KẾT NỐI MÁY CHỦ RUST (API & WEBSOCKET)',
-              style: TextStyle(
-                color: AppColors.getTextSecondary(isDark),
-                fontSize: 11,
-                fontWeight: FontWeight.bold,
-              ),
-            ),
-            const SizedBox(height: 10),
-            Container(
-              padding: const EdgeInsets.all(16),
-              decoration: BoxDecoration(
-                color: AppColors.getSurface(isDark),
-                borderRadius: BorderRadius.circular(14),
-                border: Border.all(color: AppColors.getBorder(isDark)),
-              ),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  TextField(
-                    controller: _wsUrlController,
-                    style: TextStyle(
-                      color: AppColors.getTextPrimary(isDark),
-                      fontSize: 13,
+                  decoration: InputDecoration(
+                    labelText: 'Địa chỉ Backend (HTTP / WS)',
+                    hintText: 'http://10.0.2.2:3000',
+                    prefixIcon: Icon(Icons.dns_outlined, color: cyan, size: 19),
+                  ),
+                ),
+                const SizedBox(height: 8),
+                Wrap(
+                  spacing: 8,
+                  children: [
+                    ActionChip(
+                      label: const Text(
+                        'Android Emulator (10.0.2.2)',
+                        style: TextStyle(fontSize: 11),
+                      ),
+                      onPressed: () {
+                        _serverCtrl.text = 'http://10.0.2.2:3000';
+                        _applyServerConfig();
+                      },
                     ),
-                    decoration: InputDecoration(
-                      labelText: 'WebSocket Endpoint URL',
-                      labelStyle: const TextStyle(
-                        color: AppColors.textMuted,
-                        fontSize: 12,
+                    ActionChip(
+                      label: const Text(
+                        'Localhost (127.0.0.1)',
+                        style: TextStyle(fontSize: 11),
                       ),
-                      prefixIcon: const Icon(
-                        Icons.link,
-                        color: AppColors.primary,
-                      ),
-                      border: OutlineInputBorder(
+                      onPressed: () {
+                        _serverCtrl.text = 'http://127.0.0.1:3000';
+                        _applyServerConfig();
+                      },
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 10),
+                SizedBox(
+                  width: double.infinity,
+                  child: ElevatedButton.icon(
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: cyan,
+                      foregroundColor: isDark
+                          ? const Color(0xFF0A0E1A)
+                          : Colors.white,
+                      shape: RoundedRectangleBorder(
                         borderRadius: BorderRadius.circular(10),
                       ),
                     ),
-                  ),
-                  const SizedBox(height: 8),
-                  Text(
-                    'REST API: ${apiService.baseUrl}',
-                    style: const TextStyle(
-                      color: AppColors.textMuted,
-                      fontSize: 11,
-                    ),
-                  ),
-                  const SizedBox(height: 12),
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                    children: [
-                      Text(
-                        wsService.isConnected
-                            ? 'Trạng thái: Đã kết nối'
-                            : 'Trạng thái: Ngắt kết nối',
-                        style: TextStyle(
-                          color: wsService.isConnected
-                              ? Colors.greenAccent
-                              : AppColors.accent,
-                          fontSize: 12,
-                          fontWeight: FontWeight.bold,
-                        ),
-                      ),
-                      ElevatedButton.icon(
-                        style: ElevatedButton.styleFrom(
-                          backgroundColor: AppColors.primary,
-                          foregroundColor: const Color(0xFF0A0E1A),
-                        ),
-                        onPressed: () {
-                          final url = _wsUrlController.text.trim();
-                          apiService.updateBaseUrl(url);
-                          wsService.disconnect();
-                          wsService.connect(url);
-                        },
-                        icon: const Icon(Icons.refresh, size: 16),
-                        label: const Text(
-                          'KẾT NỐI LẠI',
-                          style: TextStyle(
-                            fontSize: 11,
-                            fontWeight: FontWeight.bold,
-                          ),
-                        ),
-                      ),
-                    ],
-                  ),
-                ],
-              ),
-            ),
-            const SizedBox(height: 20),
-
-            Text(
-              'TÙY CHỈNH HỆ THỐNG',
-              style: TextStyle(
-                color: AppColors.getTextSecondary(isDark),
-                fontSize: 11,
-                fontWeight: FontWeight.bold,
-              ),
-            ),
-            const SizedBox(height: 10),
-            Material(
-              color: AppColors.getSurface(isDark),
-              shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(14),
-                side: BorderSide(color: AppColors.getBorder(isDark)),
-              ),
-              clipBehavior: Clip.antiAlias,
-              child: Column(
-                children: [
-                  SwitchListTile(
-                    title: Text(
-                      'Giao diện Tối (Cyberpunk Dark)',
+                    onPressed: _applyServerConfig,
+                    icon: const Icon(Icons.save_outlined, size: 18),
+                    label: const Text(
+                      'LƯU & KẾT NỐI LẠI',
                       style: TextStyle(
-                        color: AppColors.getTextPrimary(isDark),
-                        fontSize: 14,
-                      ),
-                    ),
-                    subtitle: const Text(
-                      'Tối ưu hiển thị ban đêm & hiệu ứng Neon',
-                      style: TextStyle(
-                        color: AppColors.textMuted,
                         fontSize: 11,
+                        fontWeight: FontWeight.bold,
                       ),
                     ),
-                    value: isDark,
-                    activeColor: AppColors.primary,
-                    onChanged: (_) => themeProvider.toggleTheme(),
-                  ),
-                  Divider(height: 1, color: AppColors.getBorder(isDark)),
-                  SwitchListTile(
-                    title: Text(
-                      'Cảnh báo quá tải điện năng',
-                      style: TextStyle(
-                        color: AppColors.getTextPrimary(isDark),
-                        fontSize: 14,
-                      ),
-                    ),
-                    subtitle: const Text(
-                      'Thông báo khi công suất vượt ngưỡng 2000W',
-                      style: TextStyle(
-                        color: AppColors.textMuted,
-                        fontSize: 11,
-                      ),
-                    ),
-                    value: _overloadAlert,
-                    activeColor: AppColors.primary,
-                    onChanged: (val) => setState(() => _overloadAlert = val),
-                  ),
-                ],
-              ),
-            ),
-            const SizedBox(height: 24),
-
-            SizedBox(
-              width: double.infinity,
-              height: 48,
-              child: OutlinedButton.icon(
-                style: OutlinedButton.styleFrom(
-                  foregroundColor: AppColors.accent,
-                  side: const BorderSide(color: AppColors.accent),
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(10),
                   ),
                 ),
-                onPressed: () {
-                  apiService.logout();
-                  wsService.disconnect();
-                  Navigator.pushReplacementNamed(context, '/login');
-                },
-                icon: const Icon(Icons.logout),
-                label: const Text(
-                  'ĐĂNG XUẤT KHỎI HỆ THỐNG',
-                  style: TextStyle(fontWeight: FontWeight.bold),
+              ],
+            ),
+          ),
+          const SizedBox(height: 24),
+
+          // 4. ĐĂNG XUẤT
+          SizedBox(
+            width: double.infinity,
+            height: 48,
+            child: OutlinedButton.icon(
+              style: OutlinedButton.styleFrom(
+                foregroundColor: AppColors.accent,
+                side: const BorderSide(color: AppColors.accent, width: 1.3),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(12),
                 ),
               ),
+              onPressed: () {
+                wsService.disconnect();
+                apiService.logout();
+                Navigator.pushNamedAndRemoveUntil(
+                  context,
+                  '/login',
+                  (route) => false,
+                );
+              },
+              icon: const Icon(Icons.logout),
+              label: const Text(
+                'ĐĂNG XUẤT KHỎI HỆ THỐNG',
+                style: TextStyle(fontWeight: FontWeight.bold, letterSpacing: 1),
+              ),
             ),
-          ],
-        ),
+          ),
+        ],
       ),
     );
   }
