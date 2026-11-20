@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
 import '../services/api_service.dart';
+import '../services/websocket_service.dart';
 import '../theme/app_colors.dart';
 import '../theme/theme_provider.dart';
 
@@ -48,12 +49,15 @@ class _LoginScreenState extends State<LoginScreen> {
     try {
       if (_isLoginMode) {
         await api.login(email, password);
+        WebSocketService().connect(api.wsUrl);
         if (!mounted) return;
         Navigator.pushReplacementNamed(context, '/main');
       } else {
         await api.register(_nameController.text.trim(), email, password);
         if (!mounted) return;
-        _showMessage('Đăng ký thành công! Vui lòng đăng nhập.');
+        _showMessage(
+          'Đăng ký tài khoản Chủ nhà thành công! Vui lòng đăng nhập.',
+        );
         setState(() {
           _isLoginMode = true;
           _passwordController.clear();
@@ -155,7 +159,7 @@ class _LoginScreenState extends State<LoginScreen> {
                   Text(
                     _isLoginMode
                         ? 'Xác thực qua máy chủ Rust Backend'
-                        : 'Đăng ký tài khoản mới vào Database',
+                        : 'Đăng ký tài khoản Chủ nhà (Owner) mới',
                     style: TextStyle(
                       color: AppColors.getTextSecondary(isDark),
                       fontSize: 12,
