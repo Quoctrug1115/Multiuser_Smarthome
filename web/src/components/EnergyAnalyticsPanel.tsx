@@ -23,6 +23,10 @@ interface DeviceItem {
   room_id?: string | null;
   room_name?: string | null;
   is_on: boolean;
+  rated_power_watt?: number | string | null;
+  power_watt?: number | string | null;
+  wattage?: number | string | null;
+  watt?: number | string | null;
 }
 
 interface RoomItem {
@@ -41,12 +45,32 @@ interface EnergyAnalyticsPanelProps {
 
 const UNIT_PRICE_VND = 2500;
 
-function getDeviceWatt(deviceType: string): number {
-  const t = (deviceType || '').toLowerCase();
-  if (t.includes('ac') || t.includes('air') || t.includes('heater')) return 1200;
-  if (t.includes('fan')) return 45;
-  if (t.includes('light')) return 15;
-  if (t.includes('sensor')) return 2;
+function getDeviceWatt(dev: DeviceItem): number {
+  // 1. Ưu tiên lấy công suất định mức thật từ Database
+  const rawDbWatt =
+    dev.rated_power_watt ?? dev.power_watt ?? dev.wattage ?? dev.watt;
+  const parsedDbWatt = Number(rawDbWatt);
+  if (!Number.isNaN(parsedDbWatt) && parsedDbWatt > 0) {
+    return parsedDbWatt;
+  }
+
+  // 2. Dự phòng khi thiết bị trong DB chưa cấu hình công suất (0 hoặc NULL)
+  const t = (dev.device_type || '').toLowerCase();
+  const n = (dev.name || '').toLowerCase();
+  if (
+    t.includes('ac') ||
+    t.includes('air') ||
+    t.includes('heater') ||
+    n.includes('điều hòa') ||
+    n.includes('máy lạnh')
+  ) {
+    return 1200;
+  }
+  if (t.includes('fan') || n.includes('quạt')) return 45;
+  if (t.includes('light') || n.includes('đèn')) return 15;
+  if (t.includes('sensor') || n.includes('cảm biến') || n.includes('dht')) {
+    return 0;
+  }
   return 25;
 }
 
@@ -73,7 +97,7 @@ export const EnergyAnalyticsPanel: React.FC<EnergyAnalyticsPanelProps> = ({
   // ==================== 1. TÍNH CÔNG SUẤT TỨC THỜI & PHÂN BỔ PHỤ TẢI ====================
   const deviceLoadBreakdown = useMemo(() => {
     const items = devices.map((dev) => {
-      const ratedWatt = getDeviceWatt(dev.device_type);
+      const ratedWatt = getDeviceWatt(dev);
       const currentWatt = dev.is_on ? ratedWatt : 0;
       return {
         ...dev,
@@ -83,7 +107,7 @@ export const EnergyAnalyticsPanel: React.FC<EnergyAnalyticsPanelProps> = ({
     });
 
     const totalLiveWatt = items.reduce((sum, d) => sum + d.currentWatt, 0);
-    const activeCount = items.filter((d) => d.is_on).length;
+    const activeCount = items.filter((d) => d.is_on && d.ratedWatt > 0).length;
 
     let hvacWatt = 0; // Quạt & Điều hòa
     let lightWatt = 0; // Đèn chiếu sáng
@@ -91,7 +115,7 @@ export const EnergyAnalyticsPanel: React.FC<EnergyAnalyticsPanelProps> = ({
     let sensorWatt = 0; // Cảm biến IoT
 
     items.forEach((d) => {
-      if (!d.is_on) return;
+      if (!d.is_on || d.currentWatt <= 0) return;
       const t = (d.device_type || '').toLowerCase();
       if (t.includes('fan') || t.includes('ac') || t.includes('heater')) {
         hvacWatt += d.currentWatt;
@@ -205,7 +229,6 @@ export const EnergyAnalyticsPanel: React.FC<EnergyAnalyticsPanelProps> = ({
     period === 'day' ? '24 giờ' : period === 'week' ? '7 ngày' : '30 ngày';
   const unitLabel = period === 'day' ? 'giờ' : 'ngày';
 
-  // Donut SVG geometry
   const radius = 42;
   const circumference = 2 * Math.PI * radius;
   let cumulativeOffset = 0;
@@ -214,7 +237,6 @@ export const EnergyAnalyticsPanel: React.FC<EnergyAnalyticsPanelProps> = ({
     <div className="space-y-6">
       {/* ==================== ROW 1: 4 KPI CARDS ==================== */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-        {/* Card 1: Tổng điện năng tiêu thụ */}
         <div className={`p-5 rounded-2xl border ${cardBg}`}>
           <div className="flex items-center justify-between text-xs text-slate-400 mb-2">
             <span>⚡ Tổng điện năng tiêu thụ</span>
@@ -227,11 +249,12 @@ export const EnergyAnalyticsPanel: React.FC<EnergyAnalyticsPanelProps> = ({
           </div>
           <div className="text-[11px] text-slate-500 mt-1.5">
             Công suất tức thời:{' '}
-            <strong className="text-slate-300">{deviceLoadBreakdown.totalLiveWatt} W</strong>
+            <strong className="text-slate-300">
+              {deviceLoadBreakdown.totalLiveWatt} W
+            </strong>
           </div>
         </div>
 
-        {/* Card 2: Chi phí ước tính */}
         <div className={`p-5 rounded-2xl border ${cardBg}`}>
           <div className="flex items-center justify-between text-xs text-slate-400 mb-2">
             <span>💰 Chi phí ước tính</span>
@@ -243,11 +266,11 @@ export const EnergyAnalyticsPanel: React.FC<EnergyAnalyticsPanelProps> = ({
             {chartStats.estimatedCost.toLocaleString('vi-VN')} đ
           </div>
           <div className="text-[11px] text-slate-500 mt-1.5">
-            Trung bình ~{chartStats.avgCostPerUnit.toLocaleString('vi-VN')} đ/{unitLabel}
+            Trung bình ~{chartStats.avgCostPerUnit.toLocaleString('vi-VN')} đ/
+            {unitLabel}
           </div>
         </div>
 
-        {/* Card 3: Trung bình mỗi giờ / ngày */}
         <div className={`p-5 rounded-2xl border ${cardBg}`}>
           <div className="flex items-center justify-between text-xs text-slate-400 mb-2">
             <span>📊 Trung bình mỗi {unitLabel}</span>
@@ -263,7 +286,6 @@ export const EnergyAnalyticsPanel: React.FC<EnergyAnalyticsPanelProps> = ({
           </div>
         </div>
 
-        {/* Card 4: Giờ / Ngày tiêu thụ cao nhất */}
         <div className={`p-5 rounded-2xl border ${cardBg}`}>
           <div className="flex items-center justify-between text-xs text-slate-400 mb-2">
             <span>🔥 {period === 'day' ? 'Giờ' : 'Ngày'} tiêu thụ cao nhất</span>
@@ -272,19 +294,23 @@ export const EnergyAnalyticsPanel: React.FC<EnergyAnalyticsPanelProps> = ({
             </span>
           </div>
           <div className="text-2xl font-bold text-amber-400 font-mono">
-            {chartStats.peakPoint.label} ({formatKwh(chartStats.peakPoint.kwh)} kWh)
+            {chartStats.peakPoint.label} ({formatKwh(chartStats.peakPoint.kwh)}{' '}
+            kWh)
           </div>
           <div className="text-[11px] text-slate-500 mt-1.5">
             Cao hơn TB{' '}
-            <strong className="text-amber-400">{Math.max(0, chartStats.peakAboveAvgPct)}%</strong>
+            <strong className="text-amber-400">
+              {Math.max(0, chartStats.peakAboveAvgPct)}%
+            </strong>
           </div>
         </div>
       </div>
 
       {/* ==================== ROW 2: BIỂU ĐỒ TIÊU THỤ + TỶ TRỌNG PHỤ TẢI ==================== */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-        {/* Biểu đồ bên trái (2/3) */}
-        <div className={`lg:col-span-2 p-5 rounded-2xl border flex flex-col justify-between ${cardBg}`}>
+        <div
+          className={`lg:col-span-2 p-5 rounded-2xl border flex flex-col justify-between ${cardBg}`}
+        >
           <div className="flex flex-wrap items-start justify-between gap-3 mb-4">
             <div>
               <h2 className="font-bold text-sm">
@@ -307,7 +333,6 @@ export const EnergyAnalyticsPanel: React.FC<EnergyAnalyticsPanelProps> = ({
                 </span>
               </div>
 
-              {/* Bộ chọn Ngày / Tuần / Tháng */}
               <div className="inline-flex rounded-xl bg-slate-900/90 border border-slate-800 p-0.5">
                 {(
                   [
@@ -331,7 +356,6 @@ export const EnergyAnalyticsPanel: React.FC<EnergyAnalyticsPanelProps> = ({
                 ))}
               </div>
 
-              {/* Bộ chọn Cột / Đường mượt */}
               <div className="inline-flex rounded-xl bg-slate-900/90 border border-slate-800 p-0.5">
                 <button
                   type="button"
@@ -359,9 +383,7 @@ export const EnergyAnalyticsPanel: React.FC<EnergyAnalyticsPanelProps> = ({
             </div>
           </div>
 
-          {/* Khung vẽ biểu đồ */}
           <div className="relative rounded-xl border border-slate-800/80 bg-[#090f1e] p-4 pt-6">
-            {/* Tooltip khi rê chuột */}
             {hoveredIdx !== null && chartStats.points[hoveredIdx] && (
               <div className="absolute top-2 right-3 z-10 px-3 py-1.5 rounded-lg bg-slate-900/95 border border-cyan-500/40 text-xs shadow-lg pointer-events-none">
                 <span className="font-bold text-cyan-400 mr-2">
@@ -372,16 +394,15 @@ export const EnergyAnalyticsPanel: React.FC<EnergyAnalyticsPanelProps> = ({
                 </span>
                 <span className="text-emerald-400 font-mono">
                   (~
-                  {Math.round(chartStats.points[hoveredIdx].kwh * UNIT_PRICE_VND).toLocaleString(
-                    'vi-VN'
-                  )}{' '}
+                  {Math.round(
+                    chartStats.points[hoveredIdx].kwh * UNIT_PRICE_VND
+                  ).toLocaleString('vi-VN')}{' '}
                   đ)
                 </span>
               </div>
             )}
 
             <div className="flex gap-3">
-              {/* Trục Y */}
               <div className="flex flex-col justify-between text-[10px] font-mono text-slate-500 py-1 select-none">
                 <span>{chartStats.maxScale.toFixed(2)}</span>
                 <span>{(chartStats.maxScale * 0.75).toFixed(2)}</span>
@@ -390,9 +411,7 @@ export const EnergyAnalyticsPanel: React.FC<EnergyAnalyticsPanelProps> = ({
                 <span>0.00</span>
               </div>
 
-              {/* Vùng cột / đường */}
               <div className="flex-1 relative h-52 flex flex-col justify-end">
-                {/* Đường kẻ ngang tham chiếu */}
                 <div className="absolute inset-0 flex flex-col justify-between pointer-events-none">
                   {[0, 1, 2, 3, 4].map((line) => (
                     <div
@@ -402,7 +421,6 @@ export const EnergyAnalyticsPanel: React.FC<EnergyAnalyticsPanelProps> = ({
                   ))}
                 </div>
 
-                {/* Đường tham chiếu trung bình */}
                 {chartStats.avgKwh > 0 && (
                   <div
                     style={{
@@ -420,7 +438,8 @@ export const EnergyAnalyticsPanel: React.FC<EnergyAnalyticsPanelProps> = ({
                     {chartStats.points.map((pt, idx) => {
                       const ratio = Math.min(1, pt.kwh / chartStats.maxScale);
                       const heightPct = pt.kwh > 0 ? Math.max(6, ratio * 100) : 2;
-                      const isPeak = pt.kwh > 0 && pt.kwh === chartStats.peakPoint.kwh;
+                      const isPeak =
+                        pt.kwh > 0 && pt.kwh === chartStats.peakPoint.kwh;
 
                       return (
                         <div
@@ -480,7 +499,8 @@ export const EnergyAnalyticsPanel: React.FC<EnergyAnalyticsPanelProps> = ({
                               cy={c.y}
                               r={hoveredIdx === c.idx ? 5 : 3}
                               fill={
-                                c.pt.kwh > 0 && c.pt.kwh === chartStats.peakPoint.kwh
+                                c.pt.kwh > 0 &&
+                                c.pt.kwh === chartStats.peakPoint.kwh
                                   ? '#fbbf24'
                                   : '#22d3ee'
                               }
@@ -497,7 +517,6 @@ export const EnergyAnalyticsPanel: React.FC<EnergyAnalyticsPanelProps> = ({
               </div>
             </div>
 
-            {/* Nhãn trục X */}
             <div className="flex justify-between pl-9 pr-1 mt-2 text-[10px] font-mono text-slate-500">
               {chartStats.points.map((pt, idx) => {
                 const showLabel =
@@ -514,8 +533,10 @@ export const EnergyAnalyticsPanel: React.FC<EnergyAnalyticsPanelProps> = ({
           </div>
         </div>
 
-        {/* Tỷ trọng Công suất Tức thời (1/3 bên phải) */}
-        <div className={`p-5 rounded-2xl border flex flex-col justify-between ${cardBg}`}>
+        {/* Tỷ trọng Công suất Tức thời */}
+        <div
+          className={`p-5 rounded-2xl border flex flex-col justify-between ${cardBg}`}
+        >
           <div>
             <h2 className="font-bold text-sm">🎯 Tỷ trọng Công suất Tức thời</h2>
             <p className="text-xs text-slate-400 mt-0.5">
@@ -523,7 +544,6 @@ export const EnergyAnalyticsPanel: React.FC<EnergyAnalyticsPanelProps> = ({
             </p>
           </div>
 
-          {/* Donut SVG */}
           <div className="my-4 flex items-center justify-center">
             <div className="relative w-44 h-44 flex items-center justify-center">
               <svg viewBox="0 0 110 110" className="w-full h-full -rotate-90">
@@ -573,7 +593,6 @@ export const EnergyAnalyticsPanel: React.FC<EnergyAnalyticsPanelProps> = ({
             </div>
           </div>
 
-          {/* Danh sách tỷ trọng từng nhóm */}
           <div className="space-y-2.5 text-xs">
             {deviceLoadBreakdown.groups.map((grp) => (
               <div key={grp.key} className="flex items-center justify-between">
@@ -594,7 +613,9 @@ export const EnergyAnalyticsPanel: React.FC<EnergyAnalyticsPanelProps> = ({
       {/* ==================== ROW 3: CHI TIẾT CÔNG SUẤT TỪNG THIẾT BỊ IOT ==================== */}
       <div className={`p-5 rounded-2xl border ${cardBg}`}>
         <div className="flex items-center justify-between mb-4">
-          <h2 className="font-bold text-sm">🔌 Chi tiết công suất từng thiết bị IoT</h2>
+          <h2 className="font-bold text-sm">
+            🔌 Chi tiết công suất từng thiết bị IoT
+          </h2>
           <span className="text-xs font-mono text-slate-400">
             Tổng: {deviceLoadBreakdown.items.length} thiết bị
           </span>
@@ -620,12 +641,21 @@ export const EnergyAnalyticsPanel: React.FC<EnergyAnalyticsPanelProps> = ({
                 {deviceLoadBreakdown.items.map((dev) => {
                   const loadSharePct =
                     deviceLoadBreakdown.totalLiveWatt > 0
-                      ? Math.round((dev.currentWatt / deviceLoadBreakdown.totalLiveWatt) * 100)
+                      ? Math.round(
+                          (dev.currentWatt /
+                            deviceLoadBreakdown.totalLiveWatt) *
+                            100
+                        )
                       : 0;
-                  const isSensor = dev.device_type.toLowerCase().includes('sensor');
+                  const isSensor = dev.device_type
+                    .toLowerCase()
+                    .includes('sensor');
 
                   return (
-                    <tr key={dev.id} className="hover:bg-slate-800/30 transition">
+                    <tr
+                      key={dev.id}
+                      className="hover:bg-slate-800/30 transition"
+                    >
                       <td className="py-3 px-3 font-bold">{dev.name}</td>
                       <td className="py-3 px-3 text-slate-400">
                         {dev.room_name || 'Chưa phân phòng'}
@@ -645,7 +675,11 @@ export const EnergyAnalyticsPanel: React.FC<EnergyAnalyticsPanelProps> = ({
                         <div className="flex items-center gap-2">
                           <div className="flex-1 h-1.5 rounded-full bg-slate-800 overflow-hidden">
                             <div
-                              style={{ width: `${dev.is_on ? Math.max(4, loadSharePct) : 0}%` }}
+                              style={{
+                                width: `${
+                                  dev.is_on ? Math.max(4, loadSharePct) : 0
+                                }%`,
+                              }}
                               className="h-full rounded-full bg-cyan-400 transition-all duration-300"
                             />
                           </div>

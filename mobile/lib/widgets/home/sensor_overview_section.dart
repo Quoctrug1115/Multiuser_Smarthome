@@ -7,9 +7,7 @@ class SensorOverviewSection extends StatelessWidget {
   final double humidity;
   final int lux;
   final bool motion;
-  final bool isConnected;
-  final int activeDeviceCount;
-  final double instantPowerWatt;
+  final double totalWatt;
   final bool isDark;
 
   const SensorOverviewSection({
@@ -18,123 +16,92 @@ class SensorOverviewSection extends StatelessWidget {
     required this.humidity,
     required this.lux,
     required this.motion,
-    required this.isConnected,
-    required this.activeDeviceCount,
-    required this.instantPowerWatt,
+    this.totalWatt = 0.0,
     required this.isDark,
   });
 
-  Color get _cyan => isDark ? AppColors.primary : const Color(0xFF0284C7);
-  Color get _green => isDark ? Colors.greenAccent : const Color(0xFF0D9488);
-  Color get _amber => isDark ? Colors.amber : const Color(0xFFD97706);
-
   @override
   Widget build(BuildContext context) {
+    final cyan = isDark ? AppColors.primary : const Color(0xFF0284C7);
+    final green = isDark ? Colors.greenAccent : const Color(0xFF0D9488);
+    final amber = isDark ? Colors.amber : const Color(0xFFD97706);
+
     return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         Row(
-          mainAxisAlignment: MainAxisAlignment.spaceBetween,
           children: [
-            Text(
-              'CẢM BIẾN & TẢI TỨC THỜI',
-              style: TextStyle(
-                color: AppColors.getTextPrimary(isDark),
-                fontSize: 12,
-                fontWeight: FontWeight.bold,
-                letterSpacing: 0.6,
+            Expanded(
+              child: _buildSensorTile(
+                icon: Icons.thermostat,
+                label: 'NHIỆT ĐỘ',
+                value: '${temperature.toStringAsFixed(1)}°C',
+                color: temperature > 35 ? AppColors.accent : amber,
               ),
             ),
-            Row(
-              children: [
-                Icon(
-                  Icons.circle,
-                  size: 8,
-                  color: isConnected ? _green : AppColors.accent,
-                ),
-                const SizedBox(width: 5),
-                Text(
-                  isConnected ? 'LIVE WS/MQTT' : 'OFFLINE',
-                  style: TextStyle(
-                    color: isConnected ? _green : AppColors.accent,
-                    fontSize: 10,
-                    fontWeight: FontWeight.bold,
-                  ),
-                ),
-              ],
+            const SizedBox(width: 10),
+            Expanded(
+              child: _buildSensorTile(
+                icon: Icons.water_drop_outlined,
+                label: 'ĐỘ ẨM',
+                value: '${humidity.toStringAsFixed(0)}%',
+                color: cyan,
+              ),
             ),
           ],
         ),
-        const SizedBox(height: 8),
+        const SizedBox(height: 10),
         Row(
           children: [
             Expanded(
               child: _buildSensorTile(
-                'NHIỆT ĐỘ',
-                '${temperature.toStringAsFixed(1)}°C',
-                Icons.thermostat,
-                AppColors.accent,
+                icon: Icons.wb_sunny_outlined,
+                label: 'ÁNH SÁNG',
+                value: '$lux lx',
+                color: green,
               ),
             ),
-            const SizedBox(width: 8),
+            const SizedBox(width: 10),
             Expanded(
               child: _buildSensorTile(
-                'ĐỘ ẨM',
-                '${humidity.toStringAsFixed(0)}%',
-                Icons.water_drop_outlined,
-                _cyan,
-              ),
-            ),
-            const SizedBox(width: 8),
-            Expanded(
-              child: _buildSensorTile(
-                'ÁNH SÁNG',
-                '$lux lx',
-                Icons.wb_sunny_outlined,
-                _amber,
-              ),
-            ),
-            const SizedBox(width: 8),
-            Expanded(
-              child: _buildSensorTile(
-                'CHUYỂN ĐỘNG',
-                motion ? 'CÓ' : 'KHÔNG',
-                Icons.directions_run,
-                motion ? AppColors.accent : _green,
+                icon: motion ? Icons.sensors : Icons.sensors_off,
+                label: 'CHUYỂN ĐỘNG',
+                value: motion ? 'CÓ NGƯỜI' : 'AN TOÀN',
+                color: motion ? AppColors.accent : AppColors.secondary,
               ),
             ),
           ],
         ),
-        const SizedBox(height: 8),
+        const SizedBox(height: 10),
         Container(
-          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
           decoration: BoxDecoration(
             color: AppColors.getSurface(isDark),
             borderRadius: BorderRadius.circular(12),
-            border: Border.all(color: _cyan.withOpacity(0.3)),
+            border: Border.all(color: cyan.withOpacity(0.35)),
           ),
           child: Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
               Row(
                 children: [
-                  Icon(Icons.bolt, color: _amber, size: 18),
-                  const SizedBox(width: 6),
+                  Icon(Icons.bolt, color: amber, size: 19),
+                  const SizedBox(width: 8),
                   Text(
-                    'Công suất tải đang bật ($activeDeviceCount thiết bị):',
+                    'TỔNG CÔNG SUẤT ĐANG TẢI',
                     style: TextStyle(
                       color: AppColors.getTextSecondary(isDark),
                       fontSize: 11,
+                      fontWeight: FontWeight.bold,
                     ),
                   ),
                 ],
               ),
               Text(
-                '${instantPowerWatt.toStringAsFixed(0)} W',
+                '${totalWatt.toStringAsFixed(0)} W',
                 style: TextStyle(
-                  color: _cyan,
+                  color: cyan,
+                  fontSize: 14,
                   fontWeight: FontWeight.bold,
-                  fontSize: 13,
                 ),
               ),
             ],
@@ -144,41 +111,50 @@ class SensorOverviewSection extends StatelessWidget {
     );
   }
 
-  Widget _buildSensorTile(
-    String label,
-    String value,
-    IconData icon,
-    Color color,
-  ) {
+  Widget _buildSensorTile({
+    required IconData icon,
+    required String label,
+    required String value,
+    required Color color,
+  }) {
     return Container(
-      padding: const EdgeInsets.all(10),
+      padding: const EdgeInsets.all(12),
       decoration: BoxDecoration(
         color: AppColors.getSurface(isDark),
         borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: isDark ? Colors.white12 : Colors.black12),
+        border: Border.all(color: color.withOpacity(0.35)),
       ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
+      child: Row(
         children: [
-          Icon(icon, color: color, size: 18),
-          const SizedBox(height: 8),
-          Text(
-            value,
-            style: TextStyle(
-              color: AppColors.getTextPrimary(isDark),
-              fontSize: 14,
-              fontWeight: FontWeight.bold,
-            ),
+          CircleAvatar(
+            radius: 17,
+            backgroundColor: color.withOpacity(0.15),
+            child: Icon(icon, color: color, size: 18),
           ),
-          const SizedBox(height: 2),
-          Text(
-            label,
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-            style: const TextStyle(
-              color: AppColors.textMuted,
-              fontSize: 9,
-              fontWeight: FontWeight.w600,
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  label,
+                  style: const TextStyle(
+                    color: AppColors.textMuted,
+                    fontSize: 9.5,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  value,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    color: AppColors.getTextPrimary(isDark),
+                    fontSize: 14,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+              ],
             ),
           ),
         ],

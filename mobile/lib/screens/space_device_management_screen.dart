@@ -1,13 +1,17 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
 import '../models/smarthome_models.dart';
 import '../services/api_service.dart';
+import '../services/websocket_service.dart';
 import '../theme/app_colors.dart';
 import '../theme/theme_provider.dart';
 import '../widgets/home/device_card.dart';
 import '../widgets/home/device_dialogs.dart';
 import '../widgets/home/device_excel_sheet.dart';
+import '../widgets/spaces/space_excel_sheet.dart';
 
 class SpaceDeviceManagementScreen extends StatefulWidget {
   const SpaceDeviceManagementScreen({super.key});
@@ -21,6 +25,9 @@ class _SpaceDeviceManagementScreenState
     extends State<SpaceDeviceManagementScreen> {
   final ApiService _api = ApiService();
   final TextEditingController _searchCtrl = TextEditingController();
+  StreamSubscription<dynamic>? _wsSub;
+  Timer? _syncTimer;
+  bool _wsBound = false;
 
   int _subTabIndex = 0; // 0: Ngôi nhà | 1: Phòng | 2: Thiết bị
   String _filterHouseId = 'ALL';
@@ -36,6 +43,91 @@ class _SpaceDeviceManagementScreenState
   void initState() {
     super.initState();
     _loadAll();
+    _syncTimer = Timer.periodic(const Duration(seconds: 5), (_) {
+      _syncDevicesSilently();
+    });
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    if (!_wsBound) {
+      _wsBound = true;
+      WebSocketService ws;
+      try {
+        ws = Provider.of<WebSocketService>(context, listen: false);
+      } catch (_) {
+        ws = WebSocketService();
+      }
+      if (_api.isAuthenticated && !ws.isConnected) {
+        ws.connect(_api.wsUrl);
+      }
+      _wsSub = ws.deviceStream.listen(_handleWsMessage);
+    }
+  }
+
+  void _handleWsMessage(dynamic rawMsg) {
+    if (!mounted || rawMsg == null) return;
+
+    String devId = '';
+    String topic = '';
+    bool isOn = false;
+
+    if (rawMsg is Map) {
+      final data = rawMsg['data'] is Map ? rawMsg['data'] as Map : rawMsg;
+      devId = (data['device_id'] ?? data['id'] ?? '')
+          .toString()
+          .trim()
+          .toLowerCase();
+      topic = (data['mqtt_topic'] ?? '').toString().trim().toLowerCase();
+      final rawState = data['is_on'] ?? data['status'] ?? data['state'];
+      if (rawState is bool) {
+        isOn = rawState;
+      } else {
+        final s = (rawState ?? '').toString().trim().toLowerCase();
+        isOn = s == 'on' || s == 'true' || s == '1' || s == 'active';
+      }
+    } else {
+      try {
+        devId = (rawMsg.id ?? '').toString().trim().toLowerCase();
+        topic = (rawMsg.mqttTopic ?? '').toString().trim().toLowerCase();
+        isOn = rawMsg.isOn == true;
+      } catch (_) {
+        return;
+      }
+    }
+
+    bool matched = false;
+    setState(() {
+      for (final d in _devices) {
+        final localId = (d['id'] ?? '').toString().trim().toLowerCase();
+        final localTopic = (d['mqtt_topic'] ?? '')
+            .toString()
+            .trim()
+            .toLowerCase();
+        final matchId = devId.isNotEmpty && localId == devId;
+        final matchTopic = topic.isNotEmpty && localTopic == topic;
+        if (matchId || matchTopic) {
+          d['is_on'] = isOn;
+          d['status'] = isOn ? 'ON' : 'OFF';
+          matched = true;
+        }
+      }
+    });
+
+    if (!matched) {
+      _syncDevicesSilently();
+    }
+  }
+
+  Future<void> _syncDevicesSilently() async {
+    try {
+      final list = await _api.getDevices();
+      if (!mounted) return;
+      setState(() {
+        _devices = list;
+      });
+    } catch (_) {}
   }
 
   Future<void> _loadAll() async {
@@ -116,7 +208,6 @@ class _SpaceDeviceManagementScreenState
   int _countDevicesInRoom(String roomId) =>
       _devices.where((d) => (d['room_id'] ?? '').toString() == roomId).length;
 
-  // ==================== DIALOG THÊM / SỬA NHÀ ====================
   void _openHouseDialog(bool isDark, {JsonMap? house}) {
     final isEdit = house != null;
     final nameCtrl = TextEditingController(
@@ -198,7 +289,6 @@ class _SpaceDeviceManagementScreenState
     );
   }
 
-  // ==================== DIALOG THÊM / SỬA PHÒNG ====================
   void _openRoomDialog(bool isDark, {JsonMap? room}) {
     if (_houses.isEmpty) {
       _showSnack('Vui lòng tạo ít nhất 1 Ngôi nhà trước!', isError: true);
@@ -372,6 +462,8 @@ class _SpaceDeviceManagementScreenState
 
   @override
   void dispose() {
+    _wsSub?.cancel();
+    _syncTimer?.cancel();
     _searchCtrl.dispose();
     super.dispose();
   }
@@ -381,6 +473,7 @@ class _SpaceDeviceManagementScreenState
     final isDark = Provider.of<ThemeProvider>(context).isDarkMode;
     final apiService = Provider.of<ApiService>(context);
     final isAdmin = apiService.isAdmin;
+    final canControl = apiService.currentUserRole.toLowerCase() != 'guest';
 
     final cyan = isDark ? AppColors.primary : const Color(0xFF0284C7);
     final green = isDark ? Colors.greenAccent : const Color(0xFF0D9488);
@@ -395,7 +488,6 @@ class _SpaceDeviceManagementScreenState
         child: ListView(
           padding: const EdgeInsets.fromLTRB(16, 14, 16, 95),
           children: [
-            // 1. THỐNG KÊ HẠ TẦNG NHÀ - PHÒNG - THIẾT BỊ
             Row(
               children: [
                 Expanded(
@@ -430,8 +522,6 @@ class _SpaceDeviceManagementScreenState
               ],
             ),
             const SizedBox(height: 14),
-
-            // 2. THANH CHUYỂN PHÂN KHU QUẢN LÝ (NHÀ / PHÒNG / THIẾT BỊ)
             Container(
               padding: const EdgeInsets.all(4),
               decoration: BoxDecoration(
@@ -455,18 +545,56 @@ class _SpaceDeviceManagementScreenState
               ),
             ),
             const SizedBox(height: 14),
-
             if (_isLoading)
               Padding(
                 padding: const EdgeInsets.symmetric(vertical: 48),
                 child: Center(child: CircularProgressIndicator(color: cyan)),
               )
-            else if (_subTabIndex == 0)
-              _buildHousesSection(isDark, isAdmin, cyan, green)
-            else if (_subTabIndex == 1)
-              _buildRoomsSection(isDark, isAdmin, cyan, green)
-            else
-              _buildDevicesSection(isDark, isAdmin, cyan, green, amber),
+            else ...[
+              if (isAdmin && (_subTabIndex == 0 || _subTabIndex == 1)) ...[
+                SizedBox(
+                  width: double.infinity,
+                  child: OutlinedButton.icon(
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: green,
+                      side: BorderSide(color: green.withOpacity(0.6)),
+                      padding: const EdgeInsets.symmetric(vertical: 10),
+                    ),
+                    onPressed: () => showSpaceExcelSheet(
+                      context: context,
+                      isDark: isDark,
+                      api: _api,
+                      existingHouses: _houses,
+                      existingRooms: _rooms,
+                      onSnack: _showSnack,
+                      onRefresh: _loadAll,
+                    ),
+                    icon: const Icon(Icons.table_view, size: 18),
+                    label: const Text(
+                      'NHẬP / XUẤT EXCEL NHÀ & PHÒNG (.XLSX)',
+                      style: TextStyle(
+                        fontSize: 11,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 12),
+              ],
+              if (_subTabIndex == 0)
+                _buildHousesSection(isDark, isAdmin, cyan, green)
+              else if (_subTabIndex == 1)
+                _buildRoomsSection(isDark, isAdmin, cyan, green)
+              else
+                _buildDevicesSection(
+                  isDark,
+                  isAdmin,
+                  canControl,
+                  cyan,
+                  green,
+                  amber,
+                ),
+            ],
           ],
         ),
       ),
@@ -618,7 +746,6 @@ class _SpaceDeviceManagementScreenState
     );
   }
 
-  // ==================== PHÂN KHU 1: NGÔI NHÀ ====================
   Widget _buildHousesSection(
     bool isDark,
     bool isAdmin,
@@ -749,7 +876,6 @@ class _SpaceDeviceManagementScreenState
     );
   }
 
-  // ==================== PHÂN KHU 2: PHÒNG ====================
   Widget _buildRoomsSection(
     bool isDark,
     bool isAdmin,
@@ -887,10 +1013,10 @@ class _SpaceDeviceManagementScreenState
     );
   }
 
-  // ==================== PHÂN KHU 3: THIẾT BỊ ====================
   Widget _buildDevicesSection(
     bool isDark,
     bool isAdmin,
+    bool canControl,
     Color cyan,
     Color green,
     Color amber,
@@ -1020,107 +1146,63 @@ class _SpaceDeviceManagementScreenState
         if (filtered.isEmpty)
           _buildEmptyBox(isDark, 'Không có thiết bị nào khớp bộ lọc hiện tại.')
         else
-          ...filtered.map((d) {
-            final id = (d['id'] ?? '').toString();
-            final name = (d['name'] ?? '').toString();
-            final type = (d['device_type'] ?? 'switch').toString();
-            final topic = (d['mqtt_topic'] ?? '').toString();
-            final roomName = _resolveRoomName(d);
-            final model = Device.fromJson(d);
+          ...filtered.map((device) {
+            final id = (device['id'] ?? '').toString();
+            final name = (device['name'] ?? 'Thiết bị').toString();
+            final topic = (device['mqtt_topic'] ?? '').toString();
 
-            return Container(
-              margin: const EdgeInsets.only(bottom: 10),
-              padding: const EdgeInsets.all(12),
-              decoration: BoxDecoration(
-                color: AppColors.getSurface(isDark),
-                borderRadius: BorderRadius.circular(12),
-                border: Border.all(
-                  color: isDark ? Colors.white12 : Colors.black12,
-                ),
+            return HomeDeviceCard(
+              device: device,
+              roomName: _resolveRoomName(device),
+              isDark: isDark,
+              isOwner: isAdmin,
+              canControl: canControl,
+              onToggle: (newVal) async {
+                final cmd = newVal ? 'ON' : 'OFF';
+                setState(() {
+                  device['is_on'] = newVal;
+                  device['status'] = cmd;
+                });
+                try {
+                  await _api.controlDevice(id, cmd, mqttTopic: topic);
+                } catch (e) {
+                  if (!mounted) return;
+                  setState(() {
+                    device['is_on'] = !newVal;
+                    device['status'] = !newVal ? 'ON' : 'OFF';
+                  });
+                  _showSnack(
+                    e.toString().replaceFirst('Exception: ', ''),
+                    isError: true,
+                  );
+                }
+              },
+              onEdit: () => showDeviceFormDialog(
+                context: context,
+                isDark: isDark,
+                api: _api,
+                rooms: _rooms,
+                existingDevice: device,
+                onLog: (_, __) {},
+                onSnack: _showSnack,
+                onRefresh: _loadAll,
               ),
-              child: Row(
-                children: [
-                  CircleAvatar(
-                    backgroundColor: cyan.withOpacity(0.15),
-                    child: Icon(
-                      HomeDeviceCard.iconForType(type),
-                      color: cyan,
-                      size: 20,
-                    ),
-                  ),
-                  const SizedBox(width: 12),
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          name,
-                          style: TextStyle(
-                            color: AppColors.getTextPrimary(isDark),
-                            fontWeight: FontWeight.bold,
-                            fontSize: 13.5,
-                          ),
-                        ),
-                        const SizedBox(height: 2),
-                        Text(
-                          '${type.toUpperCase()} • ${roomName.isEmpty ? "Chưa gán phòng" : roomName} • ${model.ratedPowerWatt.toStringAsFixed(0)}W',
-                          style: TextStyle(
-                            color: roomName.isEmpty ? amber : green,
-                            fontSize: 11,
-                            fontWeight: FontWeight.w600,
-                          ),
-                        ),
-                        Text(
-                          topic,
-                          overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(
-                            color: AppColors.textMuted,
-                            fontSize: 10.5,
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                  if (isAdmin) ...[
-                    IconButton(
-                      icon: const Icon(Icons.edit_outlined, size: 19),
-                      onPressed: () => showDeviceFormDialog(
-                        context: context,
-                        isDark: isDark,
-                        api: _api,
-                        rooms: _rooms,
-                        existingDevice: d,
-                        onLog: (_, __) {},
-                        onSnack: _showSnack,
-                        onRefresh: _loadAll,
-                      ),
-                    ),
-                    IconButton(
-                      icon: const Icon(
-                        Icons.delete_outline,
-                        size: 19,
-                        color: AppColors.accent,
-                      ),
-                      onPressed: () => _confirmDelete(
-                        isDark: isDark,
-                        title: 'Xóa thiết bị?',
-                        message: 'Xác nhận xóa thiết bị "$name"?',
-                        onConfirm: () async {
-                          try {
-                            await _api.deleteDevice(id);
-                            _showSnack('Đã xóa $name');
-                            await _loadAll();
-                          } catch (e) {
-                            _showSnack(
-                              e.toString().replaceFirst('Exception: ', ''),
-                              isError: true,
-                            );
-                          }
-                        },
-                      ),
-                    ),
-                  ],
-                ],
+              onDelete: () => _confirmDelete(
+                isDark: isDark,
+                title: 'Xóa thiết bị?',
+                message: 'Xác nhận xóa thiết bị "$name"?',
+                onConfirm: () async {
+                  try {
+                    await _api.deleteDevice(id);
+                    _showSnack('Đã xóa $name');
+                    await _loadAll();
+                  } catch (e) {
+                    _showSnack(
+                      e.toString().replaceFirst('Exception: ', ''),
+                      isError: true,
+                    );
+                  }
+                },
               ),
             );
           }),

@@ -1,10 +1,13 @@
-import 'dart:math' as math;
+import 'dart:async';
+import 'dart:convert';
 
 import 'package:flutter/material.dart';
+import 'package:http/http.dart' as http;
 import 'package:provider/provider.dart';
 
 import '../models/smarthome_models.dart';
 import '../services/api_service.dart';
+import '../services/websocket_service.dart';
 import '../theme/app_colors.dart';
 import '../theme/theme_provider.dart';
 
@@ -17,138 +20,263 @@ class EnergyScreen extends StatefulWidget {
 
 class _EnergyScreenState extends State<EnergyScreen> {
   final ApiService _api = ApiService();
-  String _selectedRange = '7d'; // '24h' | '7d' | '30d'
+  late WebSocketService _ws;
+  bool _wsBound = false;
+
+  StreamSubscription<dynamic>? _deviceSub;
+  StreamSubscription<dynamic>? _sensorSub;
+  Timer? _syncTimer;
+
+  String _selectedRange = '7D'; // 24H | 7D | 30D
   bool _isLoading = true;
 
-  JsonMap _stats = {};
-  List<Device> _devices = [];
+  double _totalKwh = 0.0;
+  double _estimatedCost = 0.0;
+  double _unitPriceVnd = 2500.0;
+  double? _telemetryLiveWatt;
+
+  List _chartBars = [];
+  JsonList _devices = [];
 
   @override
   void initState() {
     super.initState();
     _loadEnergyData();
+    _syncTimer = Timer.periodic(const Duration(seconds: 6), (_) {
+      _syncDevicesSilently();
+    });
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    if (!_wsBound) {
+      _wsBound = true;
+      try {
+        _ws = Provider.of<WebSocketService>(context, listen: false);
+      } catch (_) {
+        _ws = WebSocketService();
+      }
+      if (_api.isAuthenticated && !_ws.isConnected) {
+        _ws.connect(_api.wsUrl);
+      }
+      _bindRealtime();
+    }
+  }
+
+  void _bindRealtime() {
+    _deviceSub = _ws.deviceStream.listen((raw) {
+      if (!mounted || raw == null) return;
+      String incomingId = '';
+      String topic = '';
+      bool isOn = false;
+
+      if (raw is Map) {
+        final data = raw['data'] is Map ? raw['data'] as Map : raw;
+        incomingId = (data['id'] ?? data['device_id'] ?? '')
+            .toString()
+            .trim()
+            .toLowerCase();
+        topic = (data['mqtt_topic'] ?? '').toString().trim().toLowerCase();
+        final rawState = data['is_on'] ?? data['status'] ?? data['state'];
+        isOn = rawState is bool
+            ? rawState
+            : [
+                'on',
+                'true',
+                '1',
+                'active',
+              ].contains((rawState ?? '').toString().trim().toLowerCase());
+      } else {
+        try {
+          incomingId = (raw.id ?? '').toString().trim().toLowerCase();
+          topic = (raw.mqttTopic ?? '').toString().trim().toLowerCase();
+          isOn = raw.isOn == true;
+        } catch (_) {
+          return;
+        }
+      }
+
+      setState(() {
+        for (final d in _devices) {
+          final localId = (d['id'] ?? '').toString().trim().toLowerCase();
+          final localTopic = (d['mqtt_topic'] ?? '')
+              .toString()
+              .trim()
+              .toLowerCase();
+          if ((incomingId.isNotEmpty && localId == incomingId) ||
+              (topic.isNotEmpty && localTopic == topic)) {
+            d['is_on'] = isOn;
+            d['status'] = isOn ? 'ON' : 'OFF';
+          }
+        }
+      });
+    });
+
+    _sensorSub = _ws.sensorStream.listen((raw) {
+      if (!mounted || raw is! Map) return;
+      final data = raw['data'] is Map ? raw['data'] as Map : raw;
+      final p = data['power'] ?? data['watt'] ?? data['active_power'];
+      if (p is num && p > 0) {
+        setState(() {
+          _telemetryLiveWatt = p.toDouble();
+        });
+      }
+    });
+  }
+
+  Future<void> _syncDevicesSilently() async {
+    try {
+      final list = await _api.getDevices();
+      if (!mounted) return;
+      setState(() {
+        _devices = list;
+      });
+    } catch (_) {}
   }
 
   Future<void> _loadEnergyData() async {
     setState(() => _isLoading = true);
     try {
-      final results = await Future.wait([
-        _api
-            .getEnergyStats(_selectedRange)
-            .catchError((_) => <String, dynamic>{}),
-        _api.getDevices().catchError((_) => <JsonMap>[]),
-      ]);
+      final devicesFuture = _api.getDevices().catchError((_) => <JsonMap>[]);
+      final energyFuture = _fetchEnergyFromBackend(_selectedRange);
+
+      final results = await Future.wait([devicesFuture, energyFuture]);
       if (!mounted) return;
+
+      final devicesList = results[0] as JsonList;
+      final energyMap = results[1] as Map<String, dynamic>;
+
       setState(() {
-        _stats = results[0] as JsonMap;
-        _devices = (results[1] as JsonList)
-            .map((e) => Device.fromJson(e))
-            .toList();
+        _devices = devicesList;
+        _totalKwh = (energyMap['total_kwh'] as num?)?.toDouble() ?? 0.0;
+        _unitPriceVnd = (energyMap['unit_price'] as num?)?.toDouble() ?? 2500.0;
+        _estimatedCost =
+            (energyMap['estimated_cost'] as num?)?.toDouble() ??
+            (_totalKwh * _unitPriceVnd);
+        _chartBars = List.from(
+          energyMap['bars'] as List? ?? _buildDefaultBars(),
+        );
         _isLoading = false;
       });
-    } catch (e) {
+    } catch (_) {
       if (!mounted) return;
-      setState(() => _isLoading = false);
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text(e.toString().replaceFirst('Exception: ', '')),
-          backgroundColor: AppColors.accent,
-        ),
-      );
+      setState(() {
+        _chartBars = _buildDefaultBars();
+        _isLoading = false;
+      });
     }
   }
 
-  List get _chartPoints {
-    final rawSeries =
-        _stats['chart'] ??
-        _stats['daily'] ??
-        _stats['hourly'] ??
-        _stats['series'] ??
-        _stats['data'];
+  Future _fetchEnergyFromBackend(String range) async {
+    final headers = <String, String>{
+      'Content-Type': 'application/json',
+      if (_api.token != null && _api.token!.isNotEmpty)
+        'Authorization': 'Bearer ${_api.token}',
+    };
 
-    if (rawSeries is List && rawSeries.isNotEmpty) {
-      return rawSeries.map((item) {
-        if (item is Map) {
-          final label =
-              (item['label'] ??
-                      item['date'] ??
-                      item['day'] ??
-                      item['hour'] ??
-                      '')
-                  .toString();
-          final val =
-              (item['kwh'] ??
-                      item['energy_kwh'] ??
-                      item['value'] ??
-                      item['consumption'] ??
-                      0)
+    const paths = ['/energy', '/energy/stats', '/energy/summary'];
+    for (final path in paths) {
+      try {
+        final uri = Uri.parse('${_api.baseUrl}$path?period=$range');
+        final res = await http.get(uri, headers: headers);
+        if (res.statusCode >= 200 && res.statusCode < 300) {
+          final decoded = jsonDecode(res.body);
+          final map = decoded is Map<String, dynamic>
+              ? (decoded['data'] is Map
+                    ? Map<String, dynamic>.from(decoded['data'] as Map)
+                    : decoded)
+              : <String, dynamic>{};
+
+          final totalKwh =
+              ((map['total_kwh'] ??
+                          map['total_consumption'] ??
+                          map['kwh'] ??
+                          0.0)
+                      as num)
                   .toDouble();
+          final unitPrice =
+              ((map['unit_price'] ?? map['tariff'] ?? 2500.0) as num)
+                  .toDouble();
+          final cost =
+              ((map['estimated_cost'] ??
+                          map['total_cost'] ??
+                          (totalKwh * unitPrice))
+                      as num)
+                  .toDouble();
+
+          final rawSeries = map['daily'] ?? map['chart'] ?? map['series'];
+          final bars = [];
+          if (rawSeries is List && rawSeries.isNotEmpty) {
+            for (final item in rawSeries) {
+              if (item is Map) {
+                bars.add({
+                  'label': (item['label'] ?? item['date'] ?? '').toString(),
+                  'kwh': ((item['kwh'] ?? item['value'] ?? 0.0) as num)
+                      .toDouble(),
+                });
+              }
+            }
+          }
+
           return {
-            'label': label.length > 5
-                ? label.substring(label.length - 5)
-                : label,
-            'kwh': val,
+            'total_kwh': totalKwh,
+            'unit_price': unitPrice,
+            'estimated_cost': cost,
+            'bars': bars.isNotEmpty ? bars : _buildDefaultBars(),
           };
         }
-        return {'label': '', 'kwh': 0.0};
-      }).toList();
+      } catch (_) {}
     }
 
-    // Dữ liệu tham chiếu tỷ lệ theo thiết bị đang bật nếu TimescaleDB chưa tích lũy đủ mẫu
-    final baseKwh = math.max(1.2, _activeWatt * 24 / 1000.0);
-    if (_selectedRange == '24h') {
-      return [
-        {'label': '00h', 'kwh': baseKwh * 0.12},
-        {'label': '04h', 'kwh': baseKwh * 0.10},
-        {'label': '08h', 'kwh': baseKwh * 0.18},
-        {'label': '12h', 'kwh': baseKwh * 0.22},
-        {'label': '16h', 'kwh': baseKwh * 0.16},
-        {'label': '20h', 'kwh': baseKwh * 0.22},
-      ];
-    }
-    return [
-      {'label': 'T2', 'kwh': baseKwh * 0.92},
-      {'label': 'T3', 'kwh': baseKwh * 1.05},
-      {'label': 'T4', 'kwh': baseKwh * 0.88},
-      {'label': 'T5', 'kwh': baseKwh * 1.12},
-      {'label': 'T6', 'kwh': baseKwh * 0.98},
-      {'label': 'T7', 'kwh': baseKwh * 1.15},
-      {'label': 'CN', 'kwh': baseKwh * 1.02},
-    ];
+    return {
+      'total_kwh': 0.0,
+      'unit_price': 2500.0,
+      'estimated_cost': 0.0,
+      'bars': _buildDefaultBars(),
+    };
   }
 
-  double get _activeWatt =>
-      _devices.fold<double>(0.0, (sum, d) => sum + d.ratedPowerWatt);
-
-  double get _totalKwh {
-    final backendTotal =
-        _stats['total_kwh'] ?? _stats['total_energy_kwh'] ?? _stats['sum_kwh'];
-    if (backendTotal is num && backendTotal > 0) {
-      return backendTotal.toDouble();
-    }
-    return _chartPoints.fold<double>(
-      0.0,
-      (sum, p) => sum + (p['kwh'] as double),
-    );
+  List _buildDefaultBars() {
+    final now = DateTime.now();
+    return List.generate(7, (idx) {
+      final d = now.subtract(Duration(days: 6 - idx));
+      final label =
+          '${d.day.toString().padLeft(2, '0')}/${d.month.toString().padLeft(2, '0')}';
+      return {'label': label, 'kwh': 0.0};
+    });
   }
 
-  double get _estimatedCostVnd {
-    final backendCost = _stats['estimated_cost_vnd'] ?? _stats['total_cost'];
-    if (backendCost is num && backendCost > 0) {
-      return backendCost.toDouble();
+  List<Device> get _loadDevices {
+    return _devices
+        .map((e) => Device.fromJson(e))
+        .where((d) => d.ratedPowerWatt > 0)
+        .toList();
+  }
+
+  double get _instantPowerWatt {
+    double sum = 0.0;
+    for (final d in _loadDevices) {
+      if (d.isOn) {
+        sum += d.ratedPowerWatt;
+      }
     }
-    // Đơn giá điện sinh hoạt trung bình 2.500 VNĐ/kWh đồng bộ với Web
-    return _totalKwh * 2500.0;
+    if (sum > 0) return sum;
+    return _telemetryLiveWatt ?? 0.0;
   }
 
   String _formatVnd(double amount) {
     final intVal = amount.round().toString();
-    final buf = StringBuffer();
-    for (int i = 0; i < intVal.length; i++) {
-      if (i > 0 && (intVal.length - i) % 3 == 0) buf.write('.');
-      buf.write(intVal[i]);
-    }
-    return '${buf.toString()} đ';
+    final reg = RegExp(r'\B(?=(\d{3})+(?!\d))');
+    return '${intVal.replaceAllMapped(reg, (m) => '.')} đ';
+  }
+
+  @override
+  void dispose() {
+    _deviceSub?.cancel();
+    _sensorSub?.cancel();
+    _syncTimer?.cancel();
+    super.dispose();
   }
 
   @override
@@ -158,15 +286,18 @@ class _EnergyScreenState extends State<EnergyScreen> {
     final green = isDark ? Colors.greenAccent : const Color(0xFF0D9488);
     final amber = isDark ? Colors.amber : const Color(0xFFD97706);
 
-    final points = _chartPoints;
-    final maxKwh = points.fold<double>(
-      0.1,
-      (m, p) => math.max(m, (p['kwh'] as double)),
+    final loadDevices = _loadDevices;
+    final instantWatt = _instantPowerWatt;
+    final totalCapacityWatt = loadDevices.fold<double>(
+      0.0,
+      (prev, d) => prev + d.ratedPowerWatt,
     );
 
-    final consumerDevices = _devices
-        .where((d) => d.deviceType.toLowerCase() != 'sensor')
-        .toList();
+    double maxBarKwh = 0.2;
+    for (final b in _chartBars) {
+      final v = (b['kwh'] as num?)?.toDouble() ?? 0.0;
+      if (v > maxBarKwh) maxBarKwh = v;
+    }
 
     return Scaffold(
       backgroundColor: AppColors.getBackground(isDark),
@@ -174,9 +305,9 @@ class _EnergyScreenState extends State<EnergyScreen> {
         color: cyan,
         onRefresh: _loadEnergyData,
         child: ListView(
-          padding: const EdgeInsets.fromLTRB(16, 16, 16, 90),
+          padding: const EdgeInsets.fromLTRB(16, 14, 16, 90),
           children: [
-            // Bộ chọn chu kỳ thống kê
+            // HEADER & CHỌN CHU KỲ
             Row(
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
@@ -191,265 +322,303 @@ class _EnergyScreenState extends State<EnergyScreen> {
                 ),
                 Row(
                   children: [
-                    _buildPeriodChip('24H', '24h', cyan, isDark),
+                    _buildRangeBtn('24H', '24H', cyan, isDark),
                     const SizedBox(width: 6),
-                    _buildPeriodChip('7 NGÀY', '7d', cyan, isDark),
+                    _buildRangeBtn('7 NGÀY', '7D', cyan, isDark),
                     const SizedBox(width: 6),
-                    _buildPeriodChip('30 NGÀY', '30d', cyan, isDark),
+                    _buildRangeBtn('30 NGÀY', '30D', cyan, isDark),
                   ],
                 ),
               ],
             ),
             const SizedBox(height: 14),
 
-            if (_isLoading)
-              Padding(
-                padding: const EdgeInsets.symmetric(vertical: 48),
-                child: Center(child: CircularProgressIndicator(color: cyan)),
-              )
-            else ...[
-              // 3 Thẻ chỉ số KPI
-              Row(
+            // 3 THẺ TỔNG QUAN ĐIỆN NĂNG & TẢI TỨC THỜI
+            Row(
+              children: [
+                Expanded(
+                  child: _buildMetricCard(
+                    isDark: isDark,
+                    icon: Icons.bolt,
+                    color: cyan,
+                    value: '${_totalKwh.toStringAsFixed(2)} kWh',
+                    label: 'TỔNG TIÊU THỤ',
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: _buildMetricCard(
+                    isDark: isDark,
+                    icon: Icons.payments_outlined,
+                    color: green,
+                    value: _formatVnd(_estimatedCost),
+                    label: 'CHI PHÍ ƯỚC TÍNH',
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: _buildMetricCard(
+                    isDark: isDark,
+                    icon: Icons.speed,
+                    color: amber,
+                    value: '${instantWatt.toStringAsFixed(0)} W',
+                    label: 'TẢI TỨC THỜI',
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 14),
+
+            // BIỂU ĐỒ TIÊU THỤ (kWh)
+            Container(
+              padding: const EdgeInsets.all(14),
+              decoration: BoxDecoration(
+                color: AppColors.getSurface(isDark),
+                borderRadius: BorderRadius.circular(14),
+                border: Border.all(color: cyan.withOpacity(0.35)),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Expanded(
-                    child: _buildKpiCard(
-                      'TỔNG TIÊU THỤ',
-                      '${_totalKwh.toStringAsFixed(2)} kWh',
-                      Icons.electric_bolt,
-                      cyan,
-                      isDark,
-                    ),
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      Text(
+                        'BIỂU ĐỒ TIÊU THỤ (kWh)',
+                        style: TextStyle(
+                          color: AppColors.getTextPrimary(isDark),
+                          fontSize: 12,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                      Text(
+                        '${_formatVnd(_unitPriceVnd)}/kWh',
+                        style: TextStyle(
+                          color: green,
+                          fontSize: 11.5,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                    ],
                   ),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: _buildKpiCard(
-                      'CHI PHÍ ƯỚC TÍNH',
-                      _formatVnd(_estimatedCostVnd),
-                      Icons.payments_outlined,
-                      green,
-                      isDark,
-                    ),
-                  ),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: _buildKpiCard(
-                      'TẢI TỨC THỜI',
-                      '${_activeWatt.toStringAsFixed(0)} W',
-                      Icons.speed,
-                      amber,
-                      isDark,
+                  const SizedBox(height: 16),
+                  SizedBox(
+                    height: 130,
+                    child: Row(
+                      crossAxisAlignment: CrossAxisAlignment.end,
+                      children: _chartBars.map((bar) {
+                        final kwh = (bar['kwh'] as num?)?.toDouble() ?? 0.0;
+                        final label = (bar['label'] ?? '').toString();
+                        final ratio = maxBarKwh > 0
+                            ? (kwh / maxBarKwh).clamp(0.0, 1.0)
+                            : 0.0;
+                        final barHeight = kwh > 0 ? (14 + ratio * 76) : 6.0;
+
+                        return Expanded(
+                          child: Padding(
+                            padding: const EdgeInsets.symmetric(horizontal: 4),
+                            child: Column(
+                              mainAxisAlignment: MainAxisAlignment.end,
+                              children: [
+                                Text(
+                                  kwh.toStringAsFixed(1),
+                                  style: const TextStyle(
+                                    color: AppColors.textMuted,
+                                    fontSize: 9.5,
+                                  ),
+                                ),
+                                const SizedBox(height: 4),
+                                Container(
+                                  height: barHeight,
+                                  decoration: BoxDecoration(
+                                    gradient: LinearGradient(
+                                      begin: Alignment.topCenter,
+                                      end: Alignment.bottomCenter,
+                                      colors: [cyan, cyan.withOpacity(0.35)],
+                                    ),
+                                    borderRadius: BorderRadius.circular(6),
+                                  ),
+                                ),
+                                const SizedBox(height: 6),
+                                Text(
+                                  label,
+                                  style: TextStyle(
+                                    color: AppColors.getTextSecondary(isDark),
+                                    fontSize: 9.5,
+                                    fontWeight: FontWeight.w600,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        );
+                      }).toList(),
                     ),
                   ),
                 ],
               ),
-              const SizedBox(height: 16),
+            ),
+            const SizedBox(height: 18),
 
-              // Biểu đồ cột tiêu thụ điện năng
+            // PHÂN BỔ CÔNG SUẤT THIẾT BỊ (W và %)
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                Text(
+                  'PHÂN BỔ CÔNG SUẤT THIẾT BỊ (${loadDevices.length})',
+                  style: TextStyle(
+                    color: AppColors.getTextPrimary(isDark),
+                    fontSize: 12,
+                    fontWeight: FontWeight.bold,
+                    letterSpacing: 0.5,
+                  ),
+                ),
+                if (totalCapacityWatt > 0)
+                  Text(
+                    'Tổng định mức: ${totalCapacityWatt.toStringAsFixed(0)} W',
+                    style: const TextStyle(
+                      color: AppColors.textMuted,
+                      fontSize: 10.5,
+                    ),
+                  ),
+              ],
+            ),
+            const SizedBox(height: 10),
+
+            if (_isLoading)
+              Padding(
+                padding: const EdgeInsets.symmetric(vertical: 28),
+                child: Center(child: CircularProgressIndicator(color: cyan)),
+              )
+            else if (loadDevices.isEmpty)
               Container(
-                padding: const EdgeInsets.all(16),
+                padding: const EdgeInsets.all(20),
                 decoration: BoxDecoration(
                   color: AppColors.getSurface(isDark),
                   borderRadius: BorderRadius.circular(14),
-                  border: Border.all(color: cyan.withOpacity(0.35)),
                 ),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Row(
-                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                      children: [
-                        Text(
-                          'BIỂU ĐỒ TIÊU THỤ (kWh)',
-                          style: TextStyle(
-                            color: AppColors.getTextPrimary(isDark),
-                            fontSize: 12,
-                            fontWeight: FontWeight.bold,
-                          ),
-                        ),
-                        Text(
-                          '2.500 đ/kWh',
-                          style: TextStyle(
-                            color: green,
-                            fontSize: 11,
-                            fontWeight: FontWeight.w600,
-                          ),
-                        ),
-                      ],
-                    ),
-                    const SizedBox(height: 18),
-                    SizedBox(
-                      height: 150,
-                      child: Row(
-                        crossAxisAlignment: CrossAxisAlignment.end,
-                        children: points.map((pt) {
-                          final val = pt['kwh'] as double;
-                          final ratio = (val / maxKwh).clamp(0.08, 1.0);
-                          return Expanded(
-                            child: Padding(
-                              padding: const EdgeInsets.symmetric(
-                                horizontal: 4,
-                              ),
-                              child: Column(
-                                mainAxisAlignment: MainAxisAlignment.end,
-                                children: [
-                                  Text(
-                                    val.toStringAsFixed(1),
-                                    style: const TextStyle(
-                                      color: AppColors.textMuted,
-                                      fontSize: 9,
-                                    ),
-                                  ),
-                                  const SizedBox(height: 4),
-                                  AnimatedContainer(
-                                    duration: const Duration(milliseconds: 350),
-                                    height: 105 * ratio,
-                                    decoration: BoxDecoration(
-                                      gradient: LinearGradient(
-                                        begin: Alignment.topCenter,
-                                        end: Alignment.bottomCenter,
-                                        colors: [cyan, cyan.withOpacity(0.35)],
-                                      ),
-                                      borderRadius: const BorderRadius.vertical(
-                                        top: Radius.circular(6),
-                                      ),
-                                    ),
-                                  ),
-                                  const SizedBox(height: 6),
-                                  Text(
-                                    pt['label'].toString(),
-                                    overflow: TextOverflow.ellipsis,
-                                    style: TextStyle(
-                                      color: AppColors.getTextSecondary(isDark),
-                                      fontSize: 10,
-                                      fontWeight: FontWeight.w600,
-                                    ),
-                                  ),
-                                ],
-                              ),
-                            ),
-                          );
-                        }).toList(),
-                      ),
-                    ),
-                  ],
+                child: const Text(
+                  'Chưa có thiết bị tiêu thụ điện nào được cấu hình.',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(color: AppColors.textMuted, fontSize: 12),
                 ),
-              ),
-              const SizedBox(height: 18),
+              )
+            else
+              ...loadDevices.map((dev) {
+                final activeW = dev.isOn ? dev.ratedPowerWatt : 0.0;
+                // Tính % trên tổng tải tức thời đang bật (nếu đang bật)
+                final pct = (dev.isOn && instantWatt > 0)
+                    ? ((activeW / instantWatt) * 100).round()
+                    : 0;
+                final progress = (pct / 100).clamp(0.0, 1.0);
 
-              // Phân bổ công suất theo từng thiết bị
-              Text(
-                'PHÂN BỔ CÔNG SUẤT THIẾT BỊ (${consumerDevices.length})',
-                style: TextStyle(
-                  color: AppColors.getTextPrimary(isDark),
-                  fontSize: 12,
-                  fontWeight: FontWeight.bold,
-                  letterSpacing: 0.6,
-                ),
-              ),
-              const SizedBox(height: 10),
-              if (consumerDevices.isEmpty)
-                Container(
-                  padding: const EdgeInsets.all(20),
+                return Container(
+                  margin: const EdgeInsets.only(bottom: 10),
+                  padding: const EdgeInsets.all(14),
                   decoration: BoxDecoration(
                     color: AppColors.getSurface(isDark),
-                    borderRadius: BorderRadius.circular(12),
-                  ),
-                  child: const Text(
-                    'Chưa có thiết bị tiêu thụ điện nào được kết nối.',
-                    textAlign: TextAlign.center,
-                    style: TextStyle(color: AppColors.textMuted, fontSize: 12),
-                  ),
-                )
-              else
-                ...consumerDevices.map((dev) {
-                  final watt = dev.ratedPowerWatt;
-                  final share = _activeWatt > 0 ? (watt / _activeWatt) : 0.0;
-                  return Container(
-                    margin: const EdgeInsets.only(bottom: 10),
-                    padding: const EdgeInsets.all(12),
-                    decoration: BoxDecoration(
-                      color: AppColors.getSurface(isDark),
-                      borderRadius: BorderRadius.circular(12),
-                      border: Border.all(
-                        color: isDark ? Colors.white12 : Colors.black12,
-                      ),
+                    borderRadius: BorderRadius.circular(14),
+                    border: Border.all(
+                      color: dev.isOn
+                          ? cyan.withOpacity(0.45)
+                          : (isDark ? Colors.white12 : Colors.black12),
                     ),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Row(
-                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                          children: [
-                            Expanded(
-                              child: Text(
-                                dev.name,
-                                overflow: TextOverflow.ellipsis,
-                                style: TextStyle(
-                                  color: AppColors.getTextPrimary(isDark),
-                                  fontWeight: FontWeight.bold,
-                                  fontSize: 13,
-                                ),
-                              ),
-                            ),
-                            Text(
-                              dev.isOn
-                                  ? '${watt.toStringAsFixed(0)} W (${(share * 100).toStringAsFixed(0)}%)'
-                                  : 'ĐANG TẮT (0 W)',
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
+                        children: [
+                          Expanded(
+                            child: Text(
+                              dev.name,
                               style: TextStyle(
-                                color: dev.isOn ? cyan : AppColors.textMuted,
-                                fontSize: 11,
+                                color: AppColors.getTextPrimary(isDark),
+                                fontSize: 13.5,
                                 fontWeight: FontWeight.bold,
                               ),
                             ),
-                          ],
-                        ),
-                        const SizedBox(height: 8),
-                        ClipRRect(
-                          borderRadius: BorderRadius.circular(4),
-                          child: LinearProgressIndicator(
-                            value: dev.isOn ? share : 0.0,
-                            minHeight: 6,
-                            backgroundColor: AppColors.getBackground(isDark),
-                            valueColor: AlwaysStoppedAnimation<Color>(cyan),
+                          ),
+                          Text(
+                            '${activeW.toStringAsFixed(0)} W ($pct%)',
+                            style: TextStyle(
+                              color: dev.isOn ? cyan : AppColors.textMuted,
+                              fontSize: 12.5,
+                              fontWeight: FontWeight.bold,
+                            ),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 8),
+                      ClipRRect(
+                        borderRadius: BorderRadius.circular(6),
+                        child: LinearProgressIndicator(
+                          value: progress,
+                          minHeight: 6,
+                          backgroundColor: isDark
+                              ? Colors.white10
+                              : Colors.black12,
+                          valueColor: AlwaysStoppedAnimation<Color>(
+                            dev.isOn ? cyan : AppColors.textMuted,
                           ),
                         ),
-                      ],
-                    ),
-                  );
-                }),
-            ],
+                      ),
+                      const SizedBox(height: 6),
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          Text(
+                            dev.isOn ? 'Đang hoạt động' : 'Đang tắt',
+                            style: TextStyle(
+                              color: dev.isOn ? green : AppColors.textMuted,
+                              fontSize: 10.5,
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                          Text(
+                            'Công suất định mức: ${dev.ratedPowerWatt.toStringAsFixed(0)} W',
+                            style: const TextStyle(
+                              color: AppColors.textMuted,
+                              fontSize: 10.5,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
+                );
+              }),
           ],
         ),
       ),
     );
   }
 
-  Widget _buildPeriodChip(String label, String value, Color cyan, bool isDark) {
-    final selected = _selectedRange == value;
+  Widget _buildRangeBtn(String label, String value, Color cyan, bool isDark) {
+    final active = _selectedRange == value;
     return InkWell(
       borderRadius: BorderRadius.circular(8),
       onTap: () {
-        if (_selectedRange != value) {
-          setState(() => _selectedRange = value);
-          _loadEnergyData();
-        }
+        if (_selectedRange == value) return;
+        setState(() => _selectedRange = value);
+        _loadEnergyData();
       },
       child: Container(
         padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
         decoration: BoxDecoration(
-          color: selected ? cyan : AppColors.getSurface(isDark),
+          color: active ? cyan : AppColors.getSurface(isDark),
           borderRadius: BorderRadius.circular(8),
           border: Border.all(
-            color: selected ? cyan : (isDark ? Colors.white12 : Colors.black12),
+            color: active ? cyan : (isDark ? Colors.white12 : Colors.black12),
           ),
         ),
         child: Text(
           label,
           style: TextStyle(
-            color: selected
+            color: active
                 ? (isDark ? const Color(0xFF0A0E1A) : Colors.white)
                 : AppColors.getTextSecondary(isDark),
-            fontSize: 10,
+            fontSize: 10.5,
             fontWeight: FontWeight.bold,
           ),
         ),
@@ -457,13 +626,13 @@ class _EnergyScreenState extends State<EnergyScreen> {
     );
   }
 
-  Widget _buildKpiCard(
-    String label,
-    String value,
-    IconData icon,
-    Color color,
-    bool isDark,
-  ) {
+  Widget _buildMetricCard({
+    required bool isDark,
+    required IconData icon,
+    required Color color,
+    required String value,
+    required String label,
+  }) {
     return Container(
       padding: const EdgeInsets.all(11),
       decoration: BoxDecoration(
@@ -482,15 +651,13 @@ class _EnergyScreenState extends State<EnergyScreen> {
             overflow: TextOverflow.ellipsis,
             style: TextStyle(
               color: AppColors.getTextPrimary(isDark),
-              fontSize: 13,
+              fontSize: 14,
               fontWeight: FontWeight.bold,
             ),
           ),
           const SizedBox(height: 2),
           Text(
             label,
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
             style: const TextStyle(
               color: AppColors.textMuted,
               fontSize: 9,

@@ -562,19 +562,52 @@ class ApiService extends ChangeNotifier {
     _parseResponse(res);
   }
 
+  String? _resolvedAlertsPath;
+
+  /// Lấy danh sách cảnh báo AI thật từ SQL Server
   Future<JsonList> getAiAlerts() async {
-    final res = await http.get(
-      Uri.parse('$_baseUrl/ai/alerts'),
-      headers: _headers,
+    final paths = <String>[
+      if (_resolvedAlertsPath != null) _resolvedAlertsPath!,
+      '/ai/alerts',
+      '/ai_alerts',
+      '/ai-alerts',
+      '/anomalies',
+      '/alerts',
+    ];
+
+    http.Response? lastResponse;
+    for (final path in paths) {
+      final res = await http.get(
+        Uri.parse('$_baseUrl$path'),
+        headers: _headers,
+      );
+      lastResponse = res;
+      if (res.statusCode >= 200 && res.statusCode < 300) {
+        _resolvedAlertsPath = path;
+        final decoded = jsonDecode(res.body);
+        if (decoded is List) {
+          return decoded
+              .map((e) => Map<String, dynamic>.from(e as Map))
+              .toList();
+        }
+        if (decoded is Map) {
+          final list = decoded['data'] ?? decoded['alerts'] ?? decoded['items'];
+          if (list is List) {
+            return list
+                .map((e) => Map<String, dynamic>.from(e as Map))
+                .toList();
+          }
+        }
+        return [];
+      }
+      if (res.statusCode != 404) {
+        break;
+      }
+    }
+
+    throw Exception(
+      'Không thể tải lịch sử cảnh báo (${lastResponse?.statusCode ?? 404})',
     );
-    final data = _parseResponse(res);
-    if (data is List) {
-      return data.map((e) => JsonMap.from(e)).toList();
-    }
-    if (data is Map && data['alerts'] is List) {
-      return (data['alerts'] as List).map((e) => JsonMap.from(e)).toList();
-    }
-    return [];
   }
 
   Future<void> triggerAiAnalysis({

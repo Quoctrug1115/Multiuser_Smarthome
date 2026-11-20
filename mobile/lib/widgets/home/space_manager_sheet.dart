@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import '../spaces/space_excel_sheet.dart';
 import '../../services/api_service.dart';
 import '../../theme/app_colors.dart';
 
@@ -42,12 +43,37 @@ void showSpaceManagerSheet({
                     Row(
                       mainAxisAlignment: MainAxisAlignment.spaceBetween,
                       children: [
-                        Text(
-                          'QUẢN LÝ KHÔNG GIAN NHÀ & PHÒNG',
-                          style: TextStyle(
-                            color: AppColors.getTextPrimary(isDark),
-                            fontSize: 14,
-                            fontWeight: FontWeight.bold,
+                        Expanded(
+                          child: Text(
+                            'QUẢN LÝ KHÔNG GIAN NHÀ & PHÒNG',
+                            style: TextStyle(
+                              color: AppColors.getTextPrimary(isDark),
+                              fontSize: 13.5,
+                              fontWeight: FontWeight.bold,
+                            ),
+                          ),
+                        ),
+                        TextButton.icon(
+                          onPressed: () => showSpaceExcelSheet(
+                            context: context,
+                            isDark: isDark,
+                            api: api,
+                            existingHouses: getHouses(),
+                            existingRooms: getRooms(),
+                            onSnack: onSnack,
+                            onRefresh: () async {
+                              await onReloadSpaces();
+                              setSheetState(() {});
+                            },
+                          ),
+                          icon: Icon(Icons.table_view, size: 16, color: green),
+                          label: Text(
+                            'EXCEL',
+                            style: TextStyle(
+                              color: green,
+                              fontSize: 11,
+                              fontWeight: FontWeight.bold,
+                            ),
                           ),
                         ),
                         IconButton(
