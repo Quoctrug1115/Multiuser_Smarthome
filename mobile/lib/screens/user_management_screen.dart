@@ -4,6 +4,7 @@ import 'package:provider/provider.dart';
 import '../services/api_service.dart';
 import '../theme/app_colors.dart';
 import '../theme/theme_provider.dart';
+import '../widgets/users/user_excel_sheet.dart';
 
 class UserManagementScreen extends StatefulWidget {
   const UserManagementScreen({super.key});
@@ -14,17 +15,14 @@ class UserManagementScreen extends StatefulWidget {
 
 class _UserManagementScreenState extends State<UserManagementScreen> {
   final ApiService _api = ApiService();
-  final _searchController = TextEditingController();
-  String _selectedRoleFilter = 'TẤT CẢ';
-  bool _isLoading = true;
   JsonList _users = [];
+  bool _isLoading = true;
+  String _selectedRoleFilter = 'TẤT CẢ';
 
   @override
   void initState() {
     super.initState();
-    if (_api.isAdmin) {
-      _loadUsers();
-    }
+    _loadUsers();
   }
 
   Future<void> _loadUsers() async {
@@ -43,91 +41,72 @@ class _UserManagementScreenState extends State<UserManagementScreen> {
     }
   }
 
-  String _normalizeRole(dynamic rawRole) {
-    final r = (rawRole ?? '').toString().trim().toLowerCase();
-    if (r == 'owner' || r == 'admin' || r.startsWith('e8a4742f')) {
-      return 'Owner';
-    }
-    if (r == 'guest' || r.startsWith('c645ad8a')) {
-      return 'Guest';
-    }
-    return 'Member';
-  }
-
-  JsonList get _filteredUsers {
-    final query = _searchController.text.trim().toLowerCase();
-    return _users.where((user) {
-      final role = _normalizeRole(
-        user['role'] ?? user['role_name'] ?? user['role_id'],
-      ).toUpperCase();
-      final name = (user['full_name'] ?? user['name'] ?? user['username'] ?? '')
-          .toString()
-          .toLowerCase();
-      final email = (user['email'] ?? '').toString().toLowerCase();
-      final matchesRole =
-          _selectedRoleFilter == 'TẤT CẢ' || role == _selectedRoleFilter;
-      final matchesQuery =
-          query.isEmpty || name.contains(query) || email.contains(query);
-      return matchesRole && matchesQuery;
-    }).toList();
-  }
-
-  Color _getRoleColor(String role) {
-    switch (role.toLowerCase()) {
-      case 'owner':
-      case 'admin':
-        return AppColors.primary;
-      case 'guest':
-        return Colors.amber;
-      default:
-        return Colors.tealAccent;
-    }
-  }
-
-  void _showSnack(String message, {bool isError = false}) {
+  void _showSnack(String msg, {bool isError = false}) {
+    if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
-        content: Text(
-          message,
-          style: const TextStyle(fontWeight: FontWeight.w600),
-        ),
+        content: Text(msg, style: const TextStyle(fontWeight: FontWeight.w600)),
         backgroundColor: isError ? AppColors.accent : AppColors.secondary,
       ),
     );
   }
 
-  void _showUserFormDialog(bool isDark, {JsonMap? existingUser}) {
-    final isEdit = existingUser != null;
-    final nameCtrl = TextEditingController(
-      text:
-          existingUser?['full_name']?.toString() ??
-          existingUser?['name']?.toString() ??
-          existingUser?['username']?.toString() ??
-          '',
-    );
-    final emailCtrl = TextEditingController(
-      text: existingUser?['email']?.toString() ?? '',
-    );
-    final passwordCtrl = TextEditingController();
-    String selectedRole = _normalizeRole(
-      existingUser?['role'] ??
-          existingUser?['role_name'] ??
-          existingUser?['role_id'],
-    );
-    int guestHours = 24;
+  String _normalizeRole(dynamic raw) {
+    final r = (raw ?? 'Member').toString().trim().toLowerCase();
+    switch (r) {
+      case 'owner':
+        return 'Owner';
+      case 'admin':
+        return 'Admin';
+      case 'guest':
+        return 'Guest';
+      default:
+        return 'Member';
+    }
+  }
+
+  Color _roleColor(String role, bool isDark) {
+    switch (role.toLowerCase()) {
+      case 'owner':
+        return isDark ? Colors.amber : const Color(0xFFD97706);
+      case 'admin':
+        return isDark ? AppColors.primary : const Color(0xFF0284C7);
+      case 'guest':
+        return AppColors.secondary;
+      default:
+        return isDark ? Colors.greenAccent : const Color(0xFF0D9488);
+    }
+  }
+
+  JsonList get _filteredUsers {
+    if (_selectedRoleFilter == 'TẤT CẢ') return _users;
+    return _users.where((u) {
+      final role = _normalizeRole(u['role'] ?? u['role_name']);
+      return role.toLowerCase() == _selectedRoleFilter.toLowerCase();
+    }).toList();
+  }
+
+  void _showCreateAccountDialog(bool isDark) {
+    final nameCtrl = TextEditingController();
+    final emailCtrl = TextEditingController();
+    final passCtrl = TextEditingController();
+    String selectedRole = 'Member';
+    int durationHours = 24;
+
+    final cyan = isDark ? AppColors.primary : const Color(0xFF0284C7);
+    final isCurrentOwner = _api.currentUserRole.toLowerCase() == 'owner';
 
     showDialog(
       context: context,
       builder: (ctx) => StatefulBuilder(
         builder: (context, setDialogState) {
+          final isGuest = selectedRole == 'Guest';
           return AlertDialog(
             backgroundColor: AppColors.getSurface(isDark),
             title: Text(
-              isEdit ? 'CẬP NHẬT TÀI KHOẢN' : 'THÊM TÀI KHOẢN VÀO DATABASE',
+              isGuest ? 'CẤP QUYỀN KHÁCH TẠM THỜI' : 'THÊM THÀNH VIÊN MỚI',
               style: TextStyle(
-                color: isDark
-                    ? AppColors.primary
-                    : AppColors.getTextPrimary(isDark),
+                color: AppColors.getTextPrimary(isDark),
                 fontSize: 15,
                 fontWeight: FontWeight.bold,
               ),
@@ -135,60 +114,7 @@ class _UserManagementScreenState extends State<UserManagementScreen> {
             content: SingleChildScrollView(
               child: Column(
                 mainAxisSize: MainAxisSize.min,
-                crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  TextField(
-                    controller: nameCtrl,
-                    style: TextStyle(
-                      color: AppColors.getTextPrimary(isDark),
-                      fontSize: 13,
-                    ),
-                    decoration: const InputDecoration(
-                      labelText: 'Họ và tên',
-                      prefixIcon: Icon(
-                        Icons.person_outline,
-                        color: AppColors.primary,
-                        size: 18,
-                      ),
-                    ),
-                  ),
-                  const SizedBox(height: 10),
-                  TextField(
-                    controller: emailCtrl,
-                    enabled: !isEdit,
-                    style: TextStyle(
-                      color: AppColors.getTextPrimary(isDark),
-                      fontSize: 13,
-                    ),
-                    decoration: const InputDecoration(
-                      labelText: 'Email đăng nhập',
-                      prefixIcon: Icon(
-                        Icons.email_outlined,
-                        color: AppColors.primary,
-                        size: 18,
-                      ),
-                    ),
-                  ),
-                  if (!isEdit) ...[
-                    const SizedBox(height: 10),
-                    TextField(
-                      controller: passwordCtrl,
-                      obscureText: true,
-                      style: TextStyle(
-                        color: AppColors.getTextPrimary(isDark),
-                        fontSize: 13,
-                      ),
-                      decoration: const InputDecoration(
-                        labelText: 'Mật khẩu',
-                        prefixIcon: Icon(
-                          Icons.lock_outline,
-                          color: AppColors.primary,
-                          size: 18,
-                        ),
-                      ),
-                    ),
-                  ],
-                  const SizedBox(height: 14),
                   DropdownButtonFormField<String>(
                     value: selectedRole,
                     dropdownColor: AppColors.getSurface(isDark),
@@ -197,46 +123,86 @@ class _UserManagementScreenState extends State<UserManagementScreen> {
                       fontSize: 13,
                     ),
                     decoration: const InputDecoration(
-                      labelText: 'Vai trò phân quyền',
+                      labelText: 'Vai trò (RBAC)',
                     ),
-                    items: const [
-                      DropdownMenuItem(
-                        value: 'Owner',
-                        child: Text('Owner (Chủ nhà - Toàn quyền)'),
+                    items: [
+                      if (isCurrentOwner)
+                        const DropdownMenuItem(
+                          value: 'Owner',
+                          child: Text('Owner (Chủ hộ toàn quyền)'),
+                        ),
+                      const DropdownMenuItem(
+                        value: 'Admin',
+                        child: Text('Admin (Quản trị viên)'),
                       ),
-                      DropdownMenuItem(
+                      const DropdownMenuItem(
                         value: 'Member',
                         child: Text('Member (Thành viên gia đình)'),
                       ),
-                      DropdownMenuItem(
+                      const DropdownMenuItem(
                         value: 'Guest',
-                        child: Text('Guest (Khách hạn chế)'),
+                        child: Text('Guest (Khách truy cập có thời hạn)'),
                       ),
                     ],
                     onChanged: (val) {
-                      if (val != null) setDialogState(() => selectedRole = val);
+                      if (val != null) {
+                        setDialogState(() => selectedRole = val);
+                      }
                     },
                   ),
-                  if (!isEdit && selectedRole == 'Guest') ...[
+                  const SizedBox(height: 10),
+                  TextField(
+                    controller: nameCtrl,
+                    style: TextStyle(color: AppColors.getTextPrimary(isDark)),
+                    decoration: const InputDecoration(labelText: 'Họ và tên'),
+                  ),
+                  const SizedBox(height: 10),
+                  TextField(
+                    controller: emailCtrl,
+                    keyboardType: TextInputType.emailAddress,
+                    style: TextStyle(color: AppColors.getTextPrimary(isDark)),
+                    decoration: const InputDecoration(labelText: 'Email'),
+                  ),
+                  const SizedBox(height: 10),
+                  TextField(
+                    controller: passCtrl,
+                    obscureText: true,
+                    style: TextStyle(color: AppColors.getTextPrimary(isDark)),
+                    decoration: const InputDecoration(labelText: 'Mật khẩu'),
+                  ),
+                  if (isGuest) ...[
                     const SizedBox(height: 12),
                     DropdownButtonFormField<int>(
-                      value: guestHours,
+                      value: durationHours,
                       dropdownColor: AppColors.getSurface(isDark),
                       style: TextStyle(
                         color: AppColors.getTextPrimary(isDark),
                         fontSize: 13,
                       ),
                       decoration: const InputDecoration(
-                        labelText: 'Thời hạn truy cập khách',
+                        labelText: 'Thời hạn hiệu lực (Guest)',
                       ),
                       items: const [
                         DropdownMenuItem(value: 2, child: Text('2 giờ')),
-                        DropdownMenuItem(value: 24, child: Text('24 giờ')),
-                        DropdownMenuItem(value: 168, child: Text('7 ngày')),
-                        DropdownMenuItem(value: 720, child: Text('30 ngày')),
+                        DropdownMenuItem(value: 6, child: Text('6 giờ')),
+                        DropdownMenuItem(value: 12, child: Text('12 giờ')),
+                        DropdownMenuItem(
+                          value: 24,
+                          child: Text('24 giờ (1 ngày)'),
+                        ),
+                        DropdownMenuItem(
+                          value: 72,
+                          child: Text('72 giờ (3 ngày)'),
+                        ),
+                        DropdownMenuItem(
+                          value: 168,
+                          child: Text('168 giờ (7 ngày)'),
+                        ),
                       ],
                       onChanged: (val) {
-                        if (val != null) setDialogState(() => guestHours = val);
+                        if (val != null) {
+                          setDialogState(() => durationHours = val);
+                        }
                       },
                     ),
                   ],
@@ -250,39 +216,32 @@ class _UserManagementScreenState extends State<UserManagementScreen> {
               ),
               ElevatedButton(
                 style: ElevatedButton.styleFrom(
-                  backgroundColor: AppColors.primary,
-                  foregroundColor: const Color(0xFF0A0E1A),
+                  backgroundColor: cyan,
+                  foregroundColor: isDark
+                      ? const Color(0xFF0A0E1A)
+                      : Colors.white,
                 ),
                 onPressed: () async {
                   final name = nameCtrl.text.trim();
                   final email = emailCtrl.text.trim();
-                  final pass = passwordCtrl.text.trim();
-                  if (name.isEmpty ||
-                      email.isEmpty ||
-                      (!isEdit && pass.isEmpty)) {
+                  final pass = passCtrl.text.trim();
+                  if (name.isEmpty || email.isEmpty || pass.isEmpty) {
                     _showSnack(
-                      'Vui lòng điền đầy đủ thông tin!',
+                      'Vui lòng nhập đầy đủ họ tên, email và mật khẩu!',
                       isError: true,
                     );
                     return;
                   }
                   Navigator.pop(ctx);
                   try {
-                    if (isEdit) {
-                      await _api.updateUser(
-                        existingUser['id'].toString(),
-                        fullName: name,
-                        role: selectedRole,
-                      );
-                      _showSnack('Đã cập nhật tài khoản');
-                    } else if (selectedRole == 'Guest') {
+                    if (isGuest) {
                       await _api.createGuest(
                         fullName: name,
                         email: email,
                         password: pass,
-                        durationHours: guestHours,
+                        durationHours: durationHours,
                       );
-                      _showSnack('Đã cấp tài khoản Khách');
+                      _showSnack('Đã cấp tài khoản Khách ($durationHours giờ)');
                     } else {
                       await _api.createUser(
                         fullName: name,
@@ -290,9 +249,9 @@ class _UserManagementScreenState extends State<UserManagementScreen> {
                         password: pass,
                         role: selectedRole,
                       );
-                      _showSnack('Đã tạo tài khoản thành viên');
+                      _showSnack('Đã thêm thành viên $selectedRole');
                     }
-                    _loadUsers();
+                    await _loadUsers();
                   } catch (e) {
                     _showSnack(
                       e.toString().replaceFirst('Exception: ', ''),
@@ -300,9 +259,9 @@ class _UserManagementScreenState extends State<UserManagementScreen> {
                     );
                   }
                 },
-                child: Text(
-                  isEdit ? 'LƯU' : 'TẠO MỚI',
-                  style: const TextStyle(fontWeight: FontWeight.bold),
+                child: const Text(
+                  'TẠO TÀI KHOẢN',
+                  style: TextStyle(fontWeight: FontWeight.bold),
                 ),
               ),
             ],
@@ -312,523 +271,450 @@ class _UserManagementScreenState extends State<UserManagementScreen> {
     );
   }
 
-  void _showResetPasswordDialog(JsonMap user, bool isDark) {
-    final newPassCtrl = TextEditingController();
+  void _showEditUserDialog(JsonMap user, bool isDark) {
+    final id = (user['id'] ?? '').toString();
+    final nameCtrl = TextEditingController(
+      text: (user['full_name'] ?? user['name'] ?? '').toString(),
+    );
+    final passCtrl = TextEditingController();
+    String selectedRole = _normalizeRole(user['role'] ?? user['role_name']);
+    bool isActive = user['is_active'] != false;
+
+    final cyan = isDark ? AppColors.primary : const Color(0xFF0284C7);
+    final isCurrentOwner = _api.currentUserRole.toLowerCase() == 'owner';
+
     showDialog(
       context: context,
-      builder: (ctx) => AlertDialog(
-        backgroundColor: AppColors.getSurface(isDark),
-        title: Text(
-          'ĐẶT LẠI MẬT KHẨU',
-          style: TextStyle(
-            color: AppColors.getTextPrimary(isDark),
-            fontSize: 15,
-          ),
-        ),
-        content: TextField(
-          controller: newPassCtrl,
-          obscureText: true,
-          style: TextStyle(color: AppColors.getTextPrimary(isDark)),
-          decoration: const InputDecoration(
-            labelText: 'Mật khẩu mới (tối thiểu 6 ký tự)',
-          ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx),
-            child: const Text('HỦY'),
-          ),
-          ElevatedButton(
-            style: ElevatedButton.styleFrom(
-              backgroundColor: AppColors.primary,
-              foregroundColor: const Color(0xFF0A0E1A),
+      builder: (ctx) => StatefulBuilder(
+        builder: (context, setDialogState) {
+          return AlertDialog(
+            backgroundColor: AppColors.getSurface(isDark),
+            title: Text(
+              'CHỈNH SỬA PHÂN QUYỀN',
+              style: TextStyle(
+                color: AppColors.getTextPrimary(isDark),
+                fontSize: 15,
+                fontWeight: FontWeight.bold,
+              ),
             ),
-            onPressed: () async {
-              if (newPassCtrl.text.trim().length < 6) {
-                _showSnack('Mật khẩu phải từ 6 ký tự trở lên!', isError: true);
-                return;
-              }
-              Navigator.pop(ctx);
-              try {
-                await _api.updateUser(
-                  user['id'].toString(),
-                  password: newPassCtrl.text.trim(),
-                );
-                _showSnack('Đã cập nhật mật khẩu mới');
-              } catch (e) {
-                _showSnack(
-                  e.toString().replaceFirst('Exception: ', ''),
-                  isError: true,
-                );
-              }
-            },
-            child: const Text(
-              'XÁC NHẬN',
-              style: TextStyle(fontWeight: FontWeight.bold),
+            content: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  TextField(
+                    controller: nameCtrl,
+                    style: TextStyle(color: AppColors.getTextPrimary(isDark)),
+                    decoration: const InputDecoration(labelText: 'Họ và tên'),
+                  ),
+                  const SizedBox(height: 10),
+                  DropdownButtonFormField<String>(
+                    value: selectedRole,
+                    dropdownColor: AppColors.getSurface(isDark),
+                    style: TextStyle(
+                      color: AppColors.getTextPrimary(isDark),
+                      fontSize: 13,
+                    ),
+                    decoration: const InputDecoration(labelText: 'Vai trò'),
+                    items: [
+                      if (isCurrentOwner || selectedRole == 'Owner')
+                        const DropdownMenuItem(
+                          value: 'Owner',
+                          child: Text('Owner'),
+                        ),
+                      const DropdownMenuItem(
+                        value: 'Admin',
+                        child: Text('Admin'),
+                      ),
+                      const DropdownMenuItem(
+                        value: 'Member',
+                        child: Text('Member'),
+                      ),
+                      const DropdownMenuItem(
+                        value: 'Guest',
+                        child: Text('Guest'),
+                      ),
+                    ],
+                    onChanged: (val) {
+                      if (val != null) {
+                        setDialogState(() => selectedRole = val);
+                      }
+                    },
+                  ),
+                  const SizedBox(height: 10),
+                  TextField(
+                    controller: passCtrl,
+                    obscureText: true,
+                    style: TextStyle(color: AppColors.getTextPrimary(isDark)),
+                    decoration: const InputDecoration(
+                      labelText: 'Mật khẩu mới (để trống nếu giữ nguyên)',
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  SwitchListTile(
+                    contentPadding: EdgeInsets.zero,
+                    title: Text(
+                      'Trạng thái kích hoạt',
+                      style: TextStyle(
+                        color: AppColors.getTextPrimary(isDark),
+                        fontSize: 13,
+                      ),
+                    ),
+                    value: isActive,
+                    activeColor: cyan,
+                    onChanged: (val) => setDialogState(() => isActive = val),
+                  ),
+                ],
+              ),
             ),
-          ),
-        ],
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(ctx),
+                child: const Text('HỦY'),
+              ),
+              ElevatedButton(
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: cyan,
+                  foregroundColor: isDark
+                      ? const Color(0xFF0A0E1A)
+                      : Colors.white,
+                ),
+                onPressed: () async {
+                  Navigator.pop(ctx);
+                  try {
+                    await _api.updateUser(
+                      id,
+                      fullName: nameCtrl.text.trim(),
+                      role: selectedRole,
+                      isActive: isActive,
+                      password: passCtrl.text.trim().isEmpty
+                          ? null
+                          : passCtrl.text.trim(),
+                    );
+                    _showSnack('Đã cập nhật thông tin thành viên');
+                    await _loadUsers();
+                  } catch (e) {
+                    _showSnack(
+                      e.toString().replaceFirst('Exception: ', ''),
+                      isError: true,
+                    );
+                  }
+                },
+                child: const Text(
+                  'LƯU',
+                  style: TextStyle(fontWeight: FontWeight.bold),
+                ),
+              ),
+            ],
+          );
+        },
       ),
     );
-  }
-
-  @override
-  void dispose() {
-    _searchController.dispose();
-    super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
     final isDark = Provider.of<ThemeProvider>(context).isDarkMode;
-    final apiService = Provider.of<ApiService>(context);
+    final cyan = isDark ? AppColors.primary : const Color(0xFF0284C7);
+    final green = isDark ? Colors.greenAccent : const Color(0xFF0D9488);
+    final amber = isDark ? Colors.amber : const Color(0xFFD97706);
 
-    if (!apiService.isAdmin) {
-      return Scaffold(
-        backgroundColor: AppColors.getBackground(isDark),
-        body: const Center(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Icon(Icons.lock_person, color: AppColors.accent, size: 48),
-              SizedBox(height: 12),
-              Text(
-                'KHÔNG CÓ QUYỀN TRUY CẬP',
-                style: TextStyle(
-                  color: AppColors.accent,
-                  fontWeight: FontWeight.bold,
-                  fontSize: 16,
-                ),
-              ),
-              SizedBox(height: 6),
-              Text(
-                'Chỉ tài khoản Chủ nhà (Owner) mới được phép quản lý người dùng.',
-                style: TextStyle(color: AppColors.textMuted, fontSize: 13),
-              ),
-            ],
-          ),
-        ),
-      );
-    }
-
-    final activeCount = _users.where((u) => u['is_active'] != false).length;
-    final guestCount = _users
-        .where(
-          (u) =>
-              _normalizeRole(u['role'] ?? u['role_name'] ?? u['role_id']) ==
-              'Guest',
-        )
-        .length;
-    final filteredList = _filteredUsers;
-    final currentEmail = (apiService.currentUser?['email'] ?? '')
-        .toString()
-        .toLowerCase();
+    final currentUserId = (_api.currentUser?['id'] ?? '').toString();
+    final isCurrentOwner = _api.currentUserRole.toLowerCase() == 'owner';
+    final list = _filteredUsers;
 
     return Scaffold(
       backgroundColor: AppColors.getBackground(isDark),
       floatingActionButton: FloatingActionButton.extended(
-        heroTag: 'fab_user_management',
-        backgroundColor: AppColors.primary,
-        foregroundColor: const Color(0xFF0A0E1A),
-        onPressed: () => _showUserFormDialog(isDark),
+        heroTag: 'fab_add_user',
+        backgroundColor: cyan,
+        foregroundColor: isDark ? const Color(0xFF0A0E1A) : Colors.white,
+        onPressed: () => _showCreateAccountDialog(isDark),
         icon: const Icon(Icons.person_add_alt_1),
         label: const Text(
           'THÊM TÀI KHOẢN',
-          style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12),
+          style: TextStyle(fontWeight: FontWeight.bold, fontSize: 11),
         ),
       ),
-      body: Column(
-        children: [
-          Padding(
-            padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
-            child: Row(
-              children: [
-                Expanded(
-                  child: _buildStatCard(
-                    'TỔNG TÀI KHOẢN',
-                    '${_users.length}',
-                    AppColors.primary,
-                    isDark,
-                  ),
+      body: RefreshIndicator(
+        color: cyan,
+        onRefresh: _loadUsers,
+        child: ListView(
+          padding: const EdgeInsets.fromLTRB(16, 14, 16, 95),
+          children: [
+            // Thanh công cụ Owner: Nhập / Xuất Excel tài khoản
+            if (isCurrentOwner) ...[
+              Container(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 12,
+                  vertical: 10,
                 ),
-                const SizedBox(width: 8),
-                Expanded(
-                  child: _buildStatCard(
-                    'HOẠT ĐỘNG',
-                    '$activeCount',
-                    Colors.greenAccent,
-                    isDark,
-                  ),
+                decoration: BoxDecoration(
+                  color: AppColors.getSurface(isDark),
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(color: amber.withOpacity(0.45)),
                 ),
-                const SizedBox(width: 8),
-                Expanded(
-                  child: _buildStatCard(
-                    'KHÁCH',
-                    '$guestCount',
-                    Colors.amber,
-                    isDark,
-                  ),
-                ),
-              ],
-            ),
-          ),
-          Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
-            child: TextField(
-              controller: _searchController,
-              onChanged: (_) => setState(() {}),
-              style: TextStyle(
-                color: AppColors.getTextPrimary(isDark),
-                fontSize: 13,
-              ),
-              decoration: InputDecoration(
-                hintText: 'Tìm kiếm theo tên hoặc email...',
-                hintStyle: const TextStyle(
-                  color: AppColors.textMuted,
-                  fontSize: 12,
-                ),
-                prefixIcon: const Icon(
-                  Icons.search,
-                  color: AppColors.primary,
-                  size: 20,
-                ),
-                filled: true,
-                fillColor: AppColors.getSurface(isDark),
-                contentPadding: const EdgeInsets.symmetric(vertical: 0),
-                border: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(10),
-                ),
-              ),
-            ),
-          ),
-          SizedBox(
-            height: 38,
-            child: ListView(
-              scrollDirection: Axis.horizontal,
-              padding: const EdgeInsets.symmetric(horizontal: 16),
-              children: ['TẤT CẢ', 'OWNER', 'MEMBER', 'GUEST'].map((role) {
-                final isSelected = _selectedRoleFilter == role;
-                return Padding(
-                  padding: const EdgeInsets.only(right: 8),
-                  child: ChoiceChip(
-                    label: Text(
-                      role,
-                      style: TextStyle(
-                        color: isSelected
-                            ? const Color(0xFF0A0E1A)
-                            : AppColors.getTextSecondary(isDark),
-                        fontSize: 10,
-                        fontWeight: FontWeight.bold,
-                      ),
-                    ),
-                    selected: isSelected,
-                    selectedColor: AppColors.primary,
-                    backgroundColor: AppColors.getSurface(isDark),
-                    onSelected: (_) =>
-                        setState(() => _selectedRoleFilter = role),
-                  ),
-                );
-              }).toList(),
-            ),
-          ),
-          const SizedBox(height: 8),
-          Expanded(
-            child: RefreshIndicator(
-              color: AppColors.primary,
-              onRefresh: _loadUsers,
-              child: _isLoading
-                  ? const Center(
-                      child: CircularProgressIndicator(
-                        color: AppColors.primary,
-                      ),
-                    )
-                  : filteredList.isEmpty
-                  ? ListView(
-                      children: const [
-                        SizedBox(height: 100),
-                        Center(
-                          child: Text(
-                            'Không có tài khoản nào phù hợp',
-                            style: TextStyle(color: AppColors.textMuted),
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    Row(
+                      children: [
+                        Icon(
+                          Icons.admin_panel_settings,
+                          color: amber,
+                          size: 18,
+                        ),
+                        const SizedBox(width: 8),
+                        Text(
+                          'QUYỀN CHỦ NHÀ (${_users.length} TÀI KHOẢN)',
+                          style: TextStyle(
+                            color: AppColors.getTextPrimary(isDark),
+                            fontSize: 11,
+                            fontWeight: FontWeight.bold,
                           ),
                         ),
                       ],
-                    )
-                  : ListView.builder(
-                      padding: const EdgeInsets.fromLTRB(16, 4, 16, 80),
-                      itemCount: filteredList.length,
-                      itemBuilder: (context, index) {
-                        final user = filteredList[index];
-                        final id = user['id'].toString();
-                        final name =
-                            (user['full_name'] ??
-                                    user['name'] ??
-                                    user['username'] ??
-                                    'User')
-                                .toString();
-                        final email = (user['email'] ?? '').toString();
-                        final isSelf = email.toLowerCase() == currentEmail;
-                        final roleValue = isSelf && apiService.isAdmin
-                            ? 'Owner'
-                            : _normalizeRole(
-                                user['role'] ??
-                                    user['role_name'] ??
-                                    user['role_id'],
-                              );
-                        final roleDisplay = roleValue.toUpperCase();
-                        final isActive = user['is_active'] != false;
-                        final roleColor = _getRoleColor(roleValue);
-
-                        return Container(
-                          margin: const EdgeInsets.only(bottom: 10),
-                          padding: const EdgeInsets.all(14),
-                          decoration: BoxDecoration(
-                            color: AppColors.getSurface(isDark),
-                            borderRadius: BorderRadius.circular(12),
-                            border: Border.all(
-                              color: AppColors.getBorder(isDark),
-                            ),
-                          ),
-                          child: Column(
-                            children: [
-                              Row(
-                                children: [
-                                  CircleAvatar(
-                                    backgroundColor: roleColor.withOpacity(
-                                      0.18,
-                                    ),
-                                    child: Text(
-                                      name.isNotEmpty
-                                          ? name[0].toUpperCase()
-                                          : '?',
-                                      style: TextStyle(
-                                        color: roleColor,
-                                        fontWeight: FontWeight.bold,
-                                      ),
-                                    ),
-                                  ),
-                                  const SizedBox(width: 12),
-                                  Expanded(
-                                    child: Column(
-                                      crossAxisAlignment:
-                                          CrossAxisAlignment.start,
-                                      children: [
-                                        Row(
-                                          children: [
-                                            Flexible(
-                                              child: Text(
-                                                name,
-                                                overflow: TextOverflow.ellipsis,
-                                                style: TextStyle(
-                                                  color:
-                                                      AppColors.getTextPrimary(
-                                                        isDark,
-                                                      ),
-                                                  fontWeight: FontWeight.bold,
-                                                ),
-                                              ),
-                                            ),
-                                            const SizedBox(width: 8),
-                                            Container(
-                                              padding:
-                                                  const EdgeInsets.symmetric(
-                                                    horizontal: 6,
-                                                    vertical: 2,
-                                                  ),
-                                              decoration: BoxDecoration(
-                                                color: roleColor.withOpacity(
-                                                  0.15,
-                                                ),
-                                                borderRadius:
-                                                    BorderRadius.circular(4),
-                                              ),
-                                              child: Text(
-                                                roleDisplay,
-                                                style: TextStyle(
-                                                  color: roleColor,
-                                                  fontSize: 9,
-                                                  fontWeight: FontWeight.bold,
-                                                ),
-                                              ),
-                                            ),
-                                          ],
-                                        ),
-                                        Text(
-                                          email,
-                                          style: const TextStyle(
-                                            color: AppColors.textMuted,
-                                            fontSize: 12,
-                                          ),
-                                        ),
-                                      ],
-                                    ),
-                                  ),
-                                  PopupMenuButton<String>(
-                                    icon: Icon(
-                                      Icons.more_vert,
-                                      color: AppColors.getTextSecondary(isDark),
-                                    ),
-                                    color: AppColors.getSurface(isDark),
-                                    onSelected: (action) async {
-                                      if (action == 'edit') {
-                                        _showUserFormDialog(
-                                          isDark,
-                                          existingUser: user,
-                                        );
-                                      } else if (action == 'reset_pass') {
-                                        _showResetPasswordDialog(user, isDark);
-                                      } else if (action == 'delete') {
-                                        if (isSelf) {
-                                          _showSnack(
-                                            'Không thể tự xóa tài khoản đang đăng nhập!',
-                                            isError: true,
-                                          );
-                                          return;
-                                        }
-                                        try {
-                                          await _api.deleteUser(id);
-                                          _showSnack('Đã xóa tài khoản $name');
-                                          _loadUsers();
-                                        } catch (e) {
-                                          _showSnack(
-                                            e.toString().replaceFirst(
-                                              'Exception: ',
-                                              '',
-                                            ),
-                                            isError: true,
-                                          );
-                                        }
-                                      }
-                                    },
-                                    itemBuilder: (context) => [
-                                      const PopupMenuItem(
-                                        value: 'edit',
-                                        child: Text('Sửa & Phân quyền'),
-                                      ),
-                                      const PopupMenuItem(
-                                        value: 'reset_pass',
-                                        child: Text('Đặt lại mật khẩu'),
-                                      ),
-                                      if (!isSelf)
-                                        const PopupMenuItem(
-                                          value: 'delete',
-                                          child: Text(
-                                            'Xóa tài khoản',
-                                            style: TextStyle(
-                                              color: AppColors.accent,
-                                            ),
-                                          ),
-                                        ),
-                                    ],
-                                  ),
-                                ],
-                              ),
-                              Divider(
-                                height: 16,
-                                color: AppColors.getBorder(isDark),
-                              ),
-                              Row(
-                                mainAxisAlignment:
-                                    MainAxisAlignment.spaceBetween,
-                                children: [
-                                  Text(
-                                    'ID: $id',
-                                    style: const TextStyle(
-                                      color: AppColors.textMuted,
-                                      fontSize: 10,
-                                    ),
-                                  ),
-                                  Row(
-                                    children: [
-                                      Text(
-                                        isActive ? 'HOẠT ĐỘNG' : 'ĐÃ KHÓA',
-                                        style: TextStyle(
-                                          color: isActive
-                                              ? Colors.greenAccent
-                                              : AppColors.accent,
-                                          fontSize: 10,
-                                          fontWeight: FontWeight.bold,
-                                        ),
-                                      ),
-                                      const SizedBox(width: 6),
-                                      SizedBox(
-                                        height: 24,
-                                        child: Switch(
-                                          value: isActive,
-                                          activeColor: AppColors.primary,
-                                          onChanged: isSelf
-                                              ? null
-                                              : (val) async {
-                                                  setState(
-                                                    () =>
-                                                        user['is_active'] = val,
-                                                  );
-                                                  try {
-                                                    await _api.updateUser(
-                                                      id,
-                                                      isActive: val,
-                                                    );
-                                                  } catch (e) {
-                                                    setState(
-                                                      () => user['is_active'] =
-                                                          !val,
-                                                    );
-                                                    _showSnack(
-                                                      e.toString().replaceFirst(
-                                                        'Exception: ',
-                                                        '',
-                                                      ),
-                                                      isError: true,
-                                                    );
-                                                  }
-                                                },
-                                        ),
-                                      ),
-                                    ],
-                                  ),
-                                ],
-                              ),
-                            ],
-                          ),
-                        );
-                      },
                     ),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
+                    InkWell(
+                      borderRadius: BorderRadius.circular(8),
+                      onTap: () => showUserExcelSheet(
+                        context: context,
+                        isDark: isDark,
+                        api: _api,
+                        existingUsers: _users,
+                        onSnack: _showSnack,
+                        onRefresh: _loadUsers,
+                      ),
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 10,
+                          vertical: 6,
+                        ),
+                        decoration: BoxDecoration(
+                          color: green.withOpacity(0.16),
+                          borderRadius: BorderRadius.circular(8),
+                          border: Border.all(color: green.withOpacity(0.5)),
+                        ),
+                        child: Row(
+                          children: [
+                            Icon(Icons.table_view, size: 14, color: green),
+                            const SizedBox(width: 5),
+                            Text(
+                              'NHẬP / XUẤT EXCEL',
+                              style: TextStyle(
+                                color: green,
+                                fontSize: 10,
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 12),
+            ],
 
-  Widget _buildStatCard(String label, String value, Color color, bool isDark) {
-    return Container(
-      padding: const EdgeInsets.all(10),
-      decoration: BoxDecoration(
-        color: AppColors.getSurface(isDark),
-        borderRadius: BorderRadius.circular(10),
-        border: Border.all(color: AppColors.getBorder(isDark)),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text(
-            label,
-            style: const TextStyle(
-              color: AppColors.textMuted,
-              fontSize: 9,
-              fontWeight: FontWeight.bold,
+            // Bộ lọc theo 4 vai trò RBAC
+            SingleChildScrollView(
+              scrollDirection: Axis.horizontal,
+              child: Row(
+                children: ['TẤT CẢ', 'Owner', 'Admin', 'Member', 'Guest'].map((
+                  role,
+                ) {
+                  final selected = _selectedRoleFilter == role;
+                  return Padding(
+                    padding: const EdgeInsets.only(right: 8),
+                    child: InkWell(
+                      borderRadius: BorderRadius.circular(20),
+                      onTap: () => setState(() => _selectedRoleFilter = role),
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 14,
+                          vertical: 7,
+                        ),
+                        decoration: BoxDecoration(
+                          color: selected
+                              ? cyan.withOpacity(0.2)
+                              : AppColors.getSurface(isDark),
+                          borderRadius: BorderRadius.circular(20),
+                          border: Border.all(
+                            color: selected
+                                ? cyan
+                                : (isDark ? Colors.white12 : Colors.black12),
+                          ),
+                        ),
+                        child: Text(
+                          role,
+                          style: TextStyle(
+                            color: selected
+                                ? cyan
+                                : AppColors.getTextSecondary(isDark),
+                            fontSize: 11,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                      ),
+                    ),
+                  );
+                }).toList(),
+              ),
             ),
-          ),
-          const SizedBox(height: 4),
-          Text(
-            value,
-            style: TextStyle(
-              color: color,
-              fontSize: 18,
-              fontWeight: FontWeight.bold,
-            ),
-          ),
-        ],
+            const SizedBox(height: 14),
+
+            if (_isLoading)
+              Padding(
+                padding: const EdgeInsets.symmetric(vertical: 40),
+                child: Center(child: CircularProgressIndicator(color: cyan)),
+              )
+            else if (list.isEmpty)
+              Container(
+                padding: const EdgeInsets.all(24),
+                decoration: BoxDecoration(
+                  color: AppColors.getSurface(isDark),
+                  borderRadius: BorderRadius.circular(14),
+                  border: Border.all(color: AppColors.getBorder(isDark)),
+                ),
+                child: const Text(
+                  'Không có tài khoản nào thuộc nhóm vai trò này.',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(color: AppColors.textMuted, fontSize: 12),
+                ),
+              )
+            else
+              ...list.map((u) {
+                final id = (u['id'] ?? '').toString();
+                final name = (u['full_name'] ?? u['name'] ?? 'Thành viên')
+                    .toString();
+                final email = (u['email'] ?? '').toString();
+                final role = _normalizeRole(u['role'] ?? u['role_name']);
+                final isActive = u['is_active'] != false;
+                final expiresAt =
+                    (u['expires_at'] ?? u['guest_expires_at'] ?? '').toString();
+                final rColor = _roleColor(role, isDark);
+                final isSelf = id.isNotEmpty && id == currentUserId;
+
+                return Container(
+                  margin: const EdgeInsets.only(bottom: 10),
+                  padding: const EdgeInsets.all(14),
+                  decoration: BoxDecoration(
+                    color: AppColors.getSurface(isDark),
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(
+                      color: isActive
+                          ? rColor.withOpacity(0.35)
+                          : AppColors.accent.withOpacity(0.4),
+                    ),
+                  ),
+                  child: Row(
+                    children: [
+                      CircleAvatar(
+                        backgroundColor: rColor.withOpacity(0.18),
+                        child: Text(
+                          name.isNotEmpty ? name[0].toUpperCase() : 'U',
+                          style: TextStyle(
+                            color: rColor,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Row(
+                              children: [
+                                Flexible(
+                                  child: Text(
+                                    isSelf ? '$name (Bạn)' : name,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: TextStyle(
+                                      color: AppColors.getTextPrimary(isDark),
+                                      fontWeight: FontWeight.bold,
+                                      fontSize: 14,
+                                    ),
+                                  ),
+                                ),
+                                const SizedBox(width: 6),
+                                Container(
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 7,
+                                    vertical: 2,
+                                  ),
+                                  decoration: BoxDecoration(
+                                    color: rColor.withOpacity(0.16),
+                                    borderRadius: BorderRadius.circular(6),
+                                  ),
+                                  child: Text(
+                                    role.toUpperCase(),
+                                    style: TextStyle(
+                                      color: rColor,
+                                      fontSize: 9,
+                                      fontWeight: FontWeight.bold,
+                                    ),
+                                  ),
+                                ),
+                              ],
+                            ),
+                            const SizedBox(height: 3),
+                            Text(
+                              email,
+                              style: const TextStyle(
+                                color: AppColors.textMuted,
+                                fontSize: 11,
+                              ),
+                            ),
+                            if (!isActive)
+                              const Text(
+                                'ĐÃ VÔ HIỆU HÓA',
+                                style: TextStyle(
+                                  color: AppColors.accent,
+                                  fontSize: 10,
+                                  fontWeight: FontWeight.bold,
+                                ),
+                              )
+                            else if (role == 'Guest' && expiresAt.isNotEmpty)
+                              Text(
+                                'Hết hạn: $expiresAt',
+                                style: TextStyle(color: rColor, fontSize: 10),
+                              ),
+                          ],
+                        ),
+                      ),
+                      if (!isSelf) ...[
+                        IconButton(
+                          icon: const Icon(Icons.edit_outlined, size: 19),
+                          color: AppColors.getTextSecondary(isDark),
+                          onPressed: () => _showEditUserDialog(u, isDark),
+                        ),
+                        IconButton(
+                          icon: const Icon(
+                            Icons.delete_outline,
+                            size: 19,
+                            color: AppColors.accent,
+                          ),
+                          onPressed: () async {
+                            try {
+                              await _api.deleteUser(id);
+                              _showSnack('Đã xóa tài khoản $name');
+                              await _loadUsers();
+                            } catch (e) {
+                              _showSnack(
+                                e.toString().replaceFirst('Exception: ', ''),
+                                isError: true,
+                              );
+                            }
+                          },
+                        ),
+                      ],
+                    ],
+                  ),
+                );
+              }),
+          ],
+        ),
       ),
     );
   }
