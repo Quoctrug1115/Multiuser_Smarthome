@@ -3,10 +3,10 @@ import 'package:flutter/material.dart';
 import '../../theme/app_colors.dart';
 
 class SensorOverviewSection extends StatelessWidget {
-  final double temperature;
-  final double humidity;
-  final int lux;
-  final bool motion;
+  final double? temperature;
+  final double? humidity;
+  final int? lux;
+  final bool? motion;
   final double totalWatt;
   final bool isDark;
 
@@ -34,8 +34,10 @@ class SensorOverviewSection extends StatelessWidget {
               child: _buildSensorTile(
                 icon: Icons.thermostat,
                 label: 'NHIỆT ĐỘ',
-                value: '${temperature.toStringAsFixed(1)}°C',
-                color: temperature > 35 ? AppColors.accent : amber,
+                value: temperature != null
+                    ? '${temperature!.toStringAsFixed(1)}°C'
+                    : '--°C',
+                color: (temperature ?? 0) > 35 ? AppColors.accent : amber,
               ),
             ),
             const SizedBox(width: 10),
@@ -43,7 +45,9 @@ class SensorOverviewSection extends StatelessWidget {
               child: _buildSensorTile(
                 icon: Icons.water_drop_outlined,
                 label: 'ĐỘ ẨM',
-                value: '${humidity.toStringAsFixed(0)}%',
+                value: humidity != null
+                    ? '${humidity!.toStringAsFixed(0)}%'
+                    : '--%',
                 color: cyan,
               ),
             ),
@@ -56,17 +60,19 @@ class SensorOverviewSection extends StatelessWidget {
               child: _buildSensorTile(
                 icon: Icons.wb_sunny_outlined,
                 label: 'ÁNH SÁNG',
-                value: '$lux lx',
+                value: lux != null ? '$lux lx' : '-- lx',
                 color: green,
               ),
             ),
             const SizedBox(width: 10),
             Expanded(
               child: _buildSensorTile(
-                icon: motion ? Icons.sensors : Icons.sensors_off,
+                icon: motion == true ? Icons.sensors : Icons.sensors_off,
                 label: 'CHUYỂN ĐỘNG',
-                value: motion ? 'CÓ NGƯỜI' : 'AN TOÀN',
-                color: motion ? AppColors.accent : AppColors.secondary,
+                value: motion == null
+                    ? 'CHƯA KẾT NỐI'
+                    : (motion! ? 'CÓ NGƯỜI' : 'AN TOÀN'),
+                color: motion == true ? AppColors.accent : AppColors.secondary,
               ),
             ),
           ],

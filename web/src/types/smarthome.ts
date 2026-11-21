@@ -57,6 +57,7 @@ export interface Device {
   room_id?: string | null;
   room_name?: string | null;
   is_on: boolean;
+  is_online?: boolean;
 }
 
 export interface AutomationRule {

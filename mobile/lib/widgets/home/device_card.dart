@@ -74,6 +74,7 @@ class HomeDeviceCard extends StatelessWidget {
     final isOn = isDeviceOn(device);
     final deviceColor = _deviceColor(type, isOn);
     final amber = isDark ? Colors.amber : const Color(0xFFD97706);
+    final isOnline = device['is_online'] != false;
 
     return Container(
       margin: const EdgeInsets.only(bottom: 12),
@@ -264,8 +265,9 @@ class HomeDeviceCard extends StatelessWidget {
                     Switch(
                       value: isOn,
                       activeColor: deviceColor,
-                      onChanged: canControl
-                          ? (newVal) => onToggle(newVal)
+                      // Trong Switch của HomeDeviceCard:
+                      onChanged: (canControl && isOnline)
+                          ? (val) => onToggle(val)
                           : null,
                     ),
                   ],

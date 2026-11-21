@@ -353,7 +353,7 @@ export function DevicesTab({
               STT: 1,
               TenThietBi: 'Đèn trần phòng khách',
               LoaiThietBi: 'light',
-              MqttTopic: 'smarthome/devices/led_phong_khach',
+              MqttTopic: 'smarthome/A4CF128B90E1/light',
               Phong: 'Phòng khách',
               TrangThai: 'TẮT',
             },
@@ -1020,7 +1020,7 @@ export function DevicesTab({
                 required
                 value={newDeviceTopic}
                 onChange={(e) => setNewDeviceTopic(e.target.value)}
-                placeholder="MQTT Topic (home/r1/led)"
+                placeholder="MQTT Topic (smarthome/{chip_id}/light)"
                 className={`px-3 py-2 rounded-xl border text-xs ${inputBg}`}
               />
               <select
@@ -1365,9 +1365,20 @@ export function DevicesTab({
                 <div className="flex items-start justify-between gap-2">
                   <div className="min-w-0">
                     <div className="font-bold text-sm truncate">{dev.name}</div>
-                    <div className="text-xs text-slate-400 mt-0.5">
-                      {dev.room_name || 'Chưa phân phòng'} •{' '}
-                      <span className="uppercase text-cyan-400">{dev.device_type}</span>
+                    <div className="text-xs text-slate-400 mt-0.5 flex flex-wrap items-center gap-2">
+                      <span>
+                        {dev.room_name || 'Chưa phân phòng'} •{' '}
+                        <span className="uppercase text-cyan-400">{dev.device_type}</span>
+                      </span>
+                      <span
+                        className={`px-1.5 py-0.5 rounded text-[10px] font-semibold ${
+                          dev.is_online === false
+                            ? 'bg-rose-500/20 text-rose-300'
+                            : 'bg-emerald-500/15 text-emerald-300'
+                        }`}
+                      >
+                        {dev.is_online === false ? '● OFFLINE' : '● ONLINE'}
+                      </span>
                     </div>
                     <div className="text-[11px] font-mono text-slate-500 mt-1 truncate">
                       {dev.mqtt_topic}
@@ -1424,14 +1435,21 @@ export function DevicesTab({
                 </div>
 
                 <button
+                  disabled={dev.is_online === false}
                   onClick={() => onToggleDevice(dev)}
                   className={`w-full py-2 rounded-xl font-bold text-xs transition ${
-                    dev.is_on
+                    dev.is_online === false
+                      ? 'bg-slate-800/60 text-slate-500 cursor-not-allowed'
+                      : dev.is_on
                       ? 'bg-emerald-500 text-slate-950'
                       : 'bg-slate-800 text-slate-300 hover:bg-slate-700'
                   }`}
                 >
-                  {dev.is_on ? '● ĐANG BẬT (Nhấn để TẮT)' : '○ ĐANG TẮT (Nhấn để BẬT)'}
+                  {dev.is_online === false
+                    ? '⚠ THIẾT BỊ MẤT KẾT NỐI'
+                    : dev.is_on
+                    ? '● ĐANG BẬT (Nhấn để TẮT)'
+                    : '○ ĐANG TẮT (Nhấn để BẬT)'}
                 </button>
               </div>
             );

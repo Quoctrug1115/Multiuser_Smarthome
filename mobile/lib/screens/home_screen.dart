@@ -41,10 +41,10 @@ class _HomeScreenState extends State<HomeScreen> {
   String _selectedType = 'TẤT CẢ';
   final TextEditingController _searchController = TextEditingController();
 
-  double _temperature = 27.5;
-  double _humidity = 65.0;
-  double _lux = 420.0;
-  bool _motionDetected = false;
+  double? _temperature;
+  double? _humidity;
+  double? _lux;
+  bool? _motionDetected;
 
   final List _logs = [];
 
@@ -103,33 +103,79 @@ class _HomeScreenState extends State<HomeScreen> {
 
       String incomingId = '';
       String topic = '';
-      bool isOn = false;
+      String incomingOwner = '';
+      String source = '';
+      bool? parsedIsOn;
+      bool? parsedIsOnline;
 
       if (raw is Map) {
         final data = raw['data'] is Map ? raw['data'] as Map : raw;
+
+        // 1. Lọc đúng hộ gia đình (Multi-tenant) nếu payload có đính kèm owner_id
+        incomingOwner = (data['owner_id'] ?? '')
+            .toString()
+            .trim()
+            .toLowerCase();
+        final myOwner = _api.householdOwnerId.trim().toLowerCase();
+        if (incomingOwner.isNotEmpty &&
+            myOwner.isNotEmpty &&
+            incomingOwner != myOwner) {
+          return;
+        }
+
         incomingId = (data['id'] ?? data['device_id'] ?? '')
             .toString()
             .trim()
             .toLowerCase();
-        topic = (data['mqtt_topic'] ?? '').toString().trim().toLowerCase();
-        final rawState = data['is_on'] ?? data['status'] ?? data['state'];
-        if (rawState is bool) {
-          isOn = rawState;
-        } else {
-          final s = (rawState ?? '').toString().trim().toLowerCase();
-          isOn = s == 'on' || s == 'true' || s == '1' || s == 'active';
+        topic = (data['mqtt_topic'] ?? '')
+            .toString()
+            .trim()
+            .toLowerCase()
+            .replaceAll(RegExp(r'/+$'), '');
+        source = (data['source'] ?? '').toString().trim().toLowerCase();
+
+        // 2. Chỉ parse is_on khi gói tin thực sự có trường trạng thái bật/tắt
+        if (data.containsKey('is_on') ||
+            data.containsKey('status') ||
+            data.containsKey('state')) {
+          final rawState = data['is_on'] ?? data['status'] ?? data['state'];
+          if (rawState is bool) {
+            parsedIsOn = rawState;
+          } else if (rawState != null) {
+            final s = rawState.toString().trim().toLowerCase();
+            parsedIsOn = s == 'on' || s == 'true' || s == '1' || s == 'active';
+          }
+        }
+
+        // 3. Parse trạng thái kết nối phần cứng (Online / Offline từ MQTT LWT)
+        if (data.containsKey('is_online') && data['is_online'] != null) {
+          final rawOnline = data['is_online'];
+          if (rawOnline is bool) {
+            parsedIsOnline = rawOnline;
+          } else {
+            final s = rawOnline.toString().trim().toLowerCase();
+            parsedIsOnline = s == 'true' || s == '1' || s == 'online';
+          }
         }
       } else {
         try {
           incomingId = (raw.id ?? '').toString().trim().toLowerCase();
-          topic = (raw.mqttTopic ?? '').toString().trim().toLowerCase();
-          isOn = raw.isOn == true;
+          topic = (raw.mqttTopic ?? '')
+              .toString()
+              .trim()
+              .toLowerCase()
+              .replaceAll(RegExp(r'/+$'), '');
+          parsedIsOn = raw.isOn == true;
         } catch (_) {
           return;
         }
       }
 
       String? triggeredName;
+      bool stateChanged = false;
+      bool onlineChanged = false;
+      bool finalIsOn = false;
+      bool finalIsOnline = true;
 
       setState(() {
         for (final d in _devices) {
@@ -137,22 +183,56 @@ class _HomeScreenState extends State<HomeScreen> {
           final localTopic = (d['mqtt_topic'] ?? '')
               .toString()
               .trim()
-              .toLowerCase();
+              .toLowerCase()
+              .replaceAll(RegExp(r'/+$'), '');
+
           final matchById = incomingId.isNotEmpty && localId == incomingId;
           final matchByTopic = topic.isNotEmpty && localTopic == topic;
+
           if (matchById || matchByTopic) {
-            d['is_on'] = isOn;
-            d['status'] = isOn ? 'ON' : 'OFF';
             triggeredName = (d['name'] ?? topic).toString();
+
+            final prevOn = HomeDeviceCard.isDeviceOn(d);
+            final prevOnline = d['is_online'] != false;
+
+            if (parsedIsOn != null) {
+              if (prevOn != parsedIsOn) stateChanged = true;
+              d['is_on'] = parsedIsOn;
+              d['status'] = parsedIsOn ? 'ON' : 'OFF';
+              finalIsOn = parsedIsOn;
+            } else {
+              finalIsOn = prevOn;
+            }
+
+            if (parsedIsOnline != null) {
+              if (prevOnline != parsedIsOnline) onlineChanged = true;
+              d['is_online'] = parsedIsOnline;
+              finalIsOnline = parsedIsOnline;
+            } else {
+              finalIsOnline = prevOnline;
+            }
           }
         }
       });
 
+      // 4. Ghi nhật ký chính xác theo nguồn tác động thực tế
       if (triggeredName != null) {
-        _addLog(
-          'Realtime: ${isOn ? "Bật" : "Tắt"} $triggeredName (${isOn ? "ON" : "OFF"})',
-          'MQTT',
-        );
+        if (onlineChanged && !finalIsOnline) {
+          _addLog('Mất kết nối phần cứng: $triggeredName (OFFLINE)', 'MQTT');
+        } else if (onlineChanged && finalIsOnline && !stateChanged) {
+          _addLog(
+            'Thiết bị trực tuyến trở lại: $triggeredName (ONLINE)',
+            'MQTT',
+          );
+        } else if (stateChanged) {
+          final sourceLabel = source == 'physical_button'
+              ? 'Nút bấm cơ'
+              : (source == 'sync_reconnect' ? 'Đồng bộ lại' : 'Realtime');
+          _addLog(
+            '$sourceLabel: ${finalIsOn ? "Bật" : "Tắt"} $triggeredName (${finalIsOn ? "ON" : "OFF"})',
+            'MQTT',
+          );
+        }
       } else {
         _syncDeviceStatesSilently();
       }
@@ -373,7 +453,7 @@ class _HomeScreenState extends State<HomeScreen> {
             SensorOverviewSection(
               temperature: _temperature,
               humidity: _humidity,
-              lux: _lux.round(),
+              lux: _lux?.round(),
               motion: _motionDetected,
               totalWatt: _activeWatt,
               isDark: isDark,
@@ -708,11 +788,17 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Widget _buildAiSuggestionBanner(bool isDark, Color cyan) {
-    final hint = _temperature > 31
-        ? 'Nhiệt độ phòng đạt ${_temperature.toStringAsFixed(1)}°C. Đề xuất bật quạt hoặc điều hòa làm mát.'
-        : _lux < 250
-        ? 'Cường độ ánh sáng thấp (${_lux.toStringAsFixed(0)} lx). Đề xuất bật đèn chiếu sáng.'
-        : 'Môi trường ổn định (${_temperature.toStringAsFixed(1)}°C • ${_humidity.toStringAsFixed(0)}%). Hệ thống AI đang giám sát.';
+    final temp = _temperature;
+    final hum = _humidity;
+    final luxVal = _lux;
+
+    final hint = (temp == null || hum == null || luxVal == null)
+        ? 'Đang chờ dữ liệu cảm biến từ ESP32 qua MQTT...'
+        : temp > 31
+        ? 'Nhiệt độ phòng đạt ${temp.toStringAsFixed(1)}°C. Đề xuất bật quạt hoặc điều hòa làm mát.'
+        : luxVal < 250
+        ? 'Cường độ ánh sáng thấp (${luxVal.toStringAsFixed(0)} lx). Đề xuất bật đèn chiếu sáng.'
+        : 'Môi trường ổn định (${temp.toStringAsFixed(1)}°C • ${hum.toStringAsFixed(0)}%). Hệ thống AI đang giám sát.';
 
     return Container(
       padding: const EdgeInsets.all(12),
