@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { useAuth } from '../context/AuthContext';
-
+import { HubLogoIcon } from './HubLogoIcon';
 interface AuthScreenProps {
   onSuccessLog: (msg: string) => void;
 }
@@ -40,9 +40,7 @@ export function AuthScreen({ onSuccessLog }: AuthScreenProps) {
     <div className="min-h-screen bg-[#080d1a] text-slate-100 flex items-center justify-center p-4">
       <div className="w-full max-w-md rounded-2xl bg-[#0e1629] border border-slate-800 p-7 shadow-2xl">
         <div className="flex items-center gap-3 mb-6">
-          <div className="w-11 h-11 rounded-xl bg-cyan-500/15 border border-cyan-500/30 flex items-center justify-center text-xl">
-            🏠
-          </div>
+          <HubLogoIcon size={46} />
           <div>
             <h1 className="text-lg font-bold text-cyan-400">SmartHome IoT</h1>
             <p className="text-xs text-slate-400">
