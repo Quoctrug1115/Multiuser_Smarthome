@@ -227,7 +227,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   color: isDark ? Colors.amber : AppColors.secondary,
                 ),
                 title: Text(
-                  'Chế độ Giao diện Tối (Sci-Fi Dark)',
+                  'Chế độ Giao diện Tối (Dark)',
                   style: TextStyle(
                     color: AppColors.getTextPrimary(isDark),
                     fontSize: 13,
@@ -303,7 +303,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   ),
                   decoration: InputDecoration(
                     labelText: 'Địa chỉ Backend (HTTP / WS)',
-                    hintText: 'http://10.0.2.2:3000',
+                    hintText: 'http://127.0.0.1:3000',
                     prefixIcon: Icon(Icons.dns_outlined, color: cyan, size: 19),
                   ),
                 ),
@@ -313,11 +313,11 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   children: [
                     ActionChip(
                       label: const Text(
-                        'Android Emulator (10.0.2.2)',
+                        'Android Emulator (127.0.0.1)',
                         style: TextStyle(fontSize: 11),
                       ),
                       onPressed: () {
-                        _serverCtrl.text = 'http://10.0.2.2:3000';
+                        _serverCtrl.text = 'http://127.0.0.1:3000';
                         _applyServerConfig();
                       },
                     ),

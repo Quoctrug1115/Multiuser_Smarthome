@@ -62,7 +62,7 @@ class _SmartHomeAppState extends State<SmartHomeApp>
     final themeProvider = Provider.of<ThemeProvider>(context);
 
     return MaterialApp(
-      title: 'SmartHome Sci-Fi Hub',
+      title: 'SmartHome',
       debugShowCheckedModeBanner: false,
       themeMode: themeProvider.themeMode,
       theme: ThemeData.light().copyWith(

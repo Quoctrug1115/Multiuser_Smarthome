@@ -129,7 +129,7 @@ class _MainTabScreenState extends State<MainTabScreen> {
             const Icon(Icons.hub, color: AppColors.primary, size: 22),
             const SizedBox(width: 8),
             Text(
-              'SCI-FI HUB CONTROL',
+              'Smarthome',
               style: TextStyle(
                 color: AppColors.getTextPrimary(isDark),
                 fontSize: 16,
