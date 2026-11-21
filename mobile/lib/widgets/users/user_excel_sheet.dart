@@ -146,19 +146,16 @@ void showUserExcelSheet({
       return StatefulBuilder(
         builder: (context, setSheetState) {
           Future<void> pickAndParseExcel() async {
-            final result = await FilePicker.platform.pickFiles(
+            final result = await FilePicker.pickFiles(
               type: FileType.custom,
               allowedExtensions: ['xlsx'],
-              withData: true,
             );
-            if (result == null || result.files.isEmpty) return;
+            if (result.isEmpty) return;
 
-            final file = result.files.first;
-            final bytes =
-                file.bytes ??
-                (file.path != null
-                    ? await File(file.path!).readAsBytes()
-                    : null);
+            final file = result.first;
+            final bytes = file.path != null
+                ? await File(file.path!).readAsBytes()
+                : null;
             if (bytes == null) {
               onSnack('Không thể đọc nội dung file Excel!', isError: true);
               return;
