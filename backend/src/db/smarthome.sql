@@ -306,3 +306,27 @@ SELECT id, name, device_type, mqtt_topic, status, is_on FROM dbo.devices;
 SELECT name, LEN(name) AS do_dai_ten, create_date
 FROM sys.tables
 WHERE name LIKE N'devices%';
+
+use smarthome;
+
+UPDATE dbo.devices SET mqtt_topic = N'smarthome/XXXX/light'
+WHERE id = 'd1111111-1111-1111-1111-111111111111';
+
+-- 1. Xóa các thiết bị mẫu/trùng chưa gắn chủ sở hữu
+DELETE FROM dbo.devices WHERE owner_id IS NULL;
+
+-- 2. Kiểm tra danh sách thiết bị còn lại của bạn
+SELECT id, owner_id, name, device_type, mqtt_topic FROM dbo.devices;
+
+-- 3. Cập nhật mqtt_topic cho khớp với ChipID QTRUNG000001
+UPDATE dbo.devices
+SET mqtt_topic = N'smarthome/QTRUNG000001/light'
+WHERE device_type = N'light' OR mqtt_topic LIKE N'%led%';
+
+UPDATE dbo.devices
+SET mqtt_topic = N'smarthome/QTRUNG000001/fan'
+WHERE device_type = N'fan' OR mqtt_topic LIKE N'%quat%';
+
+UPDATE dbo.devices
+SET mqtt_topic = N'smarthome/QTRUNG000001/telemetry'
+WHERE device_type = N'sensor' OR mqtt_topic LIKE N'%dht22%';
