@@ -3,28 +3,46 @@
   "author": "SmartHome IoT",
   "editor": "wokwi",
   "parts": [
-    { "type": "wokwi-esp32-devkit-v1", "id": "esp", "top": 0, "left": 0, "attrs": {} },
-    { "type": "wokwi-dht22", "id": "dht1", "top": -100, "left": 150, "attrs": {} },
-    { "type": "wokwi-photoresistor-sensor", "id": "ldr1", "top": 100, "left": 150, "attrs": {} },
-    { "type": "wokwi-pir-motion-sensor", "id": "pir1", "top": 200, "left": 150, "attrs": {} },
-    { "type": "wokwi-led", "id": "led_light", "top": -50, "left": -150, "attrs": { "color": "yellow" } },
-    { "type": "wokwi-led", "id": "led_fan", "top": 50, "left": -150, "attrs": { "color": "blue" } }
+    { "type": "board-esp32-devkit-c-v4", "id": "esp", "top": 0, "left": 0, "attrs": {} },
+    { "type": "wokwi-led", "id": "led_light", "top": -60, "left": 180, "attrs": { "color": "yellow", "label": "Đèn (GPIO 2)" } },
+    { "type": "wokwi-resistor", "id": "r_light", "top": 15, "left": 175, "attrs": { "value": "220" } },
+    { "type": "wokwi-led", "id": "led_fan", "top": 60, "left": 180, "attrs": { "color": "blue", "label": "Quạt (GPIO 4)" } },
+    { "type": "wokwi-resistor", "id": "r_fan", "top": 135, "left": 175, "attrs": { "value": "220" } },
+    { "type": "wokwi-pushbutton", "id": "btn_light", "top": 40, "left": -150, "attrs": { "color": "yellow", "label": "Công tắc Đèn (12)" } },
+    { "type": "wokwi-pushbutton", "id": "btn_fan", "top": 120, "left": -150, "attrs": { "color": "blue", "label": "Công tắc Quạt (14)" } },
+    { "type": "wokwi-dht22", "id": "dht", "top": 190, "left": 160, "attrs": {} },
+    { "type": "wokwi-photoresistor-sensor", "id": "ldr", "top": -130, "left": -150, "attrs": {} },
+    { "type": "wokwi-pir-motion-sensor", "id": "pir", "top": 210, "left": -150, "attrs": {} }
   ],
- "connections": [
-    [ "esp:TX0", "$serialMonitor:RX", "", [] ],
-    [ "esp:RX0", "$serialMonitor:TX", "", [] ],
-    [ "dht1:VCC", "esp:3V3", "red", [] ],
-    [ "dht1:GND", "esp:GND", "black", [] ],
-    [ "dht1:SDA", "esp:D15", "green", [] ],
-    [ "ldr1:VCC", "esp:3V3", "red", [] ],
-    [ "ldr1:GND", "esp:GND", "black", [] ],
-    [ "ldr1:AO", "esp:VP", "blue", [] ],
-    [ "pir1:VCC", "esp:5V", "red", [] ],
-    [ "pir1:GND", "esp:GND", "black", [] ],
-    [ "pir1:OUT", "esp:D13", "orange", [] ],
-    [ "led_light:A", "esp:D2", "yellow", [] ],
-    [ "led_light:C", "esp:GND", "black", [] ],
-    [ "led_fan:A", "esp:D4", "blue", [] ],
-    [ "led_fan:C", "esp:GND", "black", [] ]
-  ]
+  "connections": [
+    [ "esp:TX", "$serialMonitor:RX", "", [] ],
+    [ "esp:RX", "$serialMonitor:TX", "", [] ],
+
+    [ "esp:2", "r_light:1", "gold", [ "h40" ] ],
+    [ "r_light:2", "led_light:A", "gold", [] ],
+    [ "led_light:C", "esp:GND.2", "black", [ "v20", "h-60" ] ],
+
+    [ "esp:4", "r_fan:1", "blue", [ "h40" ] ],
+    [ "r_fan:2", "led_fan:A", "blue", [] ],
+    [ "led_fan:C", "esp:GND.2", "black", [ "v20", "h-60" ] ],
+
+    [ "btn_light:1.l", "esp:12", "gold", [ "h30" ] ],
+    [ "btn_light:2.l", "esp:GND.1", "black", [ "h20" ] ],
+
+    [ "btn_fan:1.l", "esp:14", "blue", [ "h30" ] ],
+    [ "btn_fan:2.l", "esp:GND.1", "black", [ "h20" ] ],
+
+    [ "dht:VCC", "esp:3V3", "red", [ "v10", "h-40" ] ],
+    [ "dht:SDA", "esp:15", "green", [ "h-30" ] ],
+    [ "dht:GND", "esp:GND.3", "black", [ "h-40" ] ],
+
+    [ "ldr:VCC", "esp:3V3", "red", [ "h20" ] ],
+    [ "ldr:GND", "esp:GND.1", "black", [ "h20" ] ],
+    [ "ldr:AO", "esp:VP", "orange", [ "h30" ] ],
+
+    [ "pir:VCC", "esp:5V", "red", [ "h20" ] ],
+    [ "pir:GND", "esp:GND.1", "black", [ "h20" ] ],
+    [ "pir:OUT", "esp:13", "purple", [ "h30" ] ]
+  ],
+  "dependencies": {}
 }

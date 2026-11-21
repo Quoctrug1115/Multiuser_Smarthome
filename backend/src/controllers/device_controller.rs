@@ -83,6 +83,7 @@ pub async fn get_devices(
 
     let sql = r#"
         SELECT
+            COALESCE(d.is_online, CAST(1 AS BIT)) AS is_online,
             d.id,
             d.name,
             COALESCE(d.device_type, N'switch') AS device_type,
@@ -125,7 +126,8 @@ pub async fn get_devices(
                         "room_id": room_id.map(|u| u.to_string()),
                         "room_name": room_name,
                         "is_on": is_on,
-                        "status": if is_on { "ON" } else { "OFF" }
+                        "status": if is_on { "ON" } else { "OFF" },
+                        "is_online": row.get::<bool, _>("is_online").unwrap_or(true),
                     }))
                 })
                 .collect();
