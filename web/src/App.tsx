@@ -225,14 +225,16 @@ function SmartHomeWorkspace() {
   }
 
   // ==================== STYLING HELPERS ====================
-  const pageBg = isDark ? 'bg-[#080d1a] text-slate-100' : 'bg-slate-100 text-slate-900';
+  const pageBg = isDark
+    ? 'dark-theme bg-[#080d1a] text-slate-100'
+    : 'light-theme bg-[#F0F4F9] text-slate-900';
   const sidebarBg = isDark ? 'bg-[#0b1121] border-slate-800/80' : 'bg-white border-slate-200';
   const cardBg = isDark
     ? 'bg-[#0e1629] border-slate-800/80'
-    : 'bg-white border-slate-200 shadow-sm';
+    : 'bg-white border-slate-200/90 shadow-sm';
   const inputBg = isDark
     ? 'bg-[#131c31] border-slate-700 text-slate-100 placeholder-slate-500'
-    : 'bg-slate-50 border-slate-300 text-slate-900 placeholder-slate-400';
+    : 'bg-white border-slate-300 text-slate-900 placeholder-slate-400';
 
   return (
     <div className={`min-h-screen flex ${pageBg}`}>
