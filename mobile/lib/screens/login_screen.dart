@@ -145,7 +145,7 @@ class _LoginScreenState extends State<LoginScreen> {
                   ),
                   const SizedBox(height: 16),
                   Text(
-                    'NEXUS SMART HOME',
+                    'SMART HOME',
                     style: TextStyle(
                       color: isDark
                           ? AppColors.primary
