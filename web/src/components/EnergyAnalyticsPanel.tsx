@@ -316,9 +316,6 @@ export const EnergyAnalyticsPanel: React.FC<EnergyAnalyticsPanelProps> = ({
               <h2 className="font-bold text-sm">
                 Biểu đồ tiêu thụ điện năng theo {unitLabel} (kWh)
               </h2>
-              <p className="text-xs text-slate-400 mt-0.5">
-                Rê chuột vào từng mốc để xem chi tiết sản lượng và chi phí tiền điện
-              </p>
             </div>
 
             <div className="flex flex-wrap items-center gap-3 text-xs">
@@ -539,9 +536,6 @@ export const EnergyAnalyticsPanel: React.FC<EnergyAnalyticsPanelProps> = ({
         >
           <div>
             <h2 className="font-bold text-sm">Tỷ trọng Công suất Tức thời</h2>
-            <p className="text-xs text-slate-400 mt-0.5">
-              Phân bố phụ tải theo nhóm thiết bị đang bật
-            </p>
           </div>
 
           <div className="my-4 flex items-center justify-center">
