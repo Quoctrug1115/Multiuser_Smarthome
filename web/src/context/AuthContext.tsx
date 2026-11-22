@@ -8,6 +8,8 @@ interface AuthContextValue {
   syncUserProfile: (meData: Partial<UserProfile>) => void;
   login: (email: string, password: string) => Promise<UserProfile>;
   register: (name: string, email: string, password: string) => Promise<UserProfile>;
+  forgotPassword: (email: string) => Promise<{ message: string; dev_otp?: string }>;
+  resetPassword: (email: string, otp: string, newPassword: string) => Promise<string>;
   logout: () => void;
 }
 
@@ -81,6 +83,45 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     return data.user;
   };
 
+  const forgotPassword = async (
+    email: string
+  ): Promise<{ message: string; dev_otp?: string }> => {
+    const res = await fetch(`${API_BASE}/auth/forgot-password`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: email.trim() }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new Error(data?.error || 'Không thể gửi yêu cầu khôi phục mật khẩu.');
+    }
+    return {
+      message: data?.message || 'Mã OTP đã được gửi.',
+      dev_otp: data?.dev_otp,
+    };
+  };
+
+  const resetPassword = async (
+    email: string,
+    otp: string,
+    newPassword: string
+  ): Promise<string> => {
+    const res = await fetch(`${API_BASE}/auth/reset-password`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        email: email.trim(),
+        otp: otp.trim(),
+        new_password: newPassword,
+      }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new Error(data?.error || 'Đặt lại mật khẩu thất bại.');
+    }
+    return data?.message || 'Đặt lại mật khẩu thành công.';
+  };
+
   const logout = () => {
     localStorage.removeItem('token');
     localStorage.removeItem('smarthome_user');
@@ -95,6 +136,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         syncUserProfile,
         login,
         register,
+        forgotPassword,
+        resetPassword,
         logout,
       }}
     >
