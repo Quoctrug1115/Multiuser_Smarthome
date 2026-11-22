@@ -283,10 +283,6 @@ export function AccountsTab({
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
           <h1 className="text-lg font-bold">Quản lý Tài khoản Thành viên trong Gia đình</h1>
-          <p className="text-xs text-slate-400">
-            Cấp tài khoản phụ (Admin / Member / Guest) • Hỗ trợ nhập/xuất hàng loạt qua Excel (cột:
-            HoTen, Email, MatKhau, VaiTro)
-          </p>
         </div>
 
         <div className="flex items-center gap-2">
@@ -325,7 +321,7 @@ export function AccountsTab({
               <div className="flex flex-wrap items-center justify-between gap-3">
                 <div>
                   <h2 className="text-sm font-bold text-cyan-400">
-                    📋 Danh sách kiểm tra dữ liệu từ file: {excelFileName}
+                    webDanh sách kiểm tra dữ liệu từ file: {excelFileName}
                   </h2>
                   <div className="flex flex-wrap items-center gap-3 mt-1 text-xs">
                     <span className="text-slate-400">
