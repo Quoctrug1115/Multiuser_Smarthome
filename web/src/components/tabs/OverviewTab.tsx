@@ -60,7 +60,7 @@ export function OverviewTab({
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
         <div className={`p-5 rounded-2xl border ${cardBg}`}>
           <div className="flex items-center justify-between text-xs text-slate-400 mb-1">
-            <span>🌡️ Nhiệt độ phòng</span>
+            <span>Nhiệt độ phòng</span>
             <span className="px-2 py-0.5 rounded bg-amber-500/15 text-amber-400 text-[10px] font-semibold">
               {!hasLiveSensor || !sensorData
                 ? 'Chưa kết nối'
@@ -83,7 +83,7 @@ export function OverviewTab({
 
         <div className={`p-5 rounded-2xl border ${cardBg}`}>
           <div className="flex items-center justify-between text-xs text-slate-400 mb-1">
-            <span>💧 Độ ẩm không khí</span>
+            <span>Độ ẩm không khí</span>
             <span className="px-2 py-0.5 rounded bg-cyan-500/15 text-cyan-400 text-[10px] font-semibold">
               {!hasLiveSensor || !sensorData
                 ? 'Chưa kết nối'
@@ -100,7 +100,7 @@ export function OverviewTab({
 
         <div className={`p-5 rounded-2xl border ${cardBg}`}>
           <div className="flex items-center justify-between text-xs text-slate-400 mb-1">
-            <span>☀️ Ánh sáng / PIR</span>
+            <span>Ánh sáng / PIR</span>
             <span
               className={`px-2 py-0.5 rounded text-[10px] font-semibold ${
                 hasLiveSensor && sensorData?.motion
@@ -125,7 +125,7 @@ export function OverviewTab({
 
         <div className={`p-5 rounded-2xl border ${cardBg}`}>
           <div className="flex items-center justify-between text-xs text-slate-400 mb-1">
-            <span>🔌 Thiết bị & Công suất</span>
+            <span>Thiết bị & Công suất</span>
             <span className="px-2 py-0.5 rounded bg-sky-500/15 text-sky-400 text-[10px] font-mono">
               ~{estimatedLiveWatt}W
             </span>
@@ -144,7 +144,7 @@ export function OverviewTab({
         <div className={`lg:col-span-2 p-5 rounded-2xl border ${cardBg}`}>
           <div className="flex items-center justify-between mb-4">
             <div>
-              <h2 className="font-bold text-sm">⚡ Điều khiển nhanh Thiết bị IoT</h2>
+              <h2 className="font-bold text-sm">Điều khiển nhanh Thiết bị IoT</h2>
               <p className="text-xs text-slate-400">
                 Bật/tắt trực tiếp thiết bị và theo dõi chỉ số cảm biến thời gian thực qua MQTT
               </p>
@@ -179,13 +179,13 @@ export function OverviewTab({
                         {hasLiveSensor && sensorData ? (
                           <>
                             <span className="px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-300">
-                              🌡️ {sensorData.temperature.toFixed(1)}°C
+                              {sensorData.temperature.toFixed(1)}°C
                             </span>
                             <span className="px-1.5 py-0.5 rounded bg-cyan-500/15 text-cyan-300">
-                              💧 {sensorData.humidity.toFixed(0)}%
+                              {sensorData.humidity.toFixed(0)}%
                             </span>
                             <span className="px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-300">
-                              ☀️ {sensorData.lux} Lux
+                              {sensorData.lux} Lux
                             </span>
                           </>
                         ) : (
@@ -215,7 +215,7 @@ export function OverviewTab({
 
         <div className={`p-5 rounded-2xl border ${cardBg}`}>
           <div className="flex items-center justify-between mb-4">
-            <h2 className="font-bold text-sm">🏠 Không gian Nhà & Phòng</h2>
+            <h2 className="font-bold text-sm">Không gian Nhà & Phòng</h2>
             <span className="text-xs font-mono text-slate-400">
               {houses.length}N • {rooms.length}P
             </span>
@@ -250,7 +250,7 @@ export function OverviewTab({
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
         <div className={`p-5 rounded-2xl border ${cardBg}`}>
           <div className="flex items-center justify-between mb-3">
-            <h2 className="font-bold text-sm">⚙️ Kịch bản Tự động hóa ({automations.length})</h2>
+            <h2 className="font-bold text-sm">Kịch bản Tự động hóa ({automations.length})</h2>
             <button
               onClick={() => onNavigateTab('automations')}
               className="text-xs text-cyan-400 hover:underline font-semibold"
@@ -293,7 +293,7 @@ export function OverviewTab({
 
         <div className={`p-5 rounded-2xl border ${cardBg}`}>
           <div className="flex items-center justify-between mb-3">
-            <h2 className="font-bold text-sm">🤖 Cảnh báo An ninh & AI ({aiAlerts.length})</h2>
+            <h2 className="font-bold text-sm">Cảnh báo An ninh & AI ({aiAlerts.length})</h2>
             <button
               onClick={() => onNavigateTab('ai')}
               className="text-xs text-cyan-400 hover:underline font-semibold"
@@ -325,7 +325,7 @@ export function OverviewTab({
       {/* Row 4: System Logs */}
       <div className={`p-5 rounded-2xl border ${cardBg}`}>
         <div className="flex items-center justify-between mb-3">
-          <h2 className="font-bold text-sm">📜 Nhật ký hoạt động hệ thống</h2>
+          <h2 className="font-bold text-sm">Nhật ký hoạt động hệ thống</h2>
           <button onClick={onClearLogs} className="text-xs text-slate-400 hover:text-slate-200">
             Xóa nhật ký
           </button>

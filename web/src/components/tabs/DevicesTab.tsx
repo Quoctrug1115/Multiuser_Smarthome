@@ -756,7 +756,7 @@ export function DevicesTab({
               onClick={handleDiscoverDevices}
               className="px-3.5 py-2 rounded-xl bg-amber-500/15 border border-amber-500/30 text-amber-400 hover:bg-amber-500/25 text-xs font-semibold transition disabled:opacity-50"
             >
-              {discoveringDevices ? '⏳ Đang quét...' : '📡 Quét thiết bị'}
+              {discoveringDevices ? 'Đang quét...' : 'Quét thiết bị'}
             </button>
             <input
               ref={fileInputRef}
@@ -770,14 +770,14 @@ export function DevicesTab({
               onClick={() => fileInputRef.current?.click()}
               className="px-3.5 py-2 rounded-xl bg-emerald-500/15 border border-emerald-500/30 text-emerald-400 hover:bg-emerald-500/25 text-xs font-semibold transition"
             >
-              📥 Nhập Excel
+              Nhập Excel
             </button>
             <button
               type="button"
               onClick={handleExportExcel}
               className="px-3.5 py-2 rounded-xl bg-cyan-500/15 border border-cyan-500/30 text-cyan-400 hover:bg-cyan-500/25 text-xs font-semibold transition"
             >
-              📤 Xuất Excel
+              Xuất Excel
             </button>
           </div>
         )}
@@ -861,12 +861,12 @@ export function DevicesTab({
                         <td className="p-2.5">
                           {item.kind === 'house' && (
                             <span className="px-2 py-0.5 rounded bg-cyan-500/15 text-cyan-400 font-semibold">
-                              🏠 Ngôi nhà
+                              Ngôi nhà
                             </span>
                           )}
                           {item.kind === 'room' && (
                             <span className="px-2 py-0.5 rounded bg-amber-500/15 text-amber-400 font-semibold">
-                              🚪 Phòng
+                              Phòng
                             </span>
                           )}
                           {item.kind === 'device' && (
@@ -1162,7 +1162,7 @@ export function DevicesTab({
                 }}
                 className="font-semibold"
               >
-                🏠 {h.name}
+                {h.name}
               </button>
               {isOwnerOrAdmin && (
                 <>
@@ -1171,7 +1171,6 @@ export function DevicesTab({
                     className="text-sky-400 hover:text-sky-300 text-[11px]"
                     title="Sửa nhà"
                   >
-                    ✎
                   </button>
                   <button
                     onClick={() => handleDeleteHouse(h)}
@@ -1211,7 +1210,7 @@ export function DevicesTab({
               }`}
             >
               <button onClick={() => setSelectedRoomId(r.id)} className="font-semibold">
-                🚪 {r.name} (T{r.floor})
+                {r.name} (T{r.floor})
               </button>
               {isOwnerOrAdmin && (
                 <>
@@ -1220,7 +1219,6 @@ export function DevicesTab({
                     className="text-sky-400 hover:text-sky-300 text-[11px]"
                     title="Sửa phòng"
                   >
-                    ✎
                   </button>
                   <button
                     onClick={() => handleDeleteRoom(r)}
@@ -1389,13 +1387,13 @@ export function DevicesTab({
                         {hasLiveSensor && sensorData ? (
                           <>
                             <span className="px-2 py-0.5 rounded bg-amber-500/15 text-amber-300">
-                              🌡️ {sensorData.temperature.toFixed(1)}°C
+                              {sensorData.temperature.toFixed(1)}°C
                             </span>
                             <span className="px-2 py-0.5 rounded bg-cyan-500/15 text-cyan-300">
-                              💧 {sensorData.humidity.toFixed(0)}%
+                              {sensorData.humidity.toFixed(0)}%
                             </span>
                             <span className="px-2 py-0.5 rounded bg-emerald-500/15 text-emerald-300">
-                              ☀️ {sensorData.lux} Lux
+                              {sensorData.lux} Lux
                             </span>
                             <span
                               className={`px-2 py-0.5 rounded ${
@@ -1404,12 +1402,12 @@ export function DevicesTab({
                                   : 'bg-slate-800 text-slate-400'
                               }`}
                             >
-                              {sensorData.motion ? '🏃 Có người' : '😴 Yên tĩnh'}
+                              {sensorData.motion ? 'Có người' : 'Yên tĩnh'}
                             </span>
                           </>
                         ) : (
                           <span className="px-2 py-0.5 rounded bg-slate-800 text-slate-400">
-                            ⏳ Đang chờ gói tin MQTT...
+                            Đang chờ gói tin MQTT...
                           </span>
                         )}
                       </div>

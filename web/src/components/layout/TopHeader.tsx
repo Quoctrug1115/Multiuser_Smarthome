@@ -46,7 +46,7 @@ export function TopHeader({
       </div>
 
       <div className="flex flex-wrap items-center gap-2 text-xs">
-        <span
+        {/* <span
           className={`px-3 py-1 rounded-full border font-medium ${
             wsConnected
               ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400'
@@ -58,7 +58,7 @@ export function TopHeader({
 
         <span className="px-3 py-1 rounded-full bg-sky-500/10 border border-sky-500/30 text-sky-400 font-medium">
           • MQTT Broker: Online
-        </span>
+        </span> */}
 
         <span className="px-3 py-1 rounded-full bg-amber-500/10 border border-amber-500/30 text-slate-300">
           Vai trò: <strong className="text-amber-400">{userRole}</strong>

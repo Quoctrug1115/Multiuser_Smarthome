@@ -282,7 +282,7 @@ export function AccountsTab({
     <div className="space-y-6">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
-          <h1 className="text-lg font-bold">👥 Quản lý Tài khoản Thành viên trong Gia đình</h1>
+          <h1 className="text-lg font-bold">Quản lý Tài khoản Thành viên trong Gia đình</h1>
           <p className="text-xs text-slate-400">
             Cấp tài khoản phụ (Admin / Member / Guest) • Hỗ trợ nhập/xuất hàng loạt qua Excel (cột:
             HoTen, Email, MatKhau, VaiTro)
@@ -302,14 +302,14 @@ export function AccountsTab({
             onClick={() => userExcelInputRef.current?.click()}
             className="px-3.5 py-2 rounded-xl bg-emerald-500/15 border border-emerald-500/30 text-emerald-400 hover:bg-emerald-500/25 text-xs font-semibold transition"
           >
-            📥 Nhập Excel
+            Nhập Excel
           </button>
           <button
             type="button"
             onClick={handleExportUsersExcel}
             className="px-3.5 py-2 rounded-xl bg-cyan-500/15 border border-cyan-500/30 text-cyan-400 hover:bg-cyan-500/25 text-xs font-semibold transition"
           >
-            📤 Xuất Excel
+            Xuất Excel
           </button>
         </div>
       </div>

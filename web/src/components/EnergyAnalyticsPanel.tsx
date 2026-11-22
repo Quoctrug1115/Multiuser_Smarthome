@@ -239,7 +239,7 @@ export const EnergyAnalyticsPanel: React.FC<EnergyAnalyticsPanelProps> = ({
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
         <div className={`p-5 rounded-2xl border ${cardBg}`}>
           <div className="flex items-center justify-between text-xs text-slate-400 mb-2">
-            <span>⚡ Tổng điện năng tiêu thụ</span>
+            <span>Tổng điện năng tiêu thụ</span>
             <span className="px-2 py-0.5 rounded bg-cyan-500/15 text-cyan-400 text-[10px] font-semibold">
               {periodBadge}
             </span>
@@ -257,7 +257,7 @@ export const EnergyAnalyticsPanel: React.FC<EnergyAnalyticsPanelProps> = ({
 
         <div className={`p-5 rounded-2xl border ${cardBg}`}>
           <div className="flex items-center justify-between text-xs text-slate-400 mb-2">
-            <span>💰 Chi phí ước tính</span>
+            <span>Chi phí ước tính</span>
             <span className="px-2 py-0.5 rounded bg-emerald-500/15 text-emerald-400 text-[10px] font-semibold">
               ~2.500đ/kWh
             </span>
@@ -273,7 +273,7 @@ export const EnergyAnalyticsPanel: React.FC<EnergyAnalyticsPanelProps> = ({
 
         <div className={`p-5 rounded-2xl border ${cardBg}`}>
           <div className="flex items-center justify-between text-xs text-slate-400 mb-2">
-            <span>📊 Trung bình mỗi {unitLabel}</span>
+            <span>Trung bình mỗi {unitLabel}</span>
             <span className="px-2 py-0.5 rounded bg-sky-500/15 text-sky-400 text-[10px] font-semibold">
               Định mức
             </span>
@@ -288,7 +288,7 @@ export const EnergyAnalyticsPanel: React.FC<EnergyAnalyticsPanelProps> = ({
 
         <div className={`p-5 rounded-2xl border ${cardBg}`}>
           <div className="flex items-center justify-between text-xs text-slate-400 mb-2">
-            <span>🔥 {period === 'day' ? 'Giờ' : 'Ngày'} tiêu thụ cao nhất</span>
+            <span>{period === 'day' ? 'Giờ' : 'Ngày'} tiêu thụ cao nhất</span>
             <span className="px-2 py-0.5 rounded bg-amber-500/15 text-amber-400 text-[10px] font-bold">
               PEAK
             </span>
@@ -314,7 +314,7 @@ export const EnergyAnalyticsPanel: React.FC<EnergyAnalyticsPanelProps> = ({
           <div className="flex flex-wrap items-start justify-between gap-3 mb-4">
             <div>
               <h2 className="font-bold text-sm">
-                📈 Biểu đồ tiêu thụ điện năng theo {unitLabel} (kWh)
+                Biểu đồ tiêu thụ điện năng theo {unitLabel} (kWh)
               </h2>
               <p className="text-xs text-slate-400 mt-0.5">
                 Rê chuột vào từng mốc để xem chi tiết sản lượng và chi phí tiền điện
@@ -538,7 +538,7 @@ export const EnergyAnalyticsPanel: React.FC<EnergyAnalyticsPanelProps> = ({
           className={`p-5 rounded-2xl border flex flex-col justify-between ${cardBg}`}
         >
           <div>
-            <h2 className="font-bold text-sm">🎯 Tỷ trọng Công suất Tức thời</h2>
+            <h2 className="font-bold text-sm">Tỷ trọng Công suất Tức thời</h2>
             <p className="text-xs text-slate-400 mt-0.5">
               Phân bố phụ tải theo nhóm thiết bị đang bật
             </p>
@@ -614,7 +614,7 @@ export const EnergyAnalyticsPanel: React.FC<EnergyAnalyticsPanelProps> = ({
       <div className={`p-5 rounded-2xl border ${cardBg}`}>
         <div className="flex items-center justify-between mb-4">
           <h2 className="font-bold text-sm">
-            🔌 Chi tiết công suất từng thiết bị IoT
+            Chi tiết công suất từng thiết bị IoT
           </h2>
           <span className="text-xs font-mono text-slate-400">
             Tổng: {deviceLoadBreakdown.items.length} thiết bị

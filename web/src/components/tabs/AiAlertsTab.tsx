@@ -32,7 +32,7 @@ export function AiAlertsTab({
     <div className="space-y-4">
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-lg font-bold">🤖 Trung tâm Giám sát An ninh & Bất thường AI</h1>
+          <h1 className="text-lg font-bold">Trung tâm Giám sát An ninh & Bất thường AI</h1>
           <p className="text-xs text-slate-400">
             Phân tích Z-Score cảm biến thời gian thực riêng cho ngôi nhà của bạn
           </p>
@@ -42,7 +42,7 @@ export function AiAlertsTab({
             onClick={handleSimulateAnomaly}
             className="px-4 py-2 rounded-xl bg-rose-500 hover:bg-rose-400 text-white font-bold text-xs"
           >
-            ⚡ Mô phỏng bất thường
+            Mô phỏng bất thường
           </button>
         )}
       </div>

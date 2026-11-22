@@ -51,29 +51,29 @@ export function Sidebar({
 
         <nav className="space-y-1 text-xs font-medium">
           <button onClick={() => onSelectTab('overview')} className={navBtnClass('overview')}>
-            <span>📊 Tổng quan</span>
+            <span>Tổng quan</span>
           </button>
 
           <button onClick={() => onSelectTab('devices')} className={navBtnClass('devices')}>
-            <span>📱 Phòng & Thiết bị</span>
+            <span>Phòng & Thiết bị</span>
             <span className="px-1.5 py-0.5 rounded bg-cyan-500/20 text-cyan-300 text-[10px] font-mono">
               {roomsCount}P • {devicesCount}
             </span>
           </button>
 
           <button onClick={() => onSelectTab('automations')} className={navBtnClass('automations')}>
-            <span>⚡ Tự động hóa (IF-THEN)</span>
+            <span>Tự động hóa (IF-THEN)</span>
             <span className="px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-300 text-[10px] font-mono">
               {automationsCount}
             </span>
           </button>
 
           <button onClick={() => onSelectTab('energy')} className={navBtnClass('energy')}>
-            <span>📈 Thống kê Năng lượng</span>
+            <span>Thống kê Năng lượng</span>
           </button>
 
           <button onClick={() => onSelectTab('ai')} className={navBtnClass('ai')}>
-            <span>🤖 Trí tuệ Nhân tạo (AI)</span>
+            <span>Trí tuệ Nhân tạo (AI)</span>
             <span className="px-1.5 py-0.5 rounded bg-rose-500/20 text-rose-300 text-[10px] font-mono">
               {aiAlertsCount}
             </span>
@@ -81,7 +81,7 @@ export function Sidebar({
 
           {isOwnerOrAdmin && (
             <button onClick={() => onSelectTab('accounts')} className={navBtnClass('accounts')}>
-              <span>👥 Quản lý Tài khoản</span>
+              <span>Quản lý Tài khoản</span>
               <span className="px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 text-[10px] font-mono">
                 {usersCount}
               </span>
