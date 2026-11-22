@@ -1,8 +1,6 @@
 import 'dart:async';
-import 'dart:convert';
 
 import 'package:flutter/material.dart';
-import 'package:http/http.dart' as http;
 import 'package:provider/provider.dart';
 
 import '../models/smarthome_models.dart';
@@ -27,12 +25,13 @@ class _EnergyScreenState extends State<EnergyScreen> {
   StreamSubscription<dynamic>? _sensorSub;
   Timer? _syncTimer;
 
-  String _selectedRange = '7D'; // 24H | 7D | 30D
+  String _selectedRange = '24H'; // 24H | 7D | 30D
   bool _isLoading = true;
+  String? _errorMessage;
 
   double _totalKwh = 0.0;
   double _estimatedCost = 0.0;
-  double _unitPriceVnd = 2500.0;
+  final double _unitPriceVnd = 2500.0;
   double? _telemetryLiveWatt;
 
   List _chartBars = [];
@@ -42,8 +41,9 @@ class _EnergyScreenState extends State<EnergyScreen> {
   void initState() {
     super.initState();
     _loadEnergyData();
-    _syncTimer = Timer.periodic(const Duration(seconds: 6), (_) {
-      _syncDevicesSilently();
+    // Tự động đồng bộ số liệu điện năng & trạng thái thiết bị mỗi 10 giây
+    _syncTimer = Timer.periodic(const Duration(seconds: 10), (_) {
+      _loadEnergyData(silent: true);
     });
   }
 
@@ -125,122 +125,114 @@ class _EnergyScreenState extends State<EnergyScreen> {
     });
   }
 
-  Future<void> _syncDevicesSilently() async {
-    try {
-      final list = await _api.getDevices();
-      if (!mounted) return;
-      setState(() {
-        _devices = list;
-      });
-    } catch (_) {}
+  double _toDouble(dynamic val, [double fallback = 0.0]) {
+    if (val == null) return fallback;
+    if (val is num) return val.toDouble();
+    return double.tryParse(val.toString()) ?? fallback;
   }
 
-  Future<void> _loadEnergyData() async {
-    setState(() => _isLoading = true);
-    try {
-      final devicesFuture = _api.getDevices().catchError((_) => <JsonMap>[]);
-      final energyFuture = _fetchEnergyFromBackend(_selectedRange);
+  Future<void> _loadEnergyData({bool silent = false}) async {
+    if (!silent && mounted) {
+      setState(() {
+        _isLoading = true;
+        _errorMessage = null;
+      });
+    }
 
-      final results = await Future.wait([devicesFuture, energyFuture]);
+    try {
+      final results = await Future.wait([
+        _api.getDevices().catchError((_) => <JsonMap>[]),
+        _api.getEnergyStats(_selectedRange),
+      ]);
+
       if (!mounted) return;
 
       final devicesList = results[0] as JsonList;
-      final energyMap = results[1] as Map<String, dynamic>;
+      final rawEnergy = results[1] as JsonMap;
+      final map = rawEnergy['data'] is Map
+          ? JsonMap.from(rawEnergy['data'] as Map)
+          : rawEnergy;
+
+      // Đọc chuỗi điểm biểu đồ từ Backend (/api/v1/energy/analytics)
+      final rawSeries = map['daily'] ?? map['chart_data'] ?? map['chart'];
+      final parsedBars = [];
+
+      if (rawSeries is List && rawSeries.isNotEmpty) {
+        for (final item in rawSeries) {
+          if (item is Map) {
+            parsedBars.add({
+              'label': (item['label'] ?? item['date'] ?? '').toString(),
+              'kwh': _toDouble(item['kwh'] ?? item['value']),
+              'power_watt': _toDouble(item['power_watt']),
+            });
+          }
+        }
+      } else if (map['labels'] is List && map['kwh_data'] is List) {
+        final labels = map['labels'] as List;
+        final values = map['kwh_data'] as List;
+        final len = labels.length < values.length
+            ? labels.length
+            : values.length;
+        for (int i = 0; i < len; i++) {
+          parsedBars.add({
+            'label': labels[i].toString(),
+            'kwh': _toDouble(values[i]),
+          });
+        }
+      }
+
+      final bars = parsedBars.isNotEmpty
+          ? parsedBars
+          : _buildDefaultBars(_selectedRange);
+
+      double totalKwh = _toDouble(
+        map['total_kwh'] ?? map['total_consumption'] ?? map['kwh'],
+      );
+      if (totalKwh <= 0 && bars.isNotEmpty) {
+        totalKwh = bars.fold<double>(
+          0.0,
+          (sum, b) => sum + _toDouble(b['kwh']),
+        );
+      }
+
+      double cost = _toDouble(
+        map['estimated_cost'] ?? map['total_vnd'] ?? map['total_cost'],
+      );
+      if (cost <= 0 && totalKwh > 0) {
+        cost = (totalKwh * _unitPriceVnd).roundToDouble();
+      }
 
       setState(() {
         _devices = devicesList;
-        _totalKwh = (energyMap['total_kwh'] as num?)?.toDouble() ?? 0.0;
-        _unitPriceVnd = (energyMap['unit_price'] as num?)?.toDouble() ?? 2500.0;
-        _estimatedCost =
-            (energyMap['estimated_cost'] as num?)?.toDouble() ??
-            (_totalKwh * _unitPriceVnd);
-        _chartBars = List.from(
-          energyMap['bars'] as List? ?? _buildDefaultBars(),
-        );
+        _totalKwh = totalKwh;
+        _estimatedCost = cost;
+        _chartBars = bars;
         _isLoading = false;
+        _errorMessage = null;
       });
-    } catch (_) {
+    } catch (e) {
       if (!mounted) return;
       setState(() {
-        _chartBars = _buildDefaultBars();
+        if (_chartBars.isEmpty) {
+          _chartBars = _buildDefaultBars(_selectedRange);
+        }
         _isLoading = false;
+        _errorMessage = e.toString().replaceFirst('Exception: ', '');
       });
     }
   }
 
-  Future _fetchEnergyFromBackend(String range) async {
-    final headers = <String, String>{
-      'Content-Type': 'application/json',
-      if (_api.token != null && _api.token!.isNotEmpty)
-        'Authorization': 'Bearer ${_api.token}',
-    };
-
-    const paths = ['/energy', '/energy/stats', '/energy/summary'];
-    for (final path in paths) {
-      try {
-        final uri = Uri.parse('${_api.baseUrl}$path?period=$range');
-        final res = await http.get(uri, headers: headers);
-        if (res.statusCode >= 200 && res.statusCode < 300) {
-          final decoded = jsonDecode(res.body);
-          final map = decoded is Map<String, dynamic>
-              ? (decoded['data'] is Map
-                    ? Map<String, dynamic>.from(decoded['data'] as Map)
-                    : decoded)
-              : <String, dynamic>{};
-
-          final totalKwh =
-              ((map['total_kwh'] ??
-                          map['total_consumption'] ??
-                          map['kwh'] ??
-                          0.0)
-                      as num)
-                  .toDouble();
-          final unitPrice =
-              ((map['unit_price'] ?? map['tariff'] ?? 2500.0) as num)
-                  .toDouble();
-          final cost =
-              ((map['estimated_cost'] ??
-                          map['total_cost'] ??
-                          (totalKwh * unitPrice))
-                      as num)
-                  .toDouble();
-
-          final rawSeries = map['daily'] ?? map['chart'] ?? map['series'];
-          final bars = [];
-          if (rawSeries is List && rawSeries.isNotEmpty) {
-            for (final item in rawSeries) {
-              if (item is Map) {
-                bars.add({
-                  'label': (item['label'] ?? item['date'] ?? '').toString(),
-                  'kwh': ((item['kwh'] ?? item['value'] ?? 0.0) as num)
-                      .toDouble(),
-                });
-              }
-            }
-          }
-
-          return {
-            'total_kwh': totalKwh,
-            'unit_price': unitPrice,
-            'estimated_cost': cost,
-            'bars': bars.isNotEmpty ? bars : _buildDefaultBars(),
-          };
-        }
-      } catch (_) {}
-    }
-
-    return {
-      'total_kwh': 0.0,
-      'unit_price': 2500.0,
-      'estimated_cost': 0.0,
-      'bars': _buildDefaultBars(),
-    };
-  }
-
-  List _buildDefaultBars() {
+  List _buildDefaultBars(String range) {
     final now = DateTime.now();
-    return List.generate(7, (idx) {
-      final d = now.subtract(Duration(days: 6 - idx));
+    if (range == '24H') {
+      return List.generate(24, (h) {
+        final label = '${h.toString().padLeft(2, '0')}:00';
+        return {'label': label, 'kwh': 0.0};
+      });
+    }
+    final days = range == '30D' ? 30 : 7;
+    return List.generate(days, (idx) {
+      final d = now.subtract(Duration(days: (days - 1) - idx));
       final label =
           '${d.day.toString().padLeft(2, '0')}/${d.month.toString().padLeft(2, '0')}';
       return {'label': label, 'kwh': 0.0};
@@ -263,6 +255,19 @@ class _EnergyScreenState extends State<EnergyScreen> {
     }
     if (sum > 0) return sum;
     return _telemetryLiveWatt ?? 0.0;
+  }
+
+  String _formatKwh(double val) {
+    if (val > 0 && val < 0.01) return val.toStringAsFixed(4);
+    if (val > 0 && val < 1.0) return val.toStringAsFixed(3);
+    return val.toStringAsFixed(2);
+  }
+
+  String _formatBarKwh(double val) {
+    if (val <= 0) return '0.0';
+    if (val < 0.1) return val.toStringAsFixed(3);
+    if (val < 1.0) return val.toStringAsFixed(2);
+    return val.toStringAsFixed(1);
   }
 
   String _formatVnd(double amount) {
@@ -293,17 +298,18 @@ class _EnergyScreenState extends State<EnergyScreen> {
       (prev, d) => prev + d.ratedPowerWatt,
     );
 
-    double maxBarKwh = 0.2;
+    double peakKwh = 0.0;
     for (final b in _chartBars) {
-      final v = (b['kwh'] as num?)?.toDouble() ?? 0.0;
-      if (v > maxBarKwh) maxBarKwh = v;
+      final v = _toDouble(b['kwh']);
+      if (v > peakKwh) peakKwh = v;
     }
+    final double maxBarScale = peakKwh > 0 ? peakKwh * 1.15 : 0.1;
 
     return Scaffold(
       backgroundColor: AppColors.getBackground(isDark),
       body: RefreshIndicator(
         color: cyan,
-        onRefresh: _loadEnergyData,
+        onRefresh: () => _loadEnergyData(),
         child: ListView(
           padding: const EdgeInsets.fromLTRB(16, 14, 16, 90),
           children: [
@@ -333,6 +339,51 @@ class _EnergyScreenState extends State<EnergyScreen> {
             ),
             const SizedBox(height: 14),
 
+            if (_errorMessage != null) ...[
+              Container(
+                margin: const EdgeInsets.only(bottom: 12),
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 12,
+                  vertical: 10,
+                ),
+                decoration: BoxDecoration(
+                  color: AppColors.accent.withOpacity(0.14),
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(color: AppColors.accent.withOpacity(0.45)),
+                ),
+                child: Row(
+                  children: [
+                    const Icon(
+                      Icons.error_outline,
+                      color: AppColors.accent,
+                      size: 18,
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        _errorMessage!,
+                        style: const TextStyle(
+                          color: AppColors.accent,
+                          fontSize: 11.5,
+                        ),
+                      ),
+                    ),
+                    InkWell(
+                      onTap: () => _loadEnergyData(),
+                      child: Text(
+                        'THỬ LẠI',
+                        style: TextStyle(
+                          color: cyan,
+                          fontSize: 11,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+
             // 3 THẺ TỔNG QUAN ĐIỆN NĂNG & TẢI TỨC THỜI
             Row(
               children: [
@@ -341,7 +392,7 @@ class _EnergyScreenState extends State<EnergyScreen> {
                     isDark: isDark,
                     icon: Icons.bolt,
                     color: cyan,
-                    value: '${_totalKwh.toStringAsFixed(2)} kWh',
+                    value: '${_formatKwh(_totalKwh)} kWh',
                     label: 'TỔNG TIÊU THỤ',
                   ),
                 ),
@@ -384,7 +435,9 @@ class _EnergyScreenState extends State<EnergyScreen> {
                     mainAxisAlignment: MainAxisAlignment.spaceBetween,
                     children: [
                       Text(
-                        'BIỂU ĐỒ TIÊU THỤ (kWh)',
+                        _selectedRange == '24H'
+                            ? 'BIỂU ĐỒ THEO GIỜ (kWh)'
+                            : 'BIỂU ĐỒ TIÊU THỤ (kWh)',
                         style: TextStyle(
                           color: AppColors.getTextPrimary(isDark),
                           fontSize: 12,
@@ -401,59 +454,54 @@ class _EnergyScreenState extends State<EnergyScreen> {
                       ),
                     ],
                   ),
-                  const SizedBox(height: 16),
+                  if (_chartBars.length > 7) ...[
+                    const SizedBox(height: 4),
+                    const Text(
+                      'Vuốt ngang biểu đồ để xem đầy đủ các mốc thời gian',
+                      style: TextStyle(
+                        color: AppColors.textMuted,
+                        fontSize: 10,
+                      ),
+                    ),
+                  ],
+                  const SizedBox(height: 14),
                   SizedBox(
-                    height: 130,
-                    child: Row(
-                      crossAxisAlignment: CrossAxisAlignment.end,
-                      children: _chartBars.map((bar) {
-                        final kwh = (bar['kwh'] as num?)?.toDouble() ?? 0.0;
-                        final label = (bar['label'] ?? '').toString();
-                        final ratio = maxBarKwh > 0
-                            ? (kwh / maxBarKwh).clamp(0.0, 1.0)
-                            : 0.0;
-                        final barHeight = kwh > 0 ? (14 + ratio * 76) : 6.0;
-
-                        return Expanded(
-                          child: Padding(
-                            padding: const EdgeInsets.symmetric(horizontal: 4),
-                            child: Column(
-                              mainAxisAlignment: MainAxisAlignment.end,
-                              children: [
-                                Text(
-                                  kwh.toStringAsFixed(1),
-                                  style: const TextStyle(
-                                    color: AppColors.textMuted,
-                                    fontSize: 9.5,
-                                  ),
+                    height: 140,
+                    child: _chartBars.length <= 7
+                        ? Row(
+                            crossAxisAlignment: CrossAxisAlignment.end,
+                            children: _chartBars.map((bar) {
+                              return Expanded(
+                                child: _buildBarColumn(
+                                  bar: bar,
+                                  peakKwh: peakKwh,
+                                  maxBarScale: maxBarScale,
+                                  cyan: cyan,
+                                  amber: amber,
+                                  isDark: isDark,
                                 ),
-                                const SizedBox(height: 4),
-                                Container(
-                                  height: barHeight,
-                                  decoration: BoxDecoration(
-                                    gradient: LinearGradient(
-                                      begin: Alignment.topCenter,
-                                      end: Alignment.bottomCenter,
-                                      colors: [cyan, cyan.withOpacity(0.35)],
-                                    ),
-                                    borderRadius: BorderRadius.circular(6),
+                              );
+                            }).toList(),
+                          )
+                        : SingleChildScrollView(
+                            scrollDirection: Axis.horizontal,
+                            child: Row(
+                              crossAxisAlignment: CrossAxisAlignment.end,
+                              children: _chartBars.map((bar) {
+                                return SizedBox(
+                                  width: 42,
+                                  child: _buildBarColumn(
+                                    bar: bar,
+                                    peakKwh: peakKwh,
+                                    maxBarScale: maxBarScale,
+                                    cyan: cyan,
+                                    amber: amber,
+                                    isDark: isDark,
                                   ),
-                                ),
-                                const SizedBox(height: 6),
-                                Text(
-                                  label,
-                                  style: TextStyle(
-                                    color: AppColors.getTextSecondary(isDark),
-                                    fontSize: 9.5,
-                                    fontWeight: FontWeight.w600,
-                                  ),
-                                ),
-                              ],
+                                );
+                              }).toList(),
                             ),
                           ),
-                        );
-                      }).toList(),
-                    ),
                   ),
                 ],
               ),
@@ -506,7 +554,6 @@ class _EnergyScreenState extends State<EnergyScreen> {
             else
               ...loadDevices.map((dev) {
                 final activeW = dev.isOn ? dev.ratedPowerWatt : 0.0;
-                // Tính % trên tổng tải tức thời đang bật (nếu đang bật)
                 final pct = (dev.isOn && instantWatt > 0)
                     ? ((activeW / instantWatt) * 100).round()
                     : 0;
@@ -594,6 +641,64 @@ class _EnergyScreenState extends State<EnergyScreen> {
     );
   }
 
+  Widget _buildBarColumn({
+    required Map<String, dynamic> bar,
+    required double peakKwh,
+    required double maxBarScale,
+    required Color cyan,
+    required Color amber,
+    required bool isDark,
+  }) {
+    final kwh = _toDouble(bar['kwh']);
+    final label = (bar['label'] ?? '').toString();
+    final isPeak = peakKwh > 0 && kwh >= peakKwh;
+    final barColor = isPeak ? amber : cyan;
+    final ratio = maxBarScale > 0 ? (kwh / maxBarScale).clamp(0.0, 1.0) : 0.0;
+    final barHeight = kwh > 0 ? (14.0 + ratio * 82.0) : 6.0;
+
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 3),
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.end,
+        children: [
+          Text(
+            _formatBarKwh(kwh),
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(
+              color: kwh > 0 ? barColor : AppColors.textMuted,
+              fontSize: 9,
+              fontWeight: kwh > 0 ? FontWeight.bold : FontWeight.normal,
+            ),
+          ),
+          const SizedBox(height: 4),
+          Container(
+            height: barHeight,
+            decoration: BoxDecoration(
+              gradient: LinearGradient(
+                begin: Alignment.topCenter,
+                end: Alignment.bottomCenter,
+                colors: [barColor, barColor.withOpacity(0.35)],
+              ),
+              borderRadius: BorderRadius.circular(6),
+            ),
+          ),
+          const SizedBox(height: 6),
+          Text(
+            label,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(
+              color: AppColors.getTextSecondary(isDark),
+              fontSize: 9,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
   Widget _buildRangeBtn(String label, String value, Color cyan, bool isDark) {
     final active = _selectedRange == value;
     return InkWell(
@@ -651,7 +756,7 @@ class _EnergyScreenState extends State<EnergyScreen> {
             overflow: TextOverflow.ellipsis,
             style: TextStyle(
               color: AppColors.getTextPrimary(isDark),
-              fontSize: 14,
+              fontSize: 13.5,
               fontWeight: FontWeight.bold,
             ),
           ),
