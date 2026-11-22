@@ -742,10 +742,6 @@ export function DevicesTab({
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
           <h1 className="text-lg font-bold">Quản lý Không gian Nhà, Phòng & Thiết bị IoT</h1>
-          <p className="text-xs text-slate-400">
-            Hỗ trợ nhập/xuất hàng loạt qua Excel (Sheet 1: TenNha, DiaChi, TenPhong, Tang • Sheet 2:
-            TenThietBi, LoaiThietBi, MqttTopic, Phong)
-          </p>
         </div>
 
         {isOwnerOrAdmin && (
@@ -794,7 +790,7 @@ export function DevicesTab({
               <div className="flex flex-wrap items-center justify-between gap-3">
                 <div>
                   <h2 className="text-sm font-bold text-cyan-400">
-                    📋 Danh sách kiểm tra dữ liệu từ: {spaceExcelFileName}
+                    Danh sách kiểm tra dữ liệu từ: {spaceExcelFileName}
                   </h2>
                   <div className="flex flex-wrap items-center gap-3 mt-1 text-xs">
                     <span className="text-slate-400">
@@ -871,7 +867,7 @@ export function DevicesTab({
                           )}
                           {item.kind === 'device' && (
                             <span className="px-2 py-0.5 rounded bg-emerald-500/15 text-emerald-400 font-semibold">
-                              🔌 Thiết bị
+                              Thiết bị
                             </span>
                           )}
                         </td>
@@ -1254,7 +1250,7 @@ export function DevicesTab({
                   className={`p-4 rounded-2xl border border-cyan-500/50 flex flex-col justify-between gap-3 shadow-lg ${cardBg}`}
                 >
                   <div className="flex items-center justify-between">
-                    <span className="text-xs font-bold text-cyan-400">✏️ Chỉnh sửa thiết bị</span>
+                    <span className="text-xs font-bold text-cyan-400">Chỉnh sửa thiết bị</span>
                     <button
                       type="button"
                       onClick={() => setEditingDevice(null)}
@@ -1375,7 +1371,7 @@ export function DevicesTab({
                             : 'bg-emerald-500/15 text-emerald-300'
                         }`}
                       >
-                        {dev.is_online === false ? '● OFFLINE' : '● ONLINE'}
+                        {dev.is_online === false ? 'OFFLINE' : 'ONLINE'}
                       </span>
                     </div>
                     <div className="text-[11px] font-mono text-slate-500 mt-1 truncate">
@@ -1444,10 +1440,10 @@ export function DevicesTab({
                   }`}
                 >
                   {dev.is_online === false
-                    ? '⚠ THIẾT BỊ MẤT KẾT NỐI'
+                    ? 'THIẾT BỊ MẤT KẾT NỐI'
                     : dev.is_on
-                    ? '● ĐANG BẬT (Nhấn để TẮT)'
-                    : '○ ĐANG TẮT (Nhấn để BẬT)'}
+                    ? 'ĐANG BẬT (Nhấn để TẮT)'
+                    : 'ĐANG TẮT (Nhấn để BẬT)'}
                 </button>
               </div>
             );

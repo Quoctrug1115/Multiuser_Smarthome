@@ -220,11 +220,8 @@ export function AutomationsTab({
       >
         <div>
           <h2 className="font-bold text-sm tracking-wide">
-            KỊCH BẢN TỰ ĐỘNG HÓA (IF - THEN)
+            KỊCH BẢN TỰ ĐỘNG HÓA
           </h2>
-          <p className="text-xs text-slate-400 mt-1">
-            Tự động điều khiển thiết bị theo ngưỡng cảm biến nhiệt độ, độ ẩm, ánh sáng và chuyển động.
-          </p>
         </div>
         {isOwnerOrAdmin && (
           <button

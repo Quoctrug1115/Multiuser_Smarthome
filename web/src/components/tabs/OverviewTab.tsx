@@ -145,9 +145,6 @@ export function OverviewTab({
           <div className="flex items-center justify-between mb-4">
             <div>
               <h2 className="font-bold text-sm">Điều khiển nhanh Thiết bị IoT</h2>
-              <p className="text-xs text-slate-400">
-                Bật/tắt trực tiếp thiết bị và theo dõi chỉ số cảm biến thời gian thực qua MQTT
-              </p>
             </div>
             <button
               onClick={() => onNavigateTab('devices')}
