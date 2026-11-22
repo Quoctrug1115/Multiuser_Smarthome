@@ -632,7 +632,6 @@ pub async fn delete_device(
             .into_response(),
     }
 }
-
 // GET /api/v1/devices/discover
 pub async fn discover_devices(
     _claims: Claims,

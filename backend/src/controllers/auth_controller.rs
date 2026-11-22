@@ -28,6 +28,18 @@ pub struct LoginPayload {
     pub password: String,
 }
 
+#[derive(Deserialize)]
+pub struct ForgotPasswordPayload {
+    pub email: String,
+}
+
+#[derive(Deserialize)]
+pub struct ResetPasswordPayload {
+    pub email: String,
+    pub otp: String,
+    pub new_password: String,
+}
+
 async fn ensure_auth_schema(pool: &SqlPool) {
     let Ok(mut conn) = pool.get().await else {
         return;
@@ -43,6 +55,20 @@ async fn ensure_auth_schema(pool: &SqlPool) {
         "INSERT INTO dbo.roles (id, name) SELECT NEWID(), N'Admin' WHERE NOT EXISTS (SELECT 1 FROM dbo.roles WHERE LOWER(name) = N'admin')",
         "INSERT INTO dbo.roles (id, name) SELECT NEWID(), N'Member' WHERE NOT EXISTS (SELECT 1 FROM dbo.roles WHERE LOWER(name) = N'member')",
         "INSERT INTO dbo.roles (id, name) SELECT NEWID(), N'Guest' WHERE NOT EXISTS (SELECT 1 FROM dbo.roles WHERE LOWER(name) = N'guest')",
+        r#"
+        IF OBJECT_ID(N'dbo.password_resets', N'U') IS NULL
+        CREATE TABLE dbo.password_resets (
+            id UNIQUEIDENTIFIER PRIMARY KEY DEFAULT NEWID(),
+            user_id UNIQUEIDENTIFIER NOT NULL,
+            email NVARCHAR(255) NOT NULL,
+            otp_hash NVARCHAR(255) NOT NULL,
+            attempts INT NOT NULL DEFAULT 0,
+            expires_at DATETIMEOFFSET NOT NULL,
+            used_at DATETIMEOFFSET NULL,
+            created_at DATETIMEOFFSET NOT NULL DEFAULT SYSDATETIMEOFFSET(),
+            CONSTRAINT FK_password_resets_users FOREIGN KEY (user_id) REFERENCES dbo.users(id) ON DELETE CASCADE
+        )
+        "#,
     ];
 
     for sql in migrations {
@@ -77,7 +103,6 @@ pub async fn register(
         }
     };
 
-    // 1. Kiểm tra email đã tồn tại chưa (giải phóng QueryStream ngay trong block)
     let email_exists = {
         let mut check_q =
             Query::new("SELECT TOP 1 id FROM dbo.users WHERE LOWER(email) = LOWER(@P1)");
@@ -97,7 +122,6 @@ pub async fn register(
             .into_response();
     }
 
-    // 2. Lấy vai trò "Owner" (tiêu thụ QueryStream ngay thành Row để trả lại &mut conn)
     let role_row = match conn
         .query(
             "SELECT TOP 1 id, name FROM dbo.roles WHERE LOWER(name) = N'owner'",
@@ -144,7 +168,6 @@ pub async fn register(
 
     let user_id = Uuid::new_v4();
 
-    // 3. Tạo tài khoản Owner mới với owner_id = NULL (Chủ nhà gốc)
     let insert_user_res = {
         let mut insert_user_q = Query::new(
             r#"
@@ -171,7 +194,6 @@ pub async fn register(
             .into_response();
     }
 
-    // 4. Tạo session_id và JWT khớp với auth_service::create_jwt
     let session_id = Uuid::new_v4();
     let session_id_str = session_id.to_string();
 
@@ -437,4 +459,311 @@ pub async fn me(
         )
             .into_response(),
     }
+}
+
+// POST /api/v1/auth/forgot-password
+pub async fn forgot_password(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<ForgotPasswordPayload>,
+) -> impl IntoResponse {
+    ensure_auth_schema(&state.db_pool).await;
+
+    let email = payload.email.trim().to_lowercase();
+    if email.is_empty() || !email.contains('@') {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "Vui lòng nhập địa chỉ email hợp lệ" })),
+        )
+            .into_response();
+    }
+
+    let mut conn = match state.db_pool.get().await {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("Lỗi kết nối SQL Server: {}", e) })),
+            )
+                .into_response();
+        }
+    };
+
+    let user_row = {
+        let mut q = Query::new(
+            "SELECT TOP 1 id, COALESCE(is_active, CAST(1 AS BIT)) AS is_active FROM dbo.users WHERE LOWER(email) = LOWER(@P1)",
+        );
+        q.bind(&email);
+        match q.query(&mut conn).await {
+            Ok(stream) => stream.into_row().await,
+            Err(e) => Err(e),
+        }
+    };
+
+    let (user_id, is_active) = match user_row {
+        Ok(Some(row)) => (
+            row.get::<Uuid, _>("id"),
+            row.get::<bool, _>("is_active").unwrap_or(true),
+        ),
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "Không tìm thấy tài khoản nào gắn với email này" })),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("Lỗi truy vấn người dùng: {}", e) })),
+            )
+                .into_response();
+        }
+    };
+
+    let Some(user_id) = user_id else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "ID người dùng không hợp lệ" })),
+        )
+            .into_response();
+    };
+
+    if !is_active {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "Tài khoản này đang bị vô hiệu hóa, không thể đặt lại mật khẩu" })),
+        )
+            .into_response();
+    }
+
+    let otp_num = (Uuid::new_v4().as_u128() % 900_000 + 100_000) as u32;
+    let otp_code = format!("{:06}", otp_num);
+
+    let otp_hash = match hash_password(&otp_code) {
+        Ok(h) => h,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("Lỗi tạo mã xác thực: {}", e) })),
+            )
+                .into_response();
+        }
+    };
+
+    {
+        let mut invalidate_q = Query::new(
+            "UPDATE dbo.password_resets SET used_at = SYSDATETIMEOFFSET() WHERE user_id = @P1 AND used_at IS NULL",
+        );
+        invalidate_q.bind(user_id);
+        let _ = invalidate_q.execute(&mut conn).await;
+    }
+
+    let reset_id = Uuid::new_v4();
+    let insert_res = {
+        let mut insert_q = Query::new(
+            r#"
+            INSERT INTO dbo.password_resets (id, user_id, email, otp_hash, attempts, expires_at, created_at)
+            VALUES (@P1, @P2, @P3, @P4, 0, DATEADD(MINUTE, 15, SYSDATETIMEOFFSET()), SYSDATETIMEOFFSET())
+            "#,
+        );
+        insert_q.bind(reset_id);
+        insert_q.bind(user_id);
+        insert_q.bind(&email);
+        insert_q.bind(&otp_hash);
+        insert_q.execute(&mut conn).await
+    };
+
+    if let Err(e) = insert_res {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("Không thể tạo yêu cầu đặt lại mật khẩu: {}", e) })),
+        )
+            .into_response();
+    }
+
+    println!(
+        "🔑 [FORGOT PASSWORD] Mã OTP khôi phục cho {} là: {} (hết hạn sau 15 phút)",
+        email, otp_code
+    );
+
+    let is_prod = std::env::var("APP_ENV")
+        .unwrap_or_default()
+        .eq_ignore_ascii_case("production");
+
+    let mut body = json!({
+        "message": "Mã OTP xác nhận gồm 6 chữ số đã được tạo (hiệu lực 15 phút).",
+        "expires_in_minutes": 15
+    });
+
+    if !is_prod {
+        body["dev_otp"] = json!(otp_code);
+    }
+
+    (StatusCode::OK, Json(body)).into_response()
+}
+
+// POST /api/v1/auth/reset-password
+pub async fn reset_password(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<ResetPasswordPayload>,
+) -> impl IntoResponse {
+    ensure_auth_schema(&state.db_pool).await;
+
+    let email = payload.email.trim().to_lowercase();
+    let otp = payload.otp.trim();
+    let new_password = payload.new_password.trim();
+
+    if email.is_empty() || otp.is_empty() || new_password.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "Vui lòng nhập đầy đủ Email, mã OTP và mật khẩu mới" })),
+        )
+            .into_response();
+    }
+
+    if new_password.len() < 6 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "Mật khẩu mới phải có ít nhất 6 ký tự" })),
+        )
+            .into_response();
+    }
+
+    let mut conn = match state.db_pool.get().await {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("Lỗi kết nối SQL Server: {}", e) })),
+            )
+                .into_response();
+        }
+    };
+
+    let reset_row = {
+        let mut q = Query::new(
+            r#"
+            SELECT TOP 1 id, user_id, otp_hash, attempts
+            FROM dbo.password_resets
+            WHERE LOWER(email) = LOWER(@P1)
+              AND used_at IS NULL
+              AND expires_at > SYSDATETIMEOFFSET()
+            ORDER BY created_at DESC
+            "#,
+        );
+        q.bind(&email);
+        match q.query(&mut conn).await {
+            Ok(stream) => stream.into_row().await,
+            Err(e) => Err(e),
+        }
+    };
+
+    let row = match reset_row {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "Mã OTP không tồn tại hoặc đã hết hạn. Vui lòng yêu cầu mã mới." })),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("Lỗi kiểm tra mã OTP: {}", e) })),
+            )
+                .into_response();
+        }
+    };
+
+    let Some(reset_id) = row.get::<Uuid, _>("id") else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "Dữ liệu phiên khôi phục không hợp lệ" })),
+        )
+            .into_response();
+    };
+    let Some(user_id) = row.get::<Uuid, _>("user_id") else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "Dữ liệu người dùng không hợp lệ" })),
+        )
+            .into_response();
+    };
+    let otp_hash = row.get::<&str, _>("otp_hash").unwrap_or("");
+    let attempts = row.get::<i32, _>("attempts").unwrap_or(0);
+
+    if attempts >= 5 {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({ "error": "Bạn đã nhập sai OTP quá 5 lần. Vui lòng yêu cầu mã OTP mới." })),
+        )
+            .into_response();
+    }
+
+    if !verify_password(otp, otp_hash) {
+        let mut inc_q = Query::new(
+            "UPDATE dbo.password_resets SET attempts = attempts + 1 WHERE id = @P1",
+        );
+        inc_q.bind(reset_id);
+        let _ = inc_q.execute(&mut conn).await;
+
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "Mã OTP không chính xác" })),
+        )
+            .into_response();
+    }
+
+    let hashed_new_password = match hash_password(new_password) {
+        Ok(h) => h,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("Lỗi mã hóa mật khẩu mới: {}", e) })),
+            )
+                .into_response();
+        }
+    };
+
+    let update_user_res = {
+        let mut update_q = Query::new(
+            "UPDATE dbo.users SET password_hash = @P1 WHERE id = @P2",
+        );
+        update_q.bind(&hashed_new_password);
+        update_q.bind(user_id);
+        update_q.execute(&mut conn).await
+    };
+
+    if let Err(e) = update_user_res {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("Không thể cập nhật mật khẩu: {}", e) })),
+        )
+            .into_response();
+    }
+
+    {
+        let mut used_q = Query::new(
+            "UPDATE dbo.password_resets SET used_at = SYSDATETIMEOFFSET() WHERE id = @P1",
+        );
+        used_q.bind(reset_id);
+        let _ = used_q.execute(&mut conn).await;
+    }
+
+    {
+        let mut revoke_sess_q = Query::new(
+            "DELETE FROM dbo.user_sessions WHERE user_id = @P1",
+        );
+        revoke_sess_q.bind(user_id);
+        let _ = revoke_sess_q.execute(&mut conn).await;
+    }
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "message": "Đặt lại mật khẩu thành công! Bạn có thể đăng nhập bằng mật khẩu mới."
+        })),
+    )
+        .into_response()
 }

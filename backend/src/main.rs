@@ -23,7 +23,7 @@ pub mod controllers;
 pub mod models;
 pub mod services;
 pub mod ws;
-
+pub mod ai;
 pub type SqlPool = Pool<ConnectionManager>;
 
 pub struct AppState {
@@ -505,20 +505,67 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                             let _ = state_mqtt.tx.send(ws_msg.to_string());
 
-                            let pool_clone = state_mqtt.db_pool.clone();
-                            let mqtt_clone = state_mqtt.mqtt_client.clone();
-                            let owners_clone = sensor_owner_uuids.clone();
+// Lưu mẫu dữ liệu cảm biến thật vào dbo.sensor_data (tối đa 1 mẫu / 30s / thiết bị)
+                            let pool_sensor = state_mqtt.db_pool.clone();
+                            let topic_clone = publish.topic.clone();
+                            let owners_sensor = sensor_owner_uuids.clone();
                             tokio::spawn(async move {
-                                evaluate_automations(
-                                    &pool_clone,
-                                    &mqtt_clone,
-                                    &owners_clone,
-                                    temperature,
-                                    humidity,
-                                    lux as f64,
-                                    if motion { 1.0 } else { 0.0 },
-                                )
-                                .await;
+                                let Ok(mut conn) = pool_sensor.get().await else {
+                                    return;
+                                };
+
+                                let chip_prefix = extract_chip_id(&topic_clone)
+                                    .map(|c| format!("smarthome/{}/%", c))
+                                    .unwrap_or_else(|| topic_clone.clone());
+
+                                let mut dev_q = tiberius::Query::new(
+                                    r#"
+                                    SELECT d.id, COALESCE(d.owner_id, h.owner_id) AS tenant_id
+                                    FROM dbo.devices d
+                                    LEFT JOIN dbo.rooms r ON d.room_id = r.id
+                                    LEFT JOIN dbo.houses h ON r.house_id = h.id
+                                    WHERE (
+                                        LOWER(LTRIM(d.mqtt_topic)) = LOWER(LTRIM(@P1))
+                                        OR LOWER(LTRIM(d.mqtt_topic)) LIKE LOWER(@P2)
+                                    )
+                                    AND LOWER(COALESCE(d.device_type, N'')) IN (N'sensor', N'dht22')
+                                    "#,
+                                );
+                                dev_q.bind(&topic_clone);
+                                dev_q.bind(&chip_prefix);
+
+                                let rows = match dev_q.query(&mut conn).await {
+                                    Ok(s) => s.into_first_result().await.unwrap_or_default(),
+                                    Err(_) => return,
+                                };
+
+                                for r in rows {
+                                    let Some(dev_id) = r.get::<Uuid, _>("id") else {
+                                        continue;
+                                    };
+                                    if !owners_sensor.is_empty() {
+                                        if let Some(tid) = r.get::<Uuid, _>("tenant_id") {
+                                            if !owners_sensor.contains(&tid) {
+                                                continue;
+                                            }
+                                        }
+                                    }
+
+                                    let mut ins = tiberius::Query::new(
+                                        r#"
+                                        IF NOT EXISTS (
+                                            SELECT 1 FROM dbo.sensor_data
+                                            WHERE device_id = @P1
+                                              AND [time] > DATEADD(SECOND, -30, SYSDATETIMEOFFSET())
+                                        )
+                                        INSERT INTO dbo.sensor_data ([time], device_id, sensor_type, [value])
+                                        VALUES (SYSDATETIMEOFFSET(), @P1, N'temperature', @P2)
+                                        "#,
+                                    );
+                                    ins.bind(dev_id);
+                                    ins.bind(temperature);
+                                    let _ = ins.execute(&mut conn).await;
+                                }
                             });
                         }
                     }
@@ -605,7 +652,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     });
-
+    // 4C. Khởi chạy AI Background Worker (Phát hiện bất thường & Gợi ý thói quen)
+    ai::service::start_ai_worker(state.clone()).await;
     // 5. Cấu hình Router và API Endpoints (Axum 0.8)
     let cors = CorsLayer::new()
         .allow_origin(Any)
@@ -617,6 +665,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/v1/auth/login", post(controllers::auth_controller::login))
         .route("/api/v1/auth/register", post(controllers::auth_controller::register))
         .route("/api/v1/auth/me", get(controllers::auth_controller::me))
+        .route("/api/v1/auth/forgot-password",post(controllers::auth_controller::forgot_password),)
+        .route("/api/v1/auth/reset-password",post(controllers::auth_controller::reset_password),)
         .route("/api/v1/devices", get(controllers::device_controller::get_devices))
         .route("/api/v1/devices", post(controllers::device_controller::create_device))
         .route("/api/v1/devices/discover", get(controllers::device_controller::discover_devices))
@@ -625,18 +675,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/v1/devices/{id}/control", post(controllers::device_controller::control_device))
         .route("/api/v1/automations", get(controllers::automation_controller::get_automations))
         .route("/api/v1/automations", post(controllers::automation_controller::create_automation))
-        .route(
-            "/api/v1/automations/{id}",
-            axum::routing::put(controllers::automation_controller::toggle_automation)
-                .patch(controllers::automation_controller::toggle_automation)
-                .delete(controllers::automation_controller::delete_automation),
-        )
-        .route(
-            "/api/v1/automations/{id}/toggle",
-            axum::routing::post(controllers::automation_controller::toggle_automation)
-                .put(controllers::automation_controller::toggle_automation)
-                .patch(controllers::automation_controller::toggle_automation),
-        )
+        .route("/api/v1/automations/{id}",axum::routing::put(controllers::automation_controller::toggle_automation).patch(controllers::automation_controller::toggle_automation).delete(controllers::automation_controller::delete_automation),)
+        .route("/api/v1/automations/{id}/toggle",axum::routing::post(controllers::automation_controller::toggle_automation).put(controllers::automation_controller::toggle_automation).patch(controllers::automation_controller::toggle_automation),)
         .route("/api/v1/energy/analytics", get(controllers::energy_controller::get_analytics))
         .route("/api/v1/users", get(controllers::user_controller::get_users))
         .route("/api/v1/users", post(controllers::user_controller::create_user))
@@ -644,28 +684,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/v1/users/{id}", delete(controllers::user_controller::delete_user))
         .route("/api/v1/ai/alerts", get(controllers::ai_controller::get_alerts))
         .route("/api/v1/ai/simulate-anomaly", post(controllers::ai_controller::simulate_anomaly))
+        .route("/api/v1/ai/suggestions", get(controllers::ai_controller::get_suggestions))
+        .route("/api/v1/ai/suggestions/analyze", post(controllers::ai_controller::analyze_suggestions))
+        .route("/api/v1/ai/suggestions/{id}/apply", post(controllers::ai_controller::apply_suggestion))
+        .route("/api/v1/ai/suggestions/{id}/dismiss", post(controllers::ai_controller::dismiss_suggestion))
         .route("/api/v1/guests", get(controllers::guest_controller::get_guests))
         .route("/api/v1/guests/{id}/revoke", post(controllers::guest_controller::revoke_guest))
-        .route(
-            "/api/v1/houses",
-            get(controllers::house_controller::get_houses)
-                .post(controllers::house_controller::create_house),
-        )
-        .route(
-            "/api/v1/houses/{id}",
-            put(controllers::house_controller::update_house)
-                .delete(controllers::house_controller::delete_house),
-        )
-        .route(
-            "/api/v1/rooms",
-            get(controllers::room_controller::get_rooms)
-                .post(controllers::room_controller::create_room),
-        )
-        .route(
-            "/api/v1/rooms/{id}",
-            put(controllers::room_controller::update_room)
-                .delete(controllers::room_controller::delete_room),
-        )
+        .route("/api/v1/houses",get(controllers::house_controller::get_houses).post(controllers::house_controller::create_house),)
+        .route("/api/v1/houses/{id}",put(controllers::house_controller::update_house).delete(controllers::house_controller::delete_house),)
+        .route("/api/v1/rooms",get(controllers::room_controller::get_rooms).post(controllers::room_controller::create_room),)
+        .route("/api/v1/rooms/{id}",
+            put(controllers::room_controller::update_room).delete(controllers::room_controller::delete_room),)
         .layer(cors)
         .with_state(state);
 
