@@ -330,3 +330,95 @@ WHERE device_type = N'fan' OR mqtt_topic LIKE N'%quat%';
 UPDATE dbo.devices
 SET mqtt_topic = N'smarthome/QTRUNG000001/telemetry'
 WHERE device_type = N'sensor' OR mqtt_topic LIKE N'%dht22%';
+
+-- BẢNG LƯU MÃ OTP KHÔI PHỤC MẬT KHẨU
+IF OBJECT_ID(N'dbo.password_resets', N'U') IS NULL
+CREATE TABLE dbo.password_resets (
+    id UNIQUEIDENTIFIER PRIMARY KEY DEFAULT NEWID(),
+    user_id UNIQUEIDENTIFIER NOT NULL,
+    email NVARCHAR(255) NOT NULL,
+    otp_hash NVARCHAR(255) NOT NULL,
+    attempts INT NOT NULL DEFAULT 0,
+    expires_at DATETIMEOFFSET NOT NULL,
+    used_at DATETIMEOFFSET NULL,
+    created_at DATETIMEOFFSET NOT NULL DEFAULT SYSDATETIMEOFFSET(),
+    CONSTRAINT FK_password_resets_users FOREIGN KEY (user_id) REFERENCES dbo.users(id) ON DELETE CASCADE
+);
+GO
+
+IF NOT EXISTS (
+    SELECT 1 FROM sys.indexes
+    WHERE name = N'IX_password_resets_email_created'
+      AND object_id = OBJECT_ID(N'dbo.password_resets')
+)
+CREATE INDEX IX_password_resets_email_created ON dbo.password_resets (email, created_at DESC);
+GO
+
+
+-- ============================================================================
+-- MỞ RỘNG BẢNG DEVICE_LOGS & AI_SUGGESTIONS CHO CHỨC NĂNG AI GỢI Ý NGƯỜI DÙNG
+-- ============================================================================
+
+IF COL_LENGTH(N'dbo.device_logs', N'user_id') IS NULL
+ALTER TABLE dbo.device_logs ADD user_id UNIQUEIDENTIFIER NULL;
+GO
+
+IF COL_LENGTH(N'dbo.device_logs', N'owner_id') IS NULL
+ALTER TABLE dbo.device_logs ADD owner_id UNIQUEIDENTIFIER NULL;
+GO
+
+IF NOT EXISTS (
+    SELECT 1 FROM sys.indexes
+    WHERE name = N'IX_device_logs_owner_created'
+      AND object_id = OBJECT_ID(N'dbo.device_logs')
+)
+CREATE INDEX IX_device_logs_owner_created
+    ON dbo.device_logs (owner_id, created_at DESC);
+GO
+
+IF OBJECT_ID(N'dbo.ai_suggestions', N'U') IS NULL
+CREATE TABLE dbo.ai_suggestions (
+    id UNIQUEIDENTIFIER PRIMARY KEY DEFAULT NEWID(),
+    user_id UNIQUEIDENTIFIER NULL,
+    owner_id UNIQUEIDENTIFIER NULL,
+    device_id UNIQUEIDENTIFIER NULL,
+    suggestion_type NVARCHAR(50) NOT NULL DEFAULT N'HABIT',
+    title NVARCHAR(200) NOT NULL DEFAULT N'Gợi ý tự động hóa thông minh',
+    description NVARCHAR(MAX) NOT NULL DEFAULT N'',
+    suggested_action NVARCHAR(MAX) NOT NULL DEFAULT N'{}',
+    cron_expression NVARCHAR(50) NULL,
+    confidence_score FLOAT NOT NULL DEFAULT 0.8,
+    status NVARCHAR(20) NOT NULL DEFAULT N'PENDING',
+    is_applied BIT NOT NULL DEFAULT 0,
+    created_at DATETIMEOFFSET NOT NULL DEFAULT SYSDATETIMEOFFSET()
+);
+GO
+
+IF COL_LENGTH(N'dbo.ai_suggestions', N'owner_id') IS NULL
+ALTER TABLE dbo.ai_suggestions ADD owner_id UNIQUEIDENTIFIER NULL;
+GO
+
+IF COL_LENGTH(N'dbo.ai_suggestions', N'suggestion_type') IS NULL
+ALTER TABLE dbo.ai_suggestions ADD suggestion_type NVARCHAR(50) NOT NULL DEFAULT N'HABIT';
+GO
+
+IF COL_LENGTH(N'dbo.ai_suggestions', N'title') IS NULL
+ALTER TABLE dbo.ai_suggestions ADD title NVARCHAR(200) NOT NULL DEFAULT N'Gợi ý thông minh';
+GO
+
+IF COL_LENGTH(N'dbo.ai_suggestions', N'description') IS NULL
+ALTER TABLE dbo.ai_suggestions ADD description NVARCHAR(MAX) NOT NULL DEFAULT N'';
+GO
+
+IF COL_LENGTH(N'dbo.ai_suggestions', N'status') IS NULL
+ALTER TABLE dbo.ai_suggestions ADD status NVARCHAR(20) NOT NULL DEFAULT N'PENDING';
+GO
+
+IF NOT EXISTS (
+    SELECT 1 FROM sys.indexes
+    WHERE name = N'IX_ai_suggestions_owner_status'
+      AND object_id = OBJECT_ID(N'dbo.ai_suggestions')
+)
+CREATE INDEX IX_ai_suggestions_owner_status
+    ON dbo.ai_suggestions (owner_id, status, confidence_score DESC);
+GO
