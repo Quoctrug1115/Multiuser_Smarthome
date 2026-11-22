@@ -19,20 +19,32 @@ class WebSocketService extends ChangeNotifier {
   final _sensorController = StreamController.broadcast();
   final _deviceController = StreamController.broadcast();
   final _aiAlertController = StreamController.broadcast();
+  final _aiSuggestionController = StreamController.broadcast();
   final _statusController = StreamController<bool>.broadcast();
 
   Stream get sensorStream => _sensorController.stream;
   Stream get deviceStream => _deviceController.stream;
   Stream get aiAlertStream => _aiAlertController.stream;
+  Stream get aiSuggestionStream => _aiSuggestionController.stream;
   Stream<bool> get statusStream => _statusController.stream;
 
   bool _isConnected = false;
   bool get isConnected => _isConnected;
 
+  String _attachTokenIfNeeded(String rawUrl) {
+    final token = ApiService().token?.trim() ?? '';
+    if (token.isEmpty || rawUrl.contains('token=')) {
+      return rawUrl;
+    }
+    final sep = rawUrl.contains('?') ? '&' : '?';
+    return '$rawUrl${sep}token=${Uri.encodeComponent(token)}';
+  }
+
   void connect([String? wsUrl]) {
-    final targetUrl = (wsUrl != null && wsUrl.trim().isNotEmpty)
+    final baseTarget = (wsUrl != null && wsUrl.trim().isNotEmpty)
         ? wsUrl.trim()
         : ApiService().wsUrl;
+    final targetUrl = _attachTokenIfNeeded(baseTarget);
 
     if (_isConnected && _currentUrl == targetUrl) return;
 
@@ -88,11 +100,16 @@ class WebSocketService extends ChangeNotifier {
       } else if (type == 'DEVICE_UPDATE') {
         _deviceController.add(mapPayload);
       } else if (type == 'AI_ALERT') {
-        // Lọc cảnh báo AI theo đúng hộ gia đình (Multi-tenant)
         final alertOwner = (mapPayload['owner_id'] ?? '').toString();
         final myOwner = ApiService().householdOwnerId;
         if (alertOwner.isEmpty || myOwner.isEmpty || alertOwner == myOwner) {
           _aiAlertController.add(mapPayload);
+        }
+      } else if (type == 'AI_SUGGESTION') {
+        final sugOwner = (mapPayload['owner_id'] ?? '').toString();
+        final myOwner = ApiService().householdOwnerId;
+        if (sugOwner.isEmpty || myOwner.isEmpty || sugOwner == myOwner) {
+          _aiSuggestionController.add(mapPayload);
         }
       }
     } catch (e) {
