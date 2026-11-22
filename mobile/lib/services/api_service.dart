@@ -207,6 +207,40 @@ class ApiService extends ChangeNotifier {
     }
   }
 
+  Future<JsonMap> forgotPassword(String email) async {
+    final res = await http.post(
+      Uri.parse('$_baseUrl/auth/forgot-password'),
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({'email': email.trim()}),
+    );
+    final data = _parseResponse(res);
+    if (data is Map) {
+      return JsonMap.from(data);
+    }
+    return {'message': 'Mã OTP đã được gửi.'};
+  }
+
+  Future<String> resetPassword({
+    required String email,
+    required String otp,
+    required String newPassword,
+  }) async {
+    final res = await http.post(
+      Uri.parse('$_baseUrl/auth/reset-password'),
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({
+        'email': email.trim(),
+        'otp': otp.trim(),
+        'new_password': newPassword,
+      }),
+    );
+    final data = _parseResponse(res);
+    if (data is Map && data['message'] != null) {
+      return data['message'].toString();
+    }
+    return 'Đặt lại mật khẩu thành công.';
+  }
+
   void logout() {
     _token = null;
     _currentUser = null;
@@ -610,14 +644,67 @@ class ApiService extends ChangeNotifier {
     );
   }
 
-  Future<void> triggerAiAnalysis({
-    double temperature = 65.0,
-    String sensorId = 'dht22_living_room',
+  /// Kiểm thử bất thường Z-Score dựa trên thiết bị & chuỗi dữ liệu cảm biến THẬT
+  Future<JsonMap> triggerAiAnalysis({
+    String? deviceId,
+    double? temperature,
   }) async {
     final res = await http.post(
       Uri.parse('$_baseUrl/ai/simulate-anomaly'),
       headers: _headers,
-      body: jsonEncode({'temperature': temperature, 'sensor_id': sensorId}),
+      body: jsonEncode({
+        if (deviceId != null && deviceId.trim().isNotEmpty)
+          'device_id': deviceId.trim(),
+        if (temperature != null) 'temperature': temperature,
+      }),
+    );
+    final data = _parseResponse(res);
+    return data is Map ? JsonMap.from(data) : {};
+  }
+
+  // ==================== 7. AI SUGGESTIONS (GỢI Ý THÔNG MINH) ====================
+
+  /// Lấy danh sách gợi ý AI đang chờ duyệt của hộ gia đình
+  Future<JsonList> getAiSuggestions() async {
+    final res = await http.get(
+      Uri.parse('$_baseUrl/ai/suggestions'),
+      headers: _headers,
+    );
+    final data = _parseResponse(res);
+    if (data is List) {
+      return data.map((e) => JsonMap.from(e as Map)).toList();
+    }
+    if (data is Map && data['data'] is List) {
+      return (data['data'] as List).map((e) => JsonMap.from(e as Map)).toList();
+    }
+    return [];
+  }
+
+  /// Kích hoạt AI quét lịch sử điều khiển & cảm biến thật để sinh gợi ý mới
+  Future<JsonMap> analyzeAiSuggestions() async {
+    final res = await http.post(
+      Uri.parse('$_baseUrl/ai/suggestions/analyze'),
+      headers: _headers,
+    );
+    final data = _parseResponse(res);
+    return data is Map ? JsonMap.from(data) : {};
+  }
+
+  /// Chấp nhận & thực thi gợi ý (bật/tắt ngay hoặc tự tạo kịch bản tự động)
+  Future<JsonMap> applyAiSuggestion(String id) async {
+    final res = await http.post(
+      Uri.parse('$_baseUrl/ai/suggestions/$id/apply'),
+      headers: _headers,
+    );
+    final data = _parseResponse(res);
+    return data is Map ? JsonMap.from(data) : {};
+  }
+
+  /// Bỏ qua gợi ý để AI ghi nhận phản hồi
+  Future<void> dismissAiSuggestion(String id) async {
+    final res = await http.post(
+      Uri.parse('$_baseUrl/ai/suggestions/$id/dismiss'),
+      headers: _headers,
     );
     _parseResponse(res);
   }

@@ -85,6 +85,303 @@ class _LoginScreenState extends State<LoginScreen> {
     );
   }
 
+  void _showForgotPasswordSheet(bool isDark) {
+    final resetEmailCtrl = TextEditingController(
+      text: _emailController.text.trim(),
+    );
+    final otpCtrl = TextEditingController();
+    final newPassCtrl = TextEditingController();
+    final confirmNewPassCtrl = TextEditingController();
+
+    int step = 1;
+    bool submitting = false;
+    bool obscureNewPass = true;
+    String? infoBanner;
+    String? errorBanner;
+
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: AppColors.getSurface(isDark),
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (ctx) {
+        return StatefulBuilder(
+          builder: (context, setSheetState) {
+            final bottomInset = MediaQuery.of(context).viewInsets.bottom;
+
+            Future<void> handleSendOtp() async {
+              final email = resetEmailCtrl.text.trim();
+              if (email.isEmpty || !email.contains('@')) {
+                setSheetState(() {
+                  errorBanner = 'Vui lòng nhập email hợp lệ.';
+                  infoBanner = null;
+                });
+                return;
+              }
+
+              setSheetState(() {
+                submitting = true;
+                errorBanner = null;
+              });
+
+              try {
+                final res = await ApiService().forgotPassword(email);
+                final msg = res['message']?.toString() ?? 'Mã OTP đã được tạo.';
+                final devOtp = res['dev_otp']?.toString();
+
+                setSheetState(() {
+                  step = 2;
+                  infoBanner = devOtp != null && devOtp.isNotEmpty
+                      ? '$msg (Mã OTP kiểm thử: $devOtp)'
+                      : '$msg Vui lòng nhập mã OTP 6 số.';
+                });
+              } catch (e) {
+                setSheetState(() {
+                  errorBanner = e.toString().replaceFirst('Exception: ', '');
+                });
+              } finally {
+                setSheetState(() => submitting = false);
+              }
+            }
+
+            Future<void> handleResetPassword() async {
+              final email = resetEmailCtrl.text.trim();
+              final otp = otpCtrl.text.trim();
+              final newPass = newPassCtrl.text.trim();
+              final confirmPass = confirmNewPassCtrl.text.trim();
+
+              if (otp.length != 6) {
+                setSheetState(() {
+                  errorBanner = 'Mã OTP phải gồm đúng 6 chữ số.';
+                });
+                return;
+              }
+              if (newPass.length < 6) {
+                setSheetState(() {
+                  errorBanner = 'Mật khẩu mới phải có ít nhất 6 ký tự.';
+                });
+                return;
+              }
+              if (newPass != confirmPass) {
+                setSheetState(() {
+                  errorBanner = 'Mật khẩu xác nhận không khớp.';
+                });
+                return;
+              }
+
+              setSheetState(() {
+                submitting = true;
+                errorBanner = null;
+              });
+
+              try {
+                final successMsg = await ApiService().resetPassword(
+                  email: email,
+                  otp: otp,
+                  newPassword: newPass,
+                );
+                if (!mounted) return;
+                Navigator.pop(ctx);
+                _emailController.text = email;
+                _passwordController.clear();
+                _showMessage(successMsg);
+              } catch (e) {
+                setSheetState(() {
+                  errorBanner = e.toString().replaceFirst('Exception: ', '');
+                });
+              } finally {
+                setSheetState(() => submitting = false);
+              }
+            }
+
+            return Padding(
+              padding: EdgeInsets.fromLTRB(20, 20, 20, bottomInset + 24),
+              child: SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        Text(
+                          'KHÔI PHỤC MẬT KHẨU',
+                          style: TextStyle(
+                            color: AppColors.getTextPrimary(isDark),
+                            fontSize: 16,
+                            fontWeight: FontWeight.bold,
+                            letterSpacing: 1.1,
+                          ),
+                        ),
+                        IconButton(
+                          icon: Icon(
+                            Icons.close,
+                            color: AppColors.getTextSecondary(isDark),
+                          ),
+                          onPressed: () => Navigator.pop(ctx),
+                        ),
+                      ],
+                    ),
+                    Text(
+                      step == 1
+                          ? 'Bước 1/2: Nhập email tài khoản để nhận mã xác nhận OTP.'
+                          : 'Bước 2/2: Nhập mã OTP 6 số và đặt mật khẩu mới.',
+                      style: TextStyle(
+                        color: AppColors.getTextSecondary(isDark),
+                        fontSize: 12,
+                      ),
+                    ),
+                    const SizedBox(height: 16),
+                    _buildTextField(
+                      controller: resetEmailCtrl,
+                      label: 'EMAIL TÀI KHOẢN',
+                      icon: Icons.email_outlined,
+                      isDark: isDark,
+                    ),
+                    if (step == 2) ...[
+                      const SizedBox(height: 12),
+                      _buildTextField(
+                        controller: otpCtrl,
+                        label: 'MÃ OTP (6 CHỮ SỐ)',
+                        icon: Icons.pin_outlined,
+                        isDark: isDark,
+                      ),
+                      const SizedBox(height: 12),
+                      _buildTextField(
+                        controller: newPassCtrl,
+                        label: 'MẬT KHẨU MỚI',
+                        icon: Icons.lock_outline,
+                        isDark: isDark,
+                        obscureText: obscureNewPass,
+                        suffixIcon: IconButton(
+                          icon: Icon(
+                            obscureNewPass
+                                ? Icons.visibility_off
+                                : Icons.visibility,
+                            color: AppColors.textMuted,
+                            size: 18,
+                          ),
+                          onPressed: () => setSheetState(
+                            () => obscureNewPass = !obscureNewPass,
+                          ),
+                        ),
+                      ),
+                      const SizedBox(height: 12),
+                      _buildTextField(
+                        controller: confirmNewPassCtrl,
+                        label: 'XÁC NHẬN MẬT KHẨU MỚI',
+                        icon: Icons.lock_reset,
+                        isDark: isDark,
+                        obscureText: obscureNewPass,
+                      ),
+                    ],
+                    if (infoBanner != null) ...[
+                      const SizedBox(height: 12),
+                      Container(
+                        width: double.infinity,
+                        padding: const EdgeInsets.all(10),
+                        decoration: BoxDecoration(
+                          color: AppColors.secondary.withOpacity(0.15),
+                          borderRadius: BorderRadius.circular(10),
+                          border: Border.all(
+                            color: AppColors.secondary.withOpacity(0.4),
+                          ),
+                        ),
+                        child: Text(
+                          infoBanner!,
+                          style: const TextStyle(
+                            color: AppColors.secondary,
+                            fontSize: 12,
+                          ),
+                        ),
+                      ),
+                    ],
+                    if (errorBanner != null) ...[
+                      const SizedBox(height: 12),
+                      Container(
+                        width: double.infinity,
+                        padding: const EdgeInsets.all(10),
+                        decoration: BoxDecoration(
+                          color: AppColors.accent.withOpacity(0.15),
+                          borderRadius: BorderRadius.circular(10),
+                          border: Border.all(
+                            color: AppColors.accent.withOpacity(0.4),
+                          ),
+                        ),
+                        child: Text(
+                          errorBanner!,
+                          style: const TextStyle(
+                            color: AppColors.accent,
+                            fontSize: 12,
+                          ),
+                        ),
+                      ),
+                    ],
+                    const SizedBox(height: 18),
+                    SizedBox(
+                      width: double.infinity,
+                      height: 46,
+                      child: ElevatedButton(
+                        onPressed: submitting
+                            ? null
+                            : (step == 1 ? handleSendOtp : handleResetPassword),
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: AppColors.primary,
+                          foregroundColor: const Color(0xFF0A0E1A),
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(10),
+                          ),
+                        ),
+                        child: submitting
+                            ? const SizedBox(
+                                width: 20,
+                                height: 20,
+                                child: CircularProgressIndicator(
+                                  strokeWidth: 2.5,
+                                  color: Color(0xFF0A0E1A),
+                                ),
+                              )
+                            : Text(
+                                step == 1
+                                    ? 'GỬI MÃ XÁC NHẬN (OTP)'
+                                    : 'ĐẶT LẠI MẬT KHẨU',
+                                style: const TextStyle(
+                                  fontWeight: FontWeight.bold,
+                                  letterSpacing: 1.1,
+                                ),
+                              ),
+                      ),
+                    ),
+                    if (step == 2)
+                      Center(
+                        child: TextButton(
+                          onPressed: submitting
+                              ? null
+                              : () => setSheetState(() {
+                                  step = 1;
+                                  errorBanner = null;
+                                }),
+                          child: Text(
+                            'Gửi lại mã hoặc đổi email',
+                            style: TextStyle(
+                              color: AppColors.getTextSecondary(isDark),
+                              fontSize: 12,
+                            ),
+                          ),
+                        ),
+                      ),
+                  ],
+                ),
+              ),
+            );
+          },
+        );
+      },
+    );
+  }
+
   @override
   void dispose() {
     _nameController.dispose();
@@ -158,7 +455,7 @@ class _LoginScreenState extends State<LoginScreen> {
                   const SizedBox(height: 6),
                   Text(
                     _isLoginMode
-                        ? 'Xác thực qua máy chủ Rust Backend'
+                        ? 'Xin chào'
                         : 'Đăng ký tài khoản Chủ nhà (Owner) mới',
                     style: TextStyle(
                       color: AppColors.getTextSecondary(isDark),
@@ -229,6 +526,29 @@ class _LoginScreenState extends State<LoginScreen> {
                           setState(() => _obscurePassword = !_obscurePassword),
                     ),
                   ),
+                  if (_isLoginMode)
+                    Align(
+                      alignment: Alignment.centerRight,
+                      child: TextButton(
+                        onPressed: _isLoading
+                            ? null
+                            : () => _showForgotPasswordSheet(isDark),
+                        style: TextButton.styleFrom(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 4,
+                            vertical: 6,
+                          ),
+                        ),
+                        child: const Text(
+                          'Quên mật khẩu?',
+                          style: TextStyle(
+                            color: AppColors.primary,
+                            fontSize: 12,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                      ),
+                    ),
                   if (!_isLoginMode) ...[
                     const SizedBox(height: 14),
                     _buildTextField(
@@ -239,7 +559,7 @@ class _LoginScreenState extends State<LoginScreen> {
                       obscureText: _obscurePassword,
                     ),
                   ],
-                  const SizedBox(height: 24),
+                  const SizedBox(height: 20),
                   SizedBox(
                     width: double.infinity,
                     height: 48,
