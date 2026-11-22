@@ -98,7 +98,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or(1433);
     let db_user = std::env::var("MSSQL_USER").unwrap_or_else(|_| "sa".to_string());
     let db_pass =
-        std::env::var("MSSQL_PASSWORD").unwrap_or_else(|_| "SmartHome@2026".to_string());
+        std::env::var("MSSQL_PASSWORD").unwrap_or_else(|_| "Quoctrung2005@".to_string());
     let db_name = std::env::var("MSSQL_DATABASE").unwrap_or_else(|_| "smarthome".to_string());
 
     let mut config = Config::new();
