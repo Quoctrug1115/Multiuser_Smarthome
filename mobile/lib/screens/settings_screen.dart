@@ -263,35 +263,35 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   mainAxisAlignment: MainAxisAlignment.spaceBetween,
                   children: [
                     Text(
-                      'MÁY CHỦ BACKEND & WEBSOCKET',
+                      'PHIÊN ĐĂNG NHẬP',
                       style: TextStyle(
                         color: AppColors.getTextPrimary(isDark),
                         fontSize: 12,
                         fontWeight: FontWeight.bold,
                       ),
                     ),
-                    Row(
-                      children: [
-                        Icon(
-                          Icons.circle,
-                          size: 8,
-                          color: wsService.isConnected
-                              ? green
-                              : AppColors.accent,
-                        ),
-                        const SizedBox(width: 5),
-                        Text(
-                          wsService.isConnected ? 'WS CONNECTED' : 'WS OFFLINE',
-                          style: TextStyle(
-                            color: wsService.isConnected
-                                ? green
-                                : AppColors.accent,
-                            fontSize: 10,
-                            fontWeight: FontWeight.bold,
-                          ),
-                        ),
-                      ],
-                    ),
+                    // Row(
+                    //   children: [
+                    //     Icon(
+                    //       Icons.circle,
+                    //       size: 8,
+                    //       color: wsService.isConnected
+                    //           ? green
+                    //           : AppColors.accent,
+                    //     ),
+                    //     const SizedBox(width: 5),
+                    //     Text(
+                    //       wsService.isConnected ? 'WS CONNECTED' : 'WS OFFLINE',
+                    //       style: TextStyle(
+                    //         color: wsService.isConnected
+                    //             ? green
+                    //             : AppColors.accent,
+                    //         fontSize: 10,
+                    //         fontWeight: FontWeight.bold,
+                    //       ),
+                    //     ),
+                    //   ],
+                    // ),
                   ],
                 ),
                 const SizedBox(height: 10),
@@ -302,8 +302,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     fontSize: 13,
                   ),
                   decoration: InputDecoration(
-                    labelText: 'Địa chỉ Backend (HTTP / WS)',
-                    hintText: 'http://127.0.0.1:3000',
+                    labelText: 'Chưa có phiên đăng nhập',
+                    // hintText: 'http://127.0.0.1:3000',
                     prefixIcon: Icon(Icons.dns_outlined, color: cyan, size: 19),
                   ),
                 ),
@@ -311,26 +311,26 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 Wrap(
                   spacing: 8,
                   children: [
-                    ActionChip(
-                      label: const Text(
-                        'Android Emulator (127.0.0.1)',
-                        style: TextStyle(fontSize: 11),
-                      ),
-                      onPressed: () {
-                        _serverCtrl.text = 'http://127.0.0.1:3000';
-                        _applyServerConfig();
-                      },
-                    ),
-                    ActionChip(
-                      label: const Text(
-                        'Localhost (127.0.0.1)',
-                        style: TextStyle(fontSize: 11),
-                      ),
-                      onPressed: () {
-                        _serverCtrl.text = 'http://127.0.0.1:3000';
-                        _applyServerConfig();
-                      },
-                    ),
+                    // ActionChip(
+                    //   label: const Text(
+                    //     'Android Emulator (127.0.0.1)',
+                    //     style: TextStyle(fontSize: 11),
+                    //   ),
+                    //   onPressed: () {
+                    //     _serverCtrl.text = 'http://127.0.0.1:3000';
+                    //     _applyServerConfig();
+                    //   },
+                    // ),
+                    // ActionChip(
+                    //   label: const Text(
+                    //     'Localhost (127.0.0.1)',
+                    //     style: TextStyle(fontSize: 11),
+                    //   ),
+                    //   onPressed: () {
+                    //     _serverCtrl.text = 'http://127.0.0.1:3000';
+                    //     _applyServerConfig();
+                    //   },
+                    // ),
                   ],
                 ),
                 const SizedBox(height: 10),
@@ -349,7 +349,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     onPressed: _applyServerConfig,
                     icon: const Icon(Icons.save_outlined, size: 18),
                     label: const Text(
-                      'LƯU & KẾT NỐI LẠI',
+                      'Xóa phiên đăng nhập',
                       style: TextStyle(
                         fontSize: 11,
                         fontWeight: FontWeight.bold,
