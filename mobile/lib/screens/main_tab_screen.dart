@@ -26,6 +26,7 @@ class _MainTabScreenState extends State<MainTabScreen> {
   int _currentIndex = 0;
   int _unreadAlerts = 0;
   StreamSubscription? _alertSub;
+  StreamSubscription? _suggestionSub;
 
   @override
   void initState() {
@@ -37,7 +38,12 @@ class _MainTabScreenState extends State<MainTabScreen> {
     }
     _alertSub = ws.aiAlertStream.listen((_) {
       if (!mounted) return;
-      // Tab Cảnh Báo AI nằm ở vị trí index 4
+      if (_currentIndex != 4) {
+        setState(() => _unreadAlerts++);
+      }
+    });
+    _suggestionSub = ws.aiSuggestionStream.listen((_) {
+      if (!mounted) return;
       if (_currentIndex != 4) {
         setState(() => _unreadAlerts++);
       }
@@ -47,6 +53,7 @@ class _MainTabScreenState extends State<MainTabScreen> {
   @override
   void dispose() {
     _alertSub?.cancel();
+    _suggestionSub?.cancel();
     super.dispose();
   }
 

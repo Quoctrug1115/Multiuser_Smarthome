@@ -25,10 +25,14 @@ class _AiAlertsScreenState extends State<AiAlertsScreen> {
   bool _wsBound = false;
 
   List<AiAlert> _alerts = [];
+  List<AiSuggestion> _suggestions = [];
   JsonList _realDevices = [];
   JsonList _realRooms = [];
 
   bool _isLoading = true;
+  bool _isAnalyzingSuggestions = false;
+  bool _isSimulating = false;
+  String? _processingSuggestionId;
   String? _errorMessage;
   String _selectedSeverity = 'ALL'; // ALL | HIGH | WARNING
 
@@ -40,6 +44,7 @@ class _AiAlertsScreenState extends State<AiAlertsScreen> {
   DateTime? _lastRealtimeAlertAt;
 
   StreamSubscription<dynamic>? _alertSub;
+  StreamSubscription<dynamic>? _suggestionSub;
   StreamSubscription<dynamic>? _sensorSub;
   StreamSubscription<dynamic>? _deviceSub;
 
@@ -80,7 +85,20 @@ class _AiAlertsScreenState extends State<AiAlertsScreen> {
       widget.onViewed?.call();
     });
 
-    // 2. Lắng nghe dữ liệu cảm biến thật (MQTT -> WebSocket) và phân tích Z-Score thực tế
+    // 2. Lắng nghe gợi ý AI mới phát từ Backend Rust qua WebSocket
+    _suggestionSub = _ws.aiSuggestionStream.listen((raw) {
+      if (!mounted) return;
+      final incoming = AiSuggestion.fromJson(raw);
+      if (incoming.id.isEmpty) return;
+      setState(() {
+        if (!_suggestions.any((s) => s.id == incoming.id)) {
+          _suggestions.insert(0, incoming);
+        }
+      });
+      widget.onViewed?.call();
+    });
+
+    // 3. Lắng nghe dữ liệu cảm biến thật (MQTT -> WebSocket) và phân tích Z-Score thực tế
     _sensorSub = _ws.sensorStream.listen((raw) {
       if (!mounted || raw is! Map) return;
       final data = raw['data'] is Map ? raw['data'] as Map : raw;
@@ -100,7 +118,7 @@ class _AiAlertsScreenState extends State<AiAlertsScreen> {
       }
     });
 
-    // 3. Cập nhật trạng thái bật/tắt thiết bị thật để tính công suất tải thực tế
+    // 4. Cập nhật trạng thái bật/tắt thiết bị thật để tính công suất tải thực tế
     _deviceSub = _ws.deviceStream.listen((raw) {
       if (!mounted || raw == null) return;
       String incomingId = '';
@@ -214,7 +232,6 @@ class _AiAlertsScreenState extends State<AiAlertsScreen> {
       });
       widget.onViewed?.call();
 
-      // Đồng bộ thêm các bản ghi mới từ Backend SQL Server
       _loadRealData(silent: true);
     }
   }
@@ -230,14 +247,17 @@ class _AiAlertsScreenState extends State<AiAlertsScreen> {
     try {
       final results = await Future.wait([
         _api.getAiAlerts(),
+        _api.getAiSuggestions().catchError((_) => <JsonMap>[]),
         _api.getDevices().catchError((_) => <JsonMap>[]),
         _api.getRooms().catchError((_) => <JsonMap>[]),
       ]);
 
       if (!mounted) return;
       final serverAlerts = results[0].map((e) => AiAlert.fromJson(e)).toList();
+      final serverSuggestions = results[1]
+          .map((e) => AiSuggestion.fromJson(e))
+          .toList();
 
-      // Giữ lại các cảnh báo realtime vừa ghi nhận nếu server chưa kịp đồng bộ
       final localRealtime = _alerts
           .where((a) => a.id.startsWith('rt_'))
           .where(
@@ -250,8 +270,9 @@ class _AiAlertsScreenState extends State<AiAlertsScreen> {
 
       setState(() {
         _alerts = [...localRealtime, ...serverAlerts];
-        _realDevices = results[1];
-        _realRooms = results[2];
+        _suggestions = serverSuggestions;
+        _realDevices = results[2];
+        _realRooms = results[3];
         _isLoading = false;
         _errorMessage = null;
       });
@@ -262,6 +283,113 @@ class _AiAlertsScreenState extends State<AiAlertsScreen> {
         _isLoading = false;
         _errorMessage = e.toString().replaceFirst('Exception: ', '');
       });
+    }
+  }
+
+  void _showSnack(String msg, {bool isError = false}) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(msg),
+        backgroundColor: isError ? AppColors.accent : const Color(0xFF0D9488),
+        behavior: SnackBarBehavior.floating,
+      ),
+    );
+  }
+
+  Future<void> _handleAnalyzeSuggestions() async {
+    setState(() => _isAnalyzingSuggestions = true);
+    try {
+      final res = await _api.analyzeAiSuggestions();
+      await _loadRealData(silent: true);
+      final msg =
+          (res['message'] ?? 'Đã hoàn tất phân tích thói quen & cảm biến.')
+              .toString();
+      _showSnack(msg);
+    } catch (e) {
+      _showSnack(e.toString().replaceFirst('Exception: ', ''), isError: true);
+    } finally {
+      if (mounted) {
+        setState(() => _isAnalyzingSuggestions = false);
+      }
+    }
+  }
+
+  Future<void> _handleApplySuggestion(AiSuggestion sug) async {
+    setState(() => _processingSuggestionId = sug.id);
+    try {
+      final res = await _api.applyAiSuggestion(sug.id);
+      if (!mounted) return;
+      setState(() {
+        _suggestions.removeWhere((item) => item.id == sug.id);
+      });
+      final msg = (res['message'] ?? 'Đã áp dụng gợi ý: ${sug.title}')
+          .toString();
+      _showSnack(msg);
+      await _loadRealData(silent: true);
+    } catch (e) {
+      _showSnack(e.toString().replaceFirst('Exception: ', ''), isError: true);
+    } finally {
+      if (mounted) {
+        setState(() => _processingSuggestionId = null);
+      }
+    }
+  }
+
+  Future<void> _handleDismissSuggestion(AiSuggestion sug) async {
+    setState(() => _processingSuggestionId = sug.id);
+    try {
+      await _api.dismissAiSuggestion(sug.id);
+      if (!mounted) return;
+      setState(() {
+        _suggestions.removeWhere((item) => item.id == sug.id);
+      });
+      _showSnack('Đã bỏ qua gợi ý AI.');
+    } catch (e) {
+      _showSnack(e.toString().replaceFirst('Exception: ', ''), isError: true);
+    } finally {
+      if (mounted) {
+        setState(() => _processingSuggestionId = null);
+      }
+    }
+  }
+
+  /// Kiểm thử Z-Score trên cảm biến THẬT và nền nhiệt độ THẬT của ngôi nhà
+  Future<void> _handleSimulateRealSensorAnomaly() async {
+    final sensor = _pickRealSensor();
+    if (sensor == null) {
+      _showSnack(
+        'Ngôi nhà chưa có cảm biến thật nào. Hãy thêm cảm biến ở tab Quản Lý trước.',
+        isError: true,
+      );
+      return;
+    }
+
+    setState(() => _isSimulating = true);
+    try {
+      final sensorId = (sensor['id'] ?? '').toString();
+      // Nếu có dữ liệu live từ cảm biến thật -> tạo điểm đột biến dựa trên nhiệt độ đang đo,
+      // nếu chưa có gói tin live -> truyền null để Backend tự tính từ lịch sử dbo.sensor_data
+      final double? spikeTemp = (_liveTemp != null && _liveTemp! > 0)
+          ? double.parse((_liveTemp! + 16.5).toStringAsFixed(1))
+          : null;
+
+      final res = await _api.triggerAiAnalysis(
+        deviceId: sensorId,
+        temperature: spikeTemp,
+      );
+      await _loadRealData(silent: true);
+      final msg =
+          (res['message'] ??
+                  'Đã kiểm thử cảnh báo Z-Score trên ${sensor['name'] ?? 'cảm biến'}.')
+              .toString();
+      _showSnack(msg);
+    } catch (e) {
+      _showSnack(e.toString().replaceFirst('Exception: ', ''), isError: true);
+    } finally {
+      if (mounted) {
+        setState(() => _isSimulating = false);
+      }
     }
   }
 
@@ -281,13 +409,14 @@ class _AiAlertsScreenState extends State<AiAlertsScreen> {
       final type = (d['device_type'] ?? '').toString().toLowerCase();
       final topic = (d['mqtt_topic'] ?? '').toString().toLowerCase();
       if (type == 'sensor' ||
+          type == 'dht22' ||
           topic.contains('dht') ||
           topic.contains('sensor') ||
-          topic.contains('temp')) {
+          topic.contains('telemetry')) {
         return d;
       }
     }
-    return _realDevices.first;
+    return null;
   }
 
   double get _activePowerWatt {
@@ -343,6 +472,7 @@ class _AiAlertsScreenState extends State<AiAlertsScreen> {
   @override
   void dispose() {
     _alertSub?.cancel();
+    _suggestionSub?.cancel();
     _sensorSub?.cancel();
     _deviceSub?.cancel();
     super.dispose();
@@ -384,7 +514,7 @@ class _AiAlertsScreenState extends State<AiAlertsScreen> {
                       const SizedBox(width: 8),
                       Expanded(
                         child: Text(
-                          'GIÁM SÁT BẤT THƯỜNG AI (Z-SCORE)',
+                          'TRỢ LÝ & GIÁM SÁT AI (Z-SCORE)',
                           style: TextStyle(
                             color: AppColors.getTextPrimary(isDark),
                             fontSize: 13.5,
@@ -397,37 +527,37 @@ class _AiAlertsScreenState extends State<AiAlertsScreen> {
                           horizontal: 8,
                           vertical: 3,
                         ),
-                        decoration: BoxDecoration(
-                          color: (wsConnected ? green : amber).withOpacity(
-                            0.16,
-                          ),
-                          borderRadius: BorderRadius.circular(20),
-                          border: Border.all(
-                            color: (wsConnected ? green : amber).withOpacity(
-                              0.5,
-                            ),
-                          ),
-                        ),
-                        child: Text(
-                          wsConnected ? 'LIVE MQTT' : 'ĐỒNG BỘ API',
-                          style: TextStyle(
-                            color: wsConnected ? green : amber,
-                            fontSize: 9.5,
-                            fontWeight: FontWeight.bold,
-                          ),
-                        ),
+                        // decoration: BoxDecoration(
+                        //   color: (wsConnected ? green : amber).withOpacity(
+                        //     0.16,
+                        //   ),
+                        //   borderRadius: BorderRadius.circular(20),
+                        //   border: Border.all(
+                        //     color: (wsConnected ? green : amber).withOpacity(
+                        //       0.5,
+                        //     ),
+                        //   ),
+                        // ),
+                        // child: Text(
+                        //   wsConnected ? 'LIVE MQTT' : 'ĐỒNG BỘ API',
+                        //   style: TextStyle(
+                        //     color: wsConnected ? green : amber,
+                        //     fontSize: 9.5,
+                        //     fontWeight: FontWeight.bold,
+                        //   ),
+                        // ),
                       ),
                     ],
                   ),
                   const SizedBox(height: 8),
-                  Text(
-                    'Phân tích trực tiếp luồng dữ liệu cảm biến môi trường và công suất tải thực tế của hộ gia đình.',
-                    style: TextStyle(
-                      color: AppColors.getTextSecondary(isDark),
-                      fontSize: 12,
-                      height: 1.4,
-                    ),
-                  ),
+                  // Text(
+                  //   'Phân tích trực tiếp luồng dữ liệu cảm biến thật và học thói quen điều khiển thiết bị của hộ gia đình.',
+                  //   style: TextStyle(
+                  //     color: AppColors.getTextSecondary(isDark),
+                  //     fontSize: 12,
+                  //     height: 1.4,
+                  //   ),
+                  // ),
                   if (sensor != null) ...[
                     const SizedBox(height: 8),
                     Text(
@@ -491,12 +621,145 @@ class _AiAlertsScreenState extends State<AiAlertsScreen> {
                       ),
                     ],
                   ),
+                  if (_api.isAdmin) ...[
+                    const SizedBox(height: 12),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: OutlinedButton.icon(
+                            onPressed: _isAnalyzingSuggestions
+                                ? null
+                                : _handleAnalyzeSuggestions,
+                            icon: Icon(
+                              Icons.auto_awesome,
+                              size: 16,
+                              color: cyan,
+                            ),
+                            label: Text(
+                              _isAnalyzingSuggestions
+                                  ? 'ĐANG QUÉT...'
+                                  : 'QUÉT GỢI Ý AI',
+                              style: TextStyle(
+                                color: cyan,
+                                fontSize: 11,
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                            style: OutlinedButton.styleFrom(
+                              side: BorderSide(color: cyan.withOpacity(0.5)),
+                              padding: const EdgeInsets.symmetric(vertical: 10),
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(10),
+                              ),
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: OutlinedButton.icon(
+                            onPressed: (_isSimulating || sensor == null)
+                                ? null
+                                : _handleSimulateRealSensorAnomaly,
+                            icon: const Icon(
+                              Icons.bolt,
+                              size: 16,
+                              color: AppColors.accent,
+                            ),
+                            label: Text(
+                              _isSimulating
+                                  ? 'ĐANG TÍNH...'
+                                  : 'KIỂM THỬ Z-SCORE',
+                              style: const TextStyle(
+                                color: AppColors.accent,
+                                fontSize: 11,
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                            style: OutlinedButton.styleFrom(
+                              side: BorderSide(
+                                color: AppColors.accent.withOpacity(0.5),
+                              ),
+                              padding: const EdgeInsets.symmetric(vertical: 10),
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(10),
+                              ),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ],
                 ],
               ),
             ),
             const SizedBox(height: 16),
 
-            // 2. BỘ LỌC MỨC ĐỘ CẢNH BÁO
+            // 2. PHẦN GỢI Ý THÔNG MINH DÀNH CHO NGƯỜI DÙNG
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                Text(
+                  '✨ GỢI Ý THÔNG MINH (${_suggestions.length})',
+                  style: TextStyle(
+                    color: cyan,
+                    fontSize: 12,
+                    fontWeight: FontWeight.bold,
+                    letterSpacing: 0.5,
+                  ),
+                ),
+                if (!_api.isAdmin)
+                  InkWell(
+                    onTap: _isAnalyzingSuggestions
+                        ? null
+                        : _handleAnalyzeSuggestions,
+                    child: Text(
+                      _isAnalyzingSuggestions ? 'ĐANG QUÉT...' : 'QUÉT GỢI Ý',
+                      style: TextStyle(
+                        color: cyan,
+                        fontSize: 11.5,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                  ),
+              ],
+            ),
+            const SizedBox(height: 10),
+
+            if (_suggestions.isEmpty)
+              Container(
+                padding: const EdgeInsets.symmetric(
+                  vertical: 20,
+                  horizontal: 14,
+                ),
+                decoration: BoxDecoration(
+                  color: AppColors.getSurface(isDark),
+                  borderRadius: BorderRadius.circular(14),
+                  border: Border.all(
+                    color: isDark ? Colors.white12 : Colors.black12,
+                  ),
+                ),
+                child: Text(
+                  'Chưa có gợi ý mới. AI đang tiếp tục học thói quen bật/tắt thiết bị hàng ngày của bạn.',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                    color: AppColors.getTextSecondary(isDark),
+                    fontSize: 12,
+                  ),
+                ),
+              )
+            else
+              ..._suggestions.map(
+                (sug) => _buildSuggestionCard(
+                  sug: sug,
+                  isDark: isDark,
+                  cyan: cyan,
+                  green: green,
+                  amber: amber,
+                ),
+              ),
+            const SizedBox(height: 16),
+
+            // 3. BỘ LỌC MỨC ĐỘ CẢNH BÁO
             SingleChildScrollView(
               scrollDirection: Axis.horizontal,
               child: Row(
@@ -527,7 +790,7 @@ class _AiAlertsScreenState extends State<AiAlertsScreen> {
             ),
             const SizedBox(height: 14),
 
-            // 3. THANH TIÊU ĐỀ LỊCH SỬ CẢNH BÁO THẬT
+            // 4. THANH TIÊU ĐỀ LỊCH SỬ CẢNH BÁO THẬT
             Row(
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
@@ -555,7 +818,7 @@ class _AiAlertsScreenState extends State<AiAlertsScreen> {
             ),
             const SizedBox(height: 12),
 
-            // 4. DANH SÁCH CẢNH BÁO TỪ SQL SERVER & REALTIME
+            // 5. DANH SÁCH CẢNH BÁO TỪ SQL SERVER & REALTIME
             if (_isLoading)
               Padding(
                 padding: const EdgeInsets.symmetric(vertical: 40),
@@ -725,6 +988,164 @@ class _AiAlertsScreenState extends State<AiAlertsScreen> {
               }),
           ],
         ),
+      ),
+    );
+  }
+
+  Widget _buildSuggestionCard({
+    required AiSuggestion sug,
+    required bool isDark,
+    required Color cyan,
+    required Color green,
+    required Color amber,
+  }) {
+    final typeUpper = sug.suggestionType.trim().toUpperCase();
+    final Color accentColor;
+    final String typeLabel;
+
+    if (typeUpper == 'ENERGY') {
+      accentColor = green;
+      typeLabel = '⚡ Tiết kiệm điện';
+    } else if (typeUpper == 'COMFORT') {
+      accentColor = amber;
+      typeLabel = '🌡️ Tiện nghi cảm biến';
+    } else {
+      accentColor = cyan;
+      typeLabel = '🕒 Thói quen sử dụng';
+    }
+
+    final isBusy = _processingSuggestionId == sug.id;
+
+    return Container(
+      margin: const EdgeInsets.only(bottom: 12),
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: AppColors.getSurface(isDark),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: accentColor.withOpacity(0.45)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                decoration: BoxDecoration(
+                  color: accentColor.withOpacity(0.16),
+                  borderRadius: BorderRadius.circular(6),
+                ),
+                child: Text(
+                  typeLabel,
+                  style: TextStyle(
+                    color: accentColor,
+                    fontSize: 10,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+              ),
+              const Spacer(),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                decoration: BoxDecoration(
+                  color: cyan.withOpacity(0.14),
+                  borderRadius: BorderRadius.circular(6),
+                ),
+                child: Text(
+                  'Tin cậy ${sug.confidencePercent}%',
+                  style: TextStyle(
+                    color: cyan,
+                    fontSize: 10,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Text(
+            sug.title,
+            style: TextStyle(
+              color: AppColors.getTextPrimary(isDark),
+              fontSize: 13.5,
+              fontWeight: FontWeight.bold,
+            ),
+          ),
+          if (sug.description.isNotEmpty) ...[
+            const SizedBox(height: 6),
+            Text(
+              sug.description,
+              style: TextStyle(
+                color: AppColors.getTextSecondary(isDark),
+                fontSize: 12,
+                height: 1.35,
+              ),
+            ),
+          ],
+          const SizedBox(height: 6),
+          Text(
+            'Thiết bị: ${sug.deviceName}${sug.roomName != null && sug.roomName!.isNotEmpty ? ' • ${sug.roomName}' : ''}',
+            style: TextStyle(
+              color: cyan,
+              fontSize: 11,
+              fontWeight: FontWeight.w500,
+            ),
+          ),
+          const SizedBox(height: 12),
+          Row(
+            children: [
+              Expanded(
+                child: OutlinedButton(
+                  onPressed: isBusy
+                      ? null
+                      : () => _handleDismissSuggestion(sug),
+                  style: OutlinedButton.styleFrom(
+                    side: BorderSide(color: AppColors.getBorder(isDark)),
+                    padding: const EdgeInsets.symmetric(vertical: 9),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(10),
+                    ),
+                  ),
+                  child: Text(
+                    'Bỏ qua',
+                    style: TextStyle(
+                      color: AppColors.getTextSecondary(isDark),
+                      fontSize: 12,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                flex: 2,
+                child: ElevatedButton(
+                  onPressed: isBusy ? null : () => _handleApplySuggestion(sug),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: cyan,
+                    foregroundColor: const Color(0xFF030A16),
+                    padding: const EdgeInsets.symmetric(vertical: 9),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(10),
+                    ),
+                    elevation: 0,
+                  ),
+                  child: Text(
+                    isBusy
+                        ? 'Đang xử lý...'
+                        : (sug.isAutomation
+                              ? '✓ Tạo kịch bản tự động'
+                              : '✓ Áp dụng ngay'),
+                    style: const TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ],
       ),
     );
   }

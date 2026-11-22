@@ -285,6 +285,72 @@ class AiAlert {
   }
 }
 
+class AiSuggestion {
+  final String id;
+  final String deviceId;
+  final String deviceName;
+  final String? roomName;
+  final String suggestionType; // HABIT | COMFORT | ENERGY
+  final String title;
+  final String description;
+  final Map<String, dynamic> suggestedAction;
+  final String? cronExpression;
+  final double confidenceScore;
+  final String status;
+  final String createdAt;
+
+  AiSuggestion({
+    required this.id,
+    required this.deviceId,
+    required this.deviceName,
+    this.roomName,
+    this.suggestionType = 'HABIT',
+    required this.title,
+    this.description = '',
+    this.suggestedAction = const {},
+    this.cronExpression,
+    this.confidenceScore = 0.8,
+    this.status = 'PENDING',
+    this.createdAt = '',
+  });
+
+  bool get isAutomation =>
+      (suggestedAction['mode'] ?? '').toString().trim().toUpperCase() ==
+      'AUTOMATION';
+
+  int get confidencePercent => (confidenceScore * 100).round().clamp(1, 100);
+
+  factory AiSuggestion.fromJson(dynamic raw) {
+    final Map<String, dynamic> map = raw is Map<String, dynamic>
+        ? raw
+        : (raw is Map ? Map<String, dynamic>.from(raw) : <String, dynamic>{});
+    final data = map['data'] is Map
+        ? Map<String, dynamic>.from(map['data'] as Map)
+        : map;
+
+    final rawAction = data['suggested_action'];
+    Map<String, dynamic> parsedAction = {};
+    if (rawAction is Map) {
+      parsedAction = Map<String, dynamic>.from(rawAction);
+    }
+
+    return AiSuggestion(
+      id: (data['id'] ?? '').toString(),
+      deviceId: (data['device_id'] ?? '').toString(),
+      deviceName: (data['device_name'] ?? 'Thiết bị IoT').toString(),
+      roomName: data['room_name']?.toString(),
+      suggestionType: (data['suggestion_type'] ?? 'HABIT').toString(),
+      title: (data['title'] ?? 'Gợi ý thông minh').toString(),
+      description: (data['description'] ?? '').toString(),
+      suggestedAction: parsedAction,
+      cronExpression: data['cron_expression']?.toString(),
+      confidenceScore: _toDouble(data['confidence_score'], 0.8),
+      status: (data['status'] ?? 'PENDING').toString(),
+      createdAt: (data['created_at'] ?? '').toString(),
+    );
+  }
+}
+
 class AutomationRule {
   final String id;
   final String name;
