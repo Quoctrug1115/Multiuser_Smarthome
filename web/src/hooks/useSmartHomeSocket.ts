@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import type { AiAlert, Device, SensorData, UserProfile } from '../types/smarthome';
+import type { AiAlert, AiSuggestion, Device, SensorData, UserProfile } from '../types/smarthome';
 import { WS_URL } from '../utils/api';
 
 interface UseSmartHomeSocketOptions {
@@ -7,6 +7,7 @@ interface UseSmartHomeSocketOptions {
   setSensorData: React.Dispatch<React.SetStateAction<SensorData | null>>;
   setDevices: React.Dispatch<React.SetStateAction<Device[]>>;
   setAiAlerts: React.Dispatch<React.SetStateAction<AiAlert[]>>;
+  setAiSuggestions?: React.Dispatch<React.SetStateAction<AiSuggestion[]>>;
   appendLog: (msg: string) => void;
 }
 
@@ -56,6 +57,7 @@ export function useSmartHomeSocket({
   setSensorData,
   setDevices,
   setAiAlerts,
+  setAiSuggestions,
   appendLog,
 }: UseSmartHomeSocketOptions) {
   const [wsConnected, setWsConnected] = useState(false);
@@ -130,6 +132,16 @@ export function useSmartHomeSocket({
               if (isSameTenant(msg.data, tenantId)) {
                 setAiAlerts((prev) => [msg.data, ...prev].slice(0, 30));
                 appendLog(`AI ALERT: ${msg.data.message}`);
+              }
+            } else if (msg.type === 'AI_SUGGESTION' && msg.data) {
+              if (isSameTenant(msg.data, tenantId)) {
+                setAiSuggestions?.((prev) => {
+                  if (prev.some((item) => item.id === msg.data.id)) {
+                    return prev;
+                  }
+                  return [msg.data, ...prev].slice(0, 20);
+                });
+                appendLog(`AI GỢI Ý: ${msg.data.title}`);
               }
             }
           } catch {

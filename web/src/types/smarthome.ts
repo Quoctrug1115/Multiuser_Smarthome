@@ -81,6 +81,30 @@ export interface AiAlert {
   created_at: string;
 }
 
+export interface AiSuggestion {
+  id: string;
+  device_id: string;
+  device_name: string;
+  room_name?: string | null;
+  suggestion_type: 'HABIT' | 'COMFORT' | 'ENERGY' | string;
+  title: string;
+  description: string;
+  suggested_action: {
+    mode?: 'AUTOMATION' | 'INSTANT' | string;
+    action?: 'ON' | 'OFF' | string;
+    time?: string;
+    reason?: string;
+    rule_name?: string;
+    condition_text?: string;
+    action_text?: string;
+    [key: string]: unknown;
+  };
+  cron_expression?: string | null;
+  confidence_score: number;
+  status: string;
+  created_at: string;
+}
+
 export interface EnergyPoint {
   label: string;
   kwh: number;

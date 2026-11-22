@@ -13,6 +13,7 @@ import { useSmartHomeSocket } from './hooks/useSmartHomeSocket';
 import type {
   ActiveTab,
   AiAlert,
+  AiSuggestion,
   AutomationRule,
   Device,
   EnergyPoint,
@@ -40,6 +41,7 @@ function SmartHomeWorkspace() {
   const [devices, setDevices] = useState<Device[]>([]);
   const [automations, setAutomations] = useState<AutomationRule[]>([]);
   const [aiAlerts, setAiAlerts] = useState<AiAlert[]>([]);
+  const [aiSuggestions, setAiSuggestions] = useState<AiSuggestion[]>([]);
   const [usersList, setUsersList] = useState<UserProfile[]>([]);
   const [sensorData, setSensorData] = useState<SensorData | null>(null);
 
@@ -65,6 +67,7 @@ function SmartHomeWorkspace() {
     setDevices([]);
     setAutomations([]);
     setAiAlerts([]);
+    setAiSuggestions([]);
     setSensorData(null);
     setEnergyData({ total_kwh: 0, estimated_cost: 0, peak_watt: 0, daily: [] });
     setActiveTab('overview');
@@ -80,7 +83,7 @@ function SmartHomeWorkspace() {
     const activePeriod = periodOverride || energyPeriod;
 
     try {
-      const [meRes, housesRes, roomsRes, devicesRes, autoRes, energyRes, aiRes] =
+      const [meRes, housesRes, roomsRes, devicesRes, autoRes, energyRes, aiRes, sugRes] =
         await Promise.all([
           fetch(`${API_BASE}/auth/me`, { headers }).catch(() => null),
           fetch(`${API_BASE}/houses`, { headers }).catch(() => null),
@@ -91,6 +94,7 @@ function SmartHomeWorkspace() {
             () => null
           ),
           fetch(`${API_BASE}/ai/alerts`, { headers }).catch(() => null),
+          fetch(`${API_BASE}/ai/suggestions`, { headers }).catch(() => null),
         ]);
 
       if (meRes && meRes.status === 401) {
@@ -158,6 +162,11 @@ function SmartHomeWorkspace() {
         setAiAlerts(Array.isArray(data) ? data : []);
       }
 
+      if (sugRes && sugRes.ok) {
+        const data = await sugRes.json();
+        setAiSuggestions(Array.isArray(data) ? data : []);
+      }
+
       const roleLower = effectiveRole.trim().toLowerCase();
       if (roleLower === 'owner' || roleLower === 'admin') {
         const usersRes = await fetch(`${API_BASE}/users`, { headers }).catch(() => null);
@@ -187,6 +196,7 @@ function SmartHomeWorkspace() {
     setSensorData,
     setDevices,
     setAiAlerts,
+    setAiSuggestions,
     appendLog,
   });
 
@@ -323,9 +333,13 @@ function SmartHomeWorkspace() {
             />
           )}
 
-          {activeTab === 'ai' && (
+         {activeTab === 'ai' && (
             <AiAlertsTab
               aiAlerts={aiAlerts}
+              aiSuggestions={aiSuggestions}
+              setAiSuggestions={setAiSuggestions}
+              devices={devices}
+              sensorData={sensorData}
               isOwnerOrAdmin={isOwnerOrAdmin}
               cardBg={cardBg}
               appendLog={appendLog}
